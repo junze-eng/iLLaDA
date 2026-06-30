@@ -43,7 +43,8 @@ def get_num_transfer_tokens(mask_index, steps):
 @ torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False,
-             confidence_eos_eot_inf=False, token_selection_confidence_threshold=None):
+             confidence_eos_eot_inf=False, token_selection_confidence_threshold=None,
+             min_transfer_tokens=1, return_trace=False):
     '''
     Args:
         model: Mask predictor.
@@ -60,6 +61,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         token_selection_confidence_threshold: If set, only predicted tokens with confidence greater than or equal to
             this threshold are transferred. This is useful for ARness ablations because a higher threshold makes each
             diffusion step commit fewer tokens.
+        min_transfer_tokens: Minimum number of tokens to transfer for each sample when the scheduled transfer count is
+            positive. This prevents high confidence thresholds from stalling with residual mask tokens.
+        return_trace: If True, return (tokens, trace) with per-step transfer statistics.
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -74,6 +78,18 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
     assert steps % num_blocks == 0
     steps = steps // num_blocks
+
+    trace = {
+        'prompt_tokens': int(prompt.shape[1]),
+        'gen_length': int(gen_length),
+        'block_length': int(block_length),
+        'steps_per_block': int(steps),
+        'mask_id': int(mask_id),
+        'token_selection_confidence_threshold': token_selection_confidence_threshold,
+        'min_transfer_tokens': int(min_transfer_tokens),
+        'fallback_transfer_count': 0,
+        'step_stats': [],
+    } if return_trace else None
 
     for num_block in range(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
@@ -116,21 +132,47 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             confidence = torch.where(mask_index, x0_p, -np.inf)
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            step_transfer_count = 0
+            step_confidence_sum = 0.0
             for j in range(confidence.shape[0]):
-                select_confidence, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                scheduled_count = int(num_transfer_tokens[j, i].item())
+                if scheduled_count <= 0:
+                    continue
+                select_confidence, select_index = torch.topk(confidence[j], k=scheduled_count)
                 if token_selection_confidence_threshold is not None:
-                    select_index = select_index[select_confidence >= token_selection_confidence_threshold]
+                    keep = select_confidence >= token_selection_confidence_threshold
+                    if keep.sum().item() == 0 and min_transfer_tokens > 0:
+                        keep[:min(min_transfer_tokens, scheduled_count)] = True
+                        if trace is not None:
+                            trace['fallback_transfer_count'] += int(keep.sum().item())
+                    select_confidence = select_confidence[keep]
+                    select_index = select_index[keep]
                 transfer_index[j, select_index] = True
+                step_transfer_count += int(select_index.numel())
+                if select_confidence.numel() > 0:
+                    step_confidence_sum += float(select_confidence.float().sum().item())
             x[transfer_index] = x0[transfer_index]
+            if trace is not None:
+                trace['step_stats'].append({
+                    'block': int(num_block),
+                    'step': int(i),
+                    'transferred_tokens': step_transfer_count,
+                    'mean_confidence': step_confidence_sum / step_transfer_count if step_transfer_count else None,
+                    'remaining_masks': int((x == mask_id).sum().item()),
+                })
 
-    return x
+    if trace is not None:
+        trace['final_mask_count'] = int((x == mask_id).sum().item())
+    return (x, trace) if return_trace else x
 
 
 def main():
     device = 'cuda'
+    model_path = 'GSAI-ML/iLLaDA-8B-Instruct'
+    mask_id = 5
 
-    model = AutoModel.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     # The LLaDA architecture theoretically supports both left-padding and right-padding. 
     # However, the sampling code implementation is simpler with left-padding.
@@ -138,7 +180,7 @@ def main():
         tokenizer.padding_side = 'left'
 
     # If the padding ID equals the mask ID, you need to modify our generate function to achieve correct inference.
-    assert tokenizer.pad_token_id != 126336
+    assert tokenizer.pad_token_id != mask_id
 
     prompts = [ "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?",
              "Joy can read 8 pages of a book in 20 minutes. How many hours will it take her to read 120 pages?",
@@ -157,7 +199,8 @@ def main():
     input_ids = encoded_outputs['input_ids'].to(device)
     attention_mask = encoded_outputs['attention_mask'].to(device)
 
-    out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0., remasking='low_confidence')
+    out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32,
+                   temperature=0., cfg_scale=0., remasking='low_confidence', mask_id=mask_id)
     output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
     for o in output:
         print(o)

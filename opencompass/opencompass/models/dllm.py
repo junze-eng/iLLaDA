@@ -1,5 +1,7 @@
 import os
 import sys
+import json
+import time
 from pathlib import Path
 llada_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(llada_root))
@@ -144,6 +146,13 @@ class LLaDAModel(BaseModel):
                  diff_confidence_eos_eot_inf = False,
                  diff_logits_eos_inf = False,
                  token_selection_confidence_threshold = None,
+                 min_transfer_tokens = 1,
+                 metrics_output = None,
+                 per_sample_output = None,
+                 step_trace_output = None,
+                 return_trace = False,
+                 context_prefix_tokens = 0,
+                 context_prefix_text = 'Context padding sentence. ',
                  ) -> None:
         super().__init__(path=path,
                          max_seq_len=max_seq_len,
@@ -184,6 +193,17 @@ class LLaDAModel(BaseModel):
         self.diff_confidence_eos_eot_inf = diff_confidence_eos_eot_inf
         self.diff_logits_eos_inf = diff_logits_eos_inf
         self.token_selection_confidence_threshold = token_selection_confidence_threshold
+        self.min_transfer_tokens = int(min_transfer_tokens)
+        self.per_sample_output = per_sample_output or metrics_output
+        self.step_trace_output = step_trace_output
+        self.metrics_output = self.per_sample_output
+        self.return_trace = return_trace
+        self.context_prefix_tokens = int(context_prefix_tokens)
+        self.context_prefix_text = context_prefix_text
+        self._profile_sample_idx = 0
+        for output_path in (self.per_sample_output, self.step_trace_output):
+            if output_path:
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.template_parser = _get_meta_template(meta_template)
 
@@ -373,21 +393,120 @@ class LLaDAModel(BaseModel):
         """
         return len(self.tokenizer.encode(prompt))
 
+    def _cuda_stats_before(self):
+        device = getattr(self.model, 'device', None)
+        if device is None or device.type != 'cuda':
+            return
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
+    def _cuda_stats_after(self):
+        device = getattr(self.model, 'device', None)
+        if device is None or device.type != 'cuda':
+            return {}
+        torch.cuda.synchronize(device)
+        return {
+            'cuda_max_memory_allocated_mb': round(torch.cuda.max_memory_allocated(device) / 1024 ** 2, 3),
+            'cuda_max_memory_reserved_mb': round(torch.cuda.max_memory_reserved(device) / 1024 ** 2, 3),
+        }
+
+    def _write_jsonl(self, output_path, records):
+        if not output_path:
+            return
+        with open(output_path, 'a', encoding='utf-8') as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def _build_profile_records(self, prompt_texts, responses, prompt_tokens, elapsed, trace, cuda_stats):
+        batch_size = len(responses)
+        total_generated_tokens = self.gen_length * batch_size
+        per_sample_records = []
+        step_trace_records = []
+        for i in range(batch_size):
+            sample_idx = self._profile_sample_idx
+            record = {
+                'sample_idx': sample_idx,
+                'batch_size': int(batch_size),
+                'batch_item_idx': int(i),
+                'input': prompt_texts[i],
+                'prediction': responses[i],
+                'correctness': None,
+                'score': None,
+                'evaluator_status': 'pending_opencompass_eval',
+                'prompt_tokens': int(prompt_tokens),
+                'generated_tokens': int(self.gen_length),
+                'batch_generated_tokens': int(total_generated_tokens),
+                'elapsed_seconds': round(elapsed, 6),
+                'tokens_per_second': round(total_generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'steps': int(self.gen_steps),
+                'gen_length': int(self.gen_length),
+                'block_length': int(self.gen_blocksize),
+                'mask_id': int(self.mask_id),
+                'remasking': self.remasking,
+                'cfg': float(self.cfg),
+                'temperature': float(self.temperature),
+                'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
+                'min_transfer_tokens': self.min_transfer_tokens,
+                'context_prefix_tokens': self.context_prefix_tokens,
+                'forward_passes': int(self.gen_steps),
+                'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
+                'arness': float(self.gen_steps / self.gen_length) if self.gen_length else None,
+                'final_mask_count': trace.get('final_mask_count') if trace else None,
+                'fallback_transfer_count': trace.get('fallback_transfer_count') if trace else None,
+                **cuda_stats,
+            }
+            per_sample_records.append(record)
+            if trace is not None:
+                step_trace_records.append({
+                    'sample_idx': sample_idx,
+                    'batch_item_idx': int(i),
+                    'trace': trace,
+                })
+            self._profile_sample_idx += 1
+        return per_sample_records, step_trace_records
+
+    def _context_prefix(self) -> str:
+        if self.context_prefix_tokens <= 0:
+            return ''
+        unit = self.context_prefix_text or 'Context padding sentence. '
+        repeated = unit
+        target = self.context_prefix_tokens
+        while len(self.tokenizer.encode(repeated, add_special_tokens=False)) < target:
+            repeated += unit
+        token_ids = self.tokenizer.encode(repeated, add_special_tokens=False)[:target]
+        prefix = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        return (
+            prefix
+            + '\n\nThe preceding context is padding for a context-length stress test. '
+            + 'Answer the actual task below.\n\n'
+        )
+
     def generate(self, inputs: List[str], max_out_len: int) -> List[str]:
         """Generate results given a list of inputs. """
         messages = _convert_chat_messages(inputs)
+        context_prefix = self._context_prefix()
+        if context_prefix:
+            for message_group in messages:
+                for message in message_group:
+                    if message['role'] == 'user':
+                        message['content'] = context_prefix + message['content']
+                        break
         prompt = [self.tokenizer.apply_chat_template(m_i, add_generation_prompt=True, tokenize=False) for m_i in messages]
         print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
         print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
         print('token_selection_confidence_threshold:', self.token_selection_confidence_threshold)
+        print('min_transfer_tokens:', self.min_transfer_tokens, 'per_sample_output:', self.per_sample_output, 'step_trace_output:', self.step_trace_output, 'return_trace:', self.return_trace)
         print('final prompt:', prompt)
+        prompt_texts = prompt
         self.tokenizer.padding_side = "left" 
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
         attention_mask = encoded_prompt.get('attention_mask')
-        x = LLaDA_generate(
+        self._cuda_stats_before()
+        started = time.perf_counter()
+        generated = LLaDA_generate(
             model = self.model,
             prompt = prompt.to(self.model.device),
             attention_mask = attention_mask.to(self.model.device) if attention_mask is not None else None,
@@ -401,12 +520,30 @@ class LLaDAModel(BaseModel):
             confidence_eos_eot_inf = self.diff_confidence_eos_eot_inf,
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
+            min_transfer_tokens = self.min_transfer_tokens,
+            return_trace = self.return_trace,
         )
+        elapsed = time.perf_counter() - started
+        cuda_stats = self._cuda_stats_after()
+        if self.return_trace:
+            x, trace = generated
+        else:
+            x, trace = generated, None
         responses = []
         batch_size = prompt.shape[0]
         
         for i in range(batch_size):
             responses.append(self.tokenizer.decode(x[i, -self.gen_length:], skip_special_tokens=True))
+        per_sample_records, step_trace_records = self._build_profile_records(
+            prompt_texts=prompt_texts,
+            responses=responses,
+            prompt_tokens=prompt.shape[1],
+            elapsed=elapsed,
+            trace=trace,
+            cuda_stats=cuda_stats,
+        )
+        self._write_jsonl(self.per_sample_output, per_sample_records)
+        self._write_jsonl(self.step_trace_output, step_trace_records)
         print('--------------------')
         for i in range(batch_size):
             print(f'Response {i}:', responses[i])
@@ -517,18 +654,23 @@ class LLaDABaseModel(LLaDAModel):
     def generate(self, inputs: List[str], max_out_len: int) -> List[str]:
         """Generate results given a list of inputs. """
         messages = _convert_base_messages(inputs)
-        prompt = messages
+        context_prefix = self._context_prefix()
+        prompt = [context_prefix + message for message in messages]
         print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
         print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
         print('token_selection_confidence_threshold:', self.token_selection_confidence_threshold)
+        print('min_transfer_tokens:', self.min_transfer_tokens, 'per_sample_output:', self.per_sample_output, 'step_trace_output:', self.step_trace_output, 'return_trace:', self.return_trace)
         print('final prompt:', prompt)
+        prompt_texts = prompt
         self.tokenizer.padding_side = "left" 
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
         attention_mask = encoded_prompt.get('attention_mask')
-        x = LLaDA_generate(
+        self._cuda_stats_before()
+        started = time.perf_counter()
+        generated = LLaDA_generate(
             model = self.model,
             prompt = prompt.to(self.model.device),
             attention_mask = attention_mask.to(self.model.device) if attention_mask is not None else None,
@@ -542,7 +684,15 @@ class LLaDABaseModel(LLaDAModel):
             confidence_eos_eot_inf = self.diff_confidence_eos_eot_inf,
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
+            min_transfer_tokens = self.min_transfer_tokens,
+            return_trace = self.return_trace,
         )
+        elapsed = time.perf_counter() - started
+        cuda_stats = self._cuda_stats_after()
+        if self.return_trace:
+            x, trace = generated
+        else:
+            x, trace = generated, None
         responses = []
         batch_size = prompt.shape[0]
         
@@ -561,6 +711,16 @@ class LLaDABaseModel(LLaDAModel):
                     response = response.split(stop_word)[0]
                     break
             responses[i] = response
+        per_sample_records, step_trace_records = self._build_profile_records(
+            prompt_texts=prompt_texts,
+            responses=responses,
+            prompt_tokens=prompt.shape[1],
+            elapsed=elapsed,
+            trace=trace,
+            cuda_stats=cuda_stats,
+        )
+        self._write_jsonl(self.per_sample_output, per_sample_records)
+        self._write_jsonl(self.step_trace_output, step_trace_records)
         return responses
     
     def get_token_len(self, prompt: str, add_special_tokens: bool=True) -> int:

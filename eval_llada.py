@@ -2,8 +2,10 @@
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
 import accelerate
+import json
 import torch
 import re
+import time
 from pathlib import Path
 import random
 import numpy as np
@@ -43,6 +45,12 @@ class LLaDAEvalHarness(LM):
         gen_length=1024,
         block_length=1024,
         remasking='low_confidence',
+        token_selection_confidence_threshold=None,
+        min_transfer_tokens=1,
+        metrics_output=None,
+        per_sample_output=None,
+        step_trace_output=None,
+        return_trace=False,
         device="cuda",
         **kwargs,
     ):
@@ -64,12 +72,15 @@ class LLaDAEvalHarness(LM):
             cfg_scale: Unsupervised classifier-free guidance scale.
         '''
         super().__init__()
+        self.model_path = model_path
 
         accelerator = accelerate.Accelerator()
         if accelerator.num_processes > 1:
             self.accelerator = accelerator
         else:
             self.accelerator = None
+        self._rank = 0
+        self._world_size = 1
         
         model_kwargs = {}
         if self.accelerator is not None:
@@ -101,7 +112,19 @@ class LLaDAEvalHarness(LM):
         self.steps = steps
         self.gen_length = gen_length
         self.block_length = block_length
-        self.remasking = remasking    
+        self.remasking = remasking
+        self.token_selection_confidence_threshold = token_selection_confidence_threshold
+        self.min_transfer_tokens = int(min_transfer_tokens)
+        self.per_sample_output = per_sample_output or metrics_output
+        self.step_trace_output = step_trace_output
+        self.metrics_output = self.per_sample_output
+        self.return_trace = return_trace
+
+        if self.rank == 0:
+            for output_path in (self.per_sample_output, self.step_trace_output):
+                if output_path:
+                    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
     @property
     def rank(self):
         return self._rank
@@ -243,6 +266,32 @@ class LLaDAEvalHarness(LM):
     def loglikelihood_rolling(self, requests):
         raise NotImplementedError
 
+    def _cuda_stats_before(self):
+        if self.device.type != 'cuda':
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _cuda_stats_after(self):
+        if self.device.type != 'cuda':
+            return {}
+        torch.cuda.synchronize(self.device)
+        return {
+            'cuda_max_memory_allocated_mb': round(torch.cuda.max_memory_allocated(self.device) / 1024 ** 2, 3),
+            'cuda_max_memory_reserved_mb': round(torch.cuda.max_memory_reserved(self.device) / 1024 ** 2, 3),
+        }
+
+    def _write_jsonl(self, output_path, records):
+        if not output_path or self.rank != 0:
+            return
+        with open(output_path, 'a', encoding='utf-8') as f:
+            for record in records:
+                record = dict(record)
+                record['rank'] = self.rank
+                record['world_size'] = self.world_size
+                record['model_path'] = getattr(self, 'model_path', None)
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
     def generate_until(self, requests: list[Instance]):
         def _tokenize(e):
             return {
@@ -257,12 +306,32 @@ class LLaDAEvalHarness(LM):
         ds = ds.with_format("torch")
 
         out = []
-        for elem in tqdm(ds, desc="Generating..."):
+        for sample_idx, elem in enumerate(tqdm(ds, desc="Generating...")):
             prompt = elem["question"].unsqueeze(0).to(self.device)
             stop_tokens = elem["until"]
- 
-            generated_answer = generate(self.model, prompt, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, cfg_scale=self.cfg, remasking=self.remasking, mask_id=self.mask_id)
+
+            self._cuda_stats_before()
+            started = time.perf_counter()
+            generated = generate(
+                self.model,
+                prompt,
+                steps=self.steps,
+                gen_length=self.gen_length,
+                block_length=self.block_length,
+                temperature=0,
+                cfg_scale=self.cfg,
+                remasking=self.remasking,
+                mask_id=self.mask_id,
+                token_selection_confidence_threshold=self.token_selection_confidence_threshold,
+                min_transfer_tokens=self.min_transfer_tokens,
+                return_trace=self.return_trace,
+            )
+            elapsed = time.perf_counter() - started
+            cuda_stats = self._cuda_stats_after()
+            if self.return_trace:
+                generated_answer, trace = generated
+            else:
+                generated_answer, trace = generated, None
             
             generated_answer = self.tokenizer.decode(generated_answer[0][prompt.shape[1]:], skip_special_tokens=False)
             for stop_seq in stop_tokens:
@@ -274,7 +343,42 @@ class LLaDAEvalHarness(LM):
             generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
             out.append(generated_answer)
 
-            self.accelerator.wait_for_everyone()
+            generated_tokens = self.gen_length
+            per_sample_record = {
+                'sample_idx': sample_idx,
+                'input': elem["question_text"],
+                'prediction': generated_answer,
+                'correctness': None,
+                'score': None,
+                'evaluator_status': 'pending_lm_eval_aggregation',
+                'prompt_tokens': int(prompt.shape[1]),
+                'generated_tokens': int(generated_tokens),
+                'elapsed_seconds': round(elapsed, 6),
+                'tokens_per_second': round(generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'steps': int(self.steps),
+                'gen_length': int(self.gen_length),
+                'block_length': int(self.block_length),
+                'mask_id': int(self.mask_id),
+                'remasking': self.remasking,
+                'cfg': float(self.cfg),
+                'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
+                'min_transfer_tokens': self.min_transfer_tokens,
+                'forward_passes': int(self.steps),
+                'effective_parallelism': float(self.gen_length / self.steps) if self.steps else None,
+                'arness': float(self.steps / self.gen_length) if self.gen_length else None,
+                'final_mask_count': trace.get('final_mask_count') if trace else None,
+                'fallback_transfer_count': trace.get('fallback_transfer_count') if trace else None,
+                **cuda_stats,
+            }
+            self._write_jsonl(self.per_sample_output, [per_sample_record])
+            if trace is not None:
+                self._write_jsonl(self.step_trace_output, [{
+                    'sample_idx': sample_idx,
+                    'trace': trace,
+                }])
+
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
 
         return out
 

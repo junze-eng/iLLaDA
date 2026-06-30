@@ -9,6 +9,10 @@ execution:
   output_dir: outputs/illada_runs
   dry_run: false
   stop_on_error: true
+  collect_metrics: true
+  gpu_telemetry:
+    enabled: true
+    interval_seconds: 1
   opencompass_args: []
 
 model:
@@ -45,8 +49,44 @@ defaults:
   diff_confidence_eos_eot_inf: true
   diff_logits_eos_inf: false
   token_selection_confidence_threshold: null
+  min_transfer_tokens: 1
+  return_trace: false
+  context_prefix_tokens: 0
 
 experiments:
+  # Part 1: small paper-anchor sanity reproduction. These are not full paper
+  # reproductions; they check that model loading, mask_id, prompting, decoding,
+  # and evaluators behave plausibly on representative task families.
+  - name: paper_anchor_arc_c
+    enabled: false
+    benchmark: arc_c
+    params:
+      gen_length: 512
+      gen_steps: 512
+      gen_blocksize: 512
+      diff_confidence_eos_eot_inf: false
+
+  - name: paper_anchor_gsm8k
+    enabled: false
+    benchmark: gsm8k
+    params:
+      gen_length: 256
+      gen_steps: 256
+      gen_blocksize: 32
+      diff_confidence_eos_eot_inf: true
+
+  - name: paper_anchor_mbpp
+    enabled: false
+    benchmark: mbpp
+    params:
+      gen_length: 256
+      gen_steps: 256
+      gen_blocksize: 32
+      diff_confidence_eos_eot_inf: true
+
+  # Part 2 / Task 1: Parallelism. GSM8K and MBPP are both generation benchmarks used in
+  # the LLaDA eval suite; GSM8K is cheap and stable, MBPP catches code-format
+  # sensitivity when block size changes.
   - name: parallel_gsm8k
     enabled: true
     benchmark: gsm8k
@@ -57,18 +97,36 @@ experiments:
     sweep:
       gen_blocksize: [1, 4, 8, 16, 32, 64, 128, 256]
 
-  - name: context_math
+  - name: parallel_mbpp
     enabled: false
-    benchmark: math
+    benchmark: mbpp
     params:
       gen_length: 512
       gen_steps: 512
-      gen_blocksize: 64
       diff_confidence_eos_eot_inf: true
     sweep:
-      max_seq_len: [1024, 2048, 4096, 8192]
+      gen_blocksize: [1, 4, 8, 16, 32, 64, 128, 256]
 
-  - name: arness_gsm8k_threshold
+  # Part 2 / Task 2: Context window. Needle/Passkey is a small controlled
+  # diagnostic task: dynamic filler text + one secret code + exact-match scoring.
+  - name: context_needle_passkey
+    enabled: false
+    benchmark: needle_passkey
+    params:
+      num_samples: 20
+      gen_length: 32
+      gen_steps: 32
+      gen_blocksize: 32
+      seed: 20260630
+      return_trace: true
+    sweep:
+      context_length: [512, 1024, 2048, 4096, 6144, 8192]
+      needle_position: [front, middle, end]
+
+  # Optional auxiliary context stress on real tasks. This is less clean than
+  # Needle/Passkey because added filler may be ignored, so do not use it as the
+  # primary context-window claim.
+  - name: context_gsm8k_padding_aux
     enabled: false
     benchmark: gsm8k
     params:
@@ -77,13 +135,124 @@ experiments:
       gen_blocksize: 16
       diff_confidence_eos_eot_inf: true
     sweep:
-      token_selection_confidence_threshold: [null, 0.1, 0.2, 0.4, 0.6, 0.8]
+      context_prefix_tokens: [0, 512, 1024, 2048, 4096, 6144]
 
-  - name: capability_snapshot
+  # Part 2 / Task 3: ARness. Threshold controls how aggressively diffusion steps commit
+  # tokens. return_trace is enabled only here to keep the heavy per-step records
+  # focused on the ARness audit.
+  - name: arness_gsm8k_threshold
     enabled: false
-    benchmark: [gsm8k, math, gpqa, humaneval, mbpp, ifeval]
+    benchmark: gsm8k
+    params:
+      gen_length: 256
+      gen_steps: 256
+      diff_confidence_eos_eot_inf: true
+    sweep:
+      gen_blocksize: [1, 8, 32]
+      token_selection_confidence_threshold: [null, 0.4, 0.6, 0.8]
+      return_trace: [true]
+
+  - name: arness_mbpp_threshold
+    enabled: false
+    benchmark: mbpp
     params:
       gen_length: 512
       gen_steps: 512
-      gen_blocksize: 32
+      diff_confidence_eos_eot_inf: true
+    sweep:
+      gen_blocksize: [1, 8, 32]
+      token_selection_confidence_threshold: [null, 0.4, 0.6, 0.8]
+      return_trace: [true]
+
+  # Paper-comparable capability snapshots. Keep disabled until smoke tests pass;
+  # enable for final tables once the infrastructure looks healthy.
+  - name: capability_mmlu
+    enabled: false
+    benchmark: mmlu
+    params:
+      gen_length: 3
+      gen_steps: 3
+      gen_blocksize: 3
+      diff_confidence_eos_eot_inf: false
+
+  - name: capability_mmlu_pro
+    enabled: false
+    benchmark: mmlu_pro
+    params:
+      gen_length: 256
+      gen_steps: 256
+      gen_blocksize: 256
+      diff_confidence_eos_eot_inf: false
+
+  - name: capability_hellaswag
+    enabled: false
+    benchmark: hellaswag
+    params:
+      gen_length: 3
+      gen_steps: 3
+      gen_blocksize: 3
+      diff_confidence_eos_eot_inf: false
+
+  - name: capability_arc_c
+    enabled: false
+    benchmark: arc_c
+    params:
+      gen_length: 512
+      gen_steps: 512
+      gen_blocksize: 512
+      diff_confidence_eos_eot_inf: false
+
+  - name: capability_gsm8k
+    enabled: false
+    benchmark: gsm8k
+    params:
+      gen_length: 256
+      gen_steps: 256
+      gen_blocksize: 16
+      diff_confidence_eos_eot_inf: true
+
+  - name: capability_math
+    enabled: false
+    benchmark: math
+    params:
+      gen_length: 512
+      gen_steps: 512
+      gen_blocksize: 64
+      diff_confidence_eos_eot_inf: true
+
+  - name: capability_gpqa
+    enabled: false
+    benchmark: gpqa
+    params:
+      gen_length: 64
+      gen_steps: 64
+      gen_blocksize: 64
+      diff_confidence_eos_eot_inf: true
+
+  - name: capability_humaneval
+    enabled: false
+    benchmark: humaneval
+    params:
+      gen_length: 512
+      gen_steps: 512
+      gen_blocksize: 512
+      diff_logits_eos_inf: true
+      diff_confidence_eos_eot_inf: false
+
+  - name: capability_mbpp
+    enabled: false
+    benchmark: mbpp
+    params:
+      gen_length: 256
+      gen_steps: 256
+      gen_blocksize: 256
+      diff_confidence_eos_eot_inf: true
+
+  - name: capability_ifeval
+    enabled: false
+    benchmark: ifeval
+    params:
+      gen_length: 512
+      gen_steps: 512
+      gen_blocksize: 512
       diff_confidence_eos_eot_inf: true
