@@ -184,23 +184,6 @@ tasks:
           context_length: [512, 2048, 8192]
           needle_position: [front, middle, back]
 
-  trace_audit:
-    description: "Debug: full decode snapshots on a few samples, to see why generation keeps going past the answer instead of stopping."
-    experiments:
-      - name: task_debug_gsm8k_unfinished
-        benchmark: gsm8k
-        params:
-          decoding_config_name: ar_like
-          arness: 1
-          sample_limit: null
-          sample_indices: [0, 7, 23]
-          gen_length: 256
-          gen_steps: 256
-          gen_blocksize: 256
-          min_transfer_tokens: 1
-          return_trace: true
-          trace_decode_snapshots: true
-
   arness:
     description: "Task 3: small counterfactual threshold runs on Task 1/2 benchmarks."
     experiments:
