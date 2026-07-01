@@ -1,5 +1,9 @@
 # Extra dependencies for running run_test.py / OpenCompass evaluation on a GPU box (e.g. RunPod).
 #
+# GPU-ONLY. Do not run `pip install -r requirements.txt` on a local/no-GPU machine:
+# `accelerate` hard-depends on torch, so this will silently pull in the full ~100MB+ torch wheel.
+# For local dry-run / plot_results.py testing, use requirements-local.txt instead.
+#
 # Install order matters:
 #   1. cd opencompass && pip install -e . && cd ..
 #      (this pulls in opencompass/requirements/runtime.txt, which pins numpy<2.0 and pandas<2.0 —
@@ -8,7 +12,7 @@
 #      (human-eval is not on PyPI under this name, must be installed from source)
 #   3. pip install -r requirements.txt
 
-transformers>=4.46.0
+transformers>=4.46.0,<5.0.0
 accelerate>=0.34.2
 hf_xet
 math_verify

@@ -113,7 +113,6 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'gen_length': int(gen_length),
         'block_length': int(block_length),
         'steps_per_block': int(steps),
-        'planned_steps': int(planned_steps),
         'forward_passes': int(planned_steps),
         'num_blocks': int(num_blocks),
         'planned_parallelism': float(gen_length / planned_steps) if planned_steps else None,

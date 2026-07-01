@@ -1,0 +1,8 @@
+# For local machines without a GPU: only what run_test.py --dry-run and
+# plot_results.py need. No torch, no model/eval deps — those live in
+# requirements.txt and are meant for the RunPod GPU box only.
+
+pyyaml
+pandas
+matplotlib
+seaborn

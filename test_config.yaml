@@ -20,7 +20,7 @@ execution:
   collect_metrics: true
   gpu_telemetry:
     enabled: true
-    interval_seconds: 1
+    interval_seconds: 5
   opencompass_args: []
 
 model:
@@ -110,9 +110,13 @@ tasks:
         benchmark: needle_passkey
         params:
           num_samples: 30
-          gen_length: 32
-          gen_steps: 32
-          gen_blocksize: 32
+          # Was 32/32/32: the instruct model emits a <think>...</think> preamble before the
+          # answer, so 32 tokens got cut off mid-thought before ever stating the code
+          # (every sample scored correctness=0 regardless of retrieval ability). Bumped to
+          # 128 so there's room to finish reasoning and actually answer.
+          gen_length: 128
+          gen_steps: 128
+          gen_blocksize: 128
           max_seq_len: 8192
           seed: 20260630
           return_trace: true
