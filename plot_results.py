@@ -62,10 +62,32 @@ def clean_dataframe(df):
     return df
 
 
+TASK_NAME_PREFIXES = {
+    'parallel': 'task1_',
+    'context': 'task2_',
+    'arness': 'task3_',
+}
+
+
+def filter_task(df, task_name):
+    """Select rows for a task group (parallel/context/arness).
+
+    test_config.yaml names experiments task1_*/task2_*/task3_* for the
+    parallel/context/arness groups respectively, so match on that prefix.
+    Falls back to substring-matching the task name itself in `experiment`
+    for older configs that don't follow the task1_/task2_/task3_ convention.
+    """
+    prefix = TASK_NAME_PREFIXES.get(task_name)
+    if prefix:
+        matched = df[df['experiment'].str.startswith(prefix, na=False)].copy()
+        if not matched.empty:
+            return matched
+    return df[df['experiment'].str.contains(task_name, case=False, na=False)].copy()
+
+
 def plot_parallel_capability(df, output_dir):
     """Plot Parallel Capability: Accuracy & Latency vs Block Size."""
-    # Filter task contains 'parallel' or benchmark with parallel evaluations
-    target_df = df[df['experiment'].str.contains('parallel', case=False, na=False)].copy()
+    target_df = filter_task(df, 'parallel')
     if target_df.empty:
         print("[-] No parallel task data found. Skipping parallel capability plot.")
         return
@@ -143,7 +165,7 @@ def plot_parallel_capability(df, output_dir):
 
 def plot_context_window(df, output_dir):
     """Plot Context Window: Performance vs Context Length."""
-    target_df = df[df['experiment'].str.contains('context', case=False, na=False)].copy()
+    target_df = filter_task(df, 'context')
     if target_df.empty:
         print("[-] No context task data found. Skipping context window plot.")
         return
@@ -202,7 +224,7 @@ def plot_context_window(df, output_dir):
 
 def plot_arness(df, output_dir):
     """Plot ARness: Confidence Threshold & Blocksize vs Performance."""
-    target_df = df[df['experiment'].str.contains('arness', case=False, na=False)].copy()
+    target_df = filter_task(df, 'arness')
     if target_df.empty:
         print("[-] No arness task data found. Skipping ARness plot.")
         return
