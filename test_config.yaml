@@ -1,17 +1,20 @@
 run:
-  tasks: [context]
-  execution:
-    output_dir: outputs/task2_context_full
-    dry_run: false
-    stop_on_error: true
-    collect_metrics: true
-    gpu_telemetry:
-      enabled: true
-      interval_seconds: 5
-    opencompass_args: []
-  data:
-    ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
-    prepared_dir: data/prepared
+  tasks: [parallel, context, arness]
+  experiments: []
+
+execution:
+  output_dir: outputs/task2_context_full
+  dry_run: false
+  stop_on_error: true
+  collect_metrics: true
+  gpu_telemetry:
+    enabled: true
+    interval_seconds: 5
+  opencompass_args: []
+
+data:
+  ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
+  prepared_dir: data/prepared
 
 model:
   type: instruct
@@ -30,14 +33,15 @@ model:
     torch_dtype: torch.bfloat16
   run_cfg:
     num_gpus: 1
+
+runner:
+  partitioner:
+    num_worker: 1
+    num_split: null
+    min_task_size: 16
   runner:
-    partitioner:
-      num_worker: 1
-      num_split: null
-      min_task_size: 16
-    runner:
-      max_num_workers: 1
-      retry: 1
+    max_num_workers: 1
+    retry: 1
 
 defaults:
   sample_limit: null
@@ -57,6 +61,75 @@ defaults:
   needle_position: null
 
 tasks:
+  parallel:
+    description: "Task 1: GSM8K/MBPP parallel token restoration sweep."
+    experiments:
+      - name: task1_gsm8k_ar_like
+        benchmark: gsm8k
+        params:
+          decoding_config_name: ar_like
+          arness: 1
+          sample_limit: 50
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          min_transfer_tokens: 1
+
+      - name: task1_gsm8k_mild_parallel
+        benchmark: gsm8k
+        params:
+          decoding_config_name: mild_parallel
+          arness: 4
+          sample_limit: 50
+          gen_length: 256
+          gen_steps: 64
+          gen_blocksize: 256
+          min_transfer_tokens: 4
+
+      - name: task1_gsm8k_strong_parallel
+        benchmark: gsm8k
+        params:
+          decoding_config_name: strong_parallel
+          arness: 8
+          sample_limit: 50
+          gen_length: 256
+          gen_steps: 32
+          gen_blocksize: 256
+          min_transfer_tokens: 8
+
+      - name: task1_mbpp_ar_like
+        benchmark: mbpp
+        params:
+          decoding_config_name: ar_like
+          arness: 1
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 512
+          gen_blocksize: 512
+          min_transfer_tokens: 1
+
+      - name: task1_mbpp_mild_parallel
+        benchmark: mbpp
+        params:
+          decoding_config_name: mild_parallel
+          arness: 4
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 128
+          gen_blocksize: 512
+          min_transfer_tokens: 4
+
+      - name: task1_mbpp_strong_parallel
+        benchmark: mbpp
+        params:
+          decoding_config_name: strong_parallel
+          arness: 8
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 64
+          gen_blocksize: 512
+          min_transfer_tokens: 8
+
   context:
     description: "Task 2: pure RULER NIAH single_1 context-length sweep."
     experiments:
@@ -78,3 +151,30 @@ tasks:
         sweep:
           context_length: [1024, 2048, 4096, 8192]
           needle_position: [front, middle, back]
+
+  arness:
+    description: "Task 3: small counterfactual threshold runs on Task 1 benchmarks."
+    experiments:
+      - name: task3_gsm8k_threshold_counterfactual
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          return_trace: true
+        sweep:
+          gen_steps: [256, 128, 64, 32]
+          token_selection_confidence_threshold: [0.8, 0.9]
+          min_transfer_tokens: [1]
+
+      - name: task3_mbpp_threshold_counterfactual
+        benchmark: mbpp
+        params:
+          sample_limit: 10
+          gen_length: 512
+          gen_blocksize: 512
+          return_trace: true
+        sweep:
+          gen_steps: [512, 256, 128, 64]
+          token_selection_confidence_threshold: [0.8, 0.9]
+          min_transfer_tokens: [1]
