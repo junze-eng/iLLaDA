@@ -1,3 +1,16 @@
+# flake8: noqa: E501
+"""RULER Needle-in-a-Haystack single_1 config for iLLaDA Task 2.
+
+Important: use class objects for `type=...`, exactly like OpenCompass GSM8K/MBPP
+configs.  Do NOT use string names such as 'RulerNiahDataset'.  In this local
+OpenCompass fork the custom RULER module is not always in the registry at
+partition time, so string types can fail with:
+
+    KeyError: 'RulerNiahDataset is not in the opencompass::load_dataset registry'
+
+Class-object types bypass the registry lookup and match the working task1 style.
+"""
+
 from opencompass.datasets.ruler.ruler_niah import RulerNiahDataset, RulerNiahEvaluator
 from opencompass.openicl.icl_inferencer import GenInferencer
 from opencompass.openicl.icl_prompt_template import PromptTemplate
@@ -18,13 +31,13 @@ ruler_niah_single_1_infer_cfg = dict(
 )
 
 ruler_niah_single_1_eval_cfg = dict(
-    evaluator=dict(type='RulerNiahEvaluator'),
+    evaluator=dict(type=RulerNiahEvaluator),
     pred_role='BOT',
 )
 
 ruler_niah_single_1_datasets = [
     dict(
-        type='RulerNiahDataset',
+        type=RulerNiahDataset,
         abbr='ruler_niah_single_1',
         base_path='data/ruler',
         file_path='paul_graham_essay.jsonl',
