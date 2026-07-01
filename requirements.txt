@@ -1,0 +1,19 @@
+# Extra dependencies for running run_test.py / OpenCompass evaluation on a GPU box (e.g. RunPod).
+#
+# Install order matters:
+#   1. cd opencompass && pip install -e . && cd ..
+#      (this pulls in opencompass/requirements/runtime.txt, which pins numpy<2.0 and pandas<2.0 —
+#       do NOT pip install a newer pandas/numpy afterward, it can break OpenCompass's readers/summarizer)
+#   2. git clone https://github.com/open-compass/human-eval.git && cd human-eval && pip install -e . && cd ..
+#      (human-eval is not on PyPI under this name, must be installed from source)
+#   3. pip install -r requirements.txt
+
+transformers>=4.46.0
+accelerate>=0.34.2
+hf_xet
+math_verify
+latex2sympy2_extended
+antlr4-python3-runtime==4.11
+pyyaml
+matplotlib
+seaborn
