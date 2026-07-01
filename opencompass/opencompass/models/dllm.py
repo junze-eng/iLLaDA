@@ -309,7 +309,8 @@ class LLaDAModel(BaseModel):
                                                    peft_path,
                                                    is_trainable=False)
         self.model.eval()
-        self.model.generation_config.do_sample = False
+        if self.model.generation_config is not None:
+            self.model.generation_config.do_sample = False
 
         # A patch for llama when batch_padding = True
         if 'decapoda-research/llama' in path:
