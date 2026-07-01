@@ -64,6 +64,7 @@ def _dynamic_stop_token_ids(tokenizer=None, stop_token_ids=None):
     return sorted(set(int(token_id) for token_id in ids if token_id is not None))
 
 
+@torch.no_grad()
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False,
              confidence_eos_eot_inf=False, token_selection_confidence_threshold=None,
