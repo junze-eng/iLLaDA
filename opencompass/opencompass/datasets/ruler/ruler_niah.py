@@ -351,6 +351,10 @@ class RulerNiahEvaluator(BaseEvaluator):
 def _register_aliases():
     for name in (
         'RulerNiahDataset',
+        # MMEngine splits `opencompass.datasets.RulerNiahDataset` into scope=`opencompass`,
+        # real_key=`datasets.RulerNiahDataset`, so both forms are needed.
+        'datasets.RulerNiahDataset',
+        'datasets.ruler.ruler_niah.RulerNiahDataset',
         'opencompass.datasets.RulerNiahDataset',
         'opencompass.datasets.ruler.ruler_niah.RulerNiahDataset',
     ):
@@ -363,6 +367,9 @@ def _register_aliases():
     if ICL_EVALUATORS is not None:
         for name in (
             'RulerNiahEvaluator',
+            # Same MMEngine scoped-key behavior as dataset names.
+            'datasets.RulerNiahEvaluator',
+            'datasets.ruler.ruler_niah.RulerNiahEvaluator',
             'opencompass.datasets.RulerNiahEvaluator',
             'opencompass.datasets.ruler.ruler_niah.RulerNiahEvaluator',
         ):
