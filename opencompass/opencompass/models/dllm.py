@@ -469,9 +469,16 @@ class LLaDAModel(BaseModel):
                 'context_prefix_tokens': self.context_prefix_tokens,
                 'forward_passes': int(self.gen_steps),
                 'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
+                'planned_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
                 'arness': float(self.gen_steps / self.gen_length) if self.gen_length else None,
                 'final_mask_count': trace.get('final_mask_count') if trace else None,
-                'fallback_transfer_count': trace.get('fallback_transfer_count') if trace else None,
+                'remaining_masks': trace.get('final_mask_count') if trace else None,
+                'completion_rate': trace.get('completion_rate') if trace else None,
+                'actual_parallelism': trace.get('actual_parallelism') if trace else None,
+                'scheduled_transfer_count': trace.get('scheduled_transfer_count') if trace else None,
+                'threshold_passed_count': trace.get('threshold_passed_count') if trace else None,
+                'fallback_forced_count': trace.get('fallback_forced_count') if trace else None,
+                'actual_transfer_count': trace.get('actual_transfer_count') if trace else None,
                 **cuda_stats,
             }
             per_sample_records.append(record)
@@ -524,6 +531,7 @@ class LLaDAModel(BaseModel):
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
         attention_mask = encoded_prompt.get('attention_mask')
+        profile_trace = self.return_trace or bool(self.per_sample_output)
         self._cuda_stats_before()
         started = time.perf_counter()
         generated = LLaDA_generate(
@@ -541,12 +549,13 @@ class LLaDAModel(BaseModel):
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
             min_transfer_tokens = self.min_transfer_tokens,
-            return_trace = self.return_trace,
+            return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
+            tokenizer = self.tokenizer,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()
-        if self.return_trace:
+        if profile_trace:
             x, trace = generated
         else:
             x, trace = generated, None
@@ -690,6 +699,7 @@ class LLaDABaseModel(LLaDAModel):
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
         attention_mask = encoded_prompt.get('attention_mask')
+        profile_trace = self.return_trace or bool(self.per_sample_output)
         self._cuda_stats_before()
         started = time.perf_counter()
         generated = LLaDA_generate(
@@ -707,12 +717,13 @@ class LLaDABaseModel(LLaDAModel):
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
             min_transfer_tokens = self.min_transfer_tokens,
-            return_trace = self.return_trace,
+            return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
+            tokenizer = self.tokenizer,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()
-        if self.return_trace:
+        if profile_trace:
             x, trace = generated
         else:
             x, trace = generated, None

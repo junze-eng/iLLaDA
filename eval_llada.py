@@ -330,6 +330,7 @@ class LLaDAEvalHarness(LM):
             stop_tokens = elem["until"]
 
             self._cuda_stats_before()
+            profile_trace = self.return_trace or bool(self.per_sample_output)
             started = time.perf_counter()
             generated = generate(
                 self.model,
@@ -343,12 +344,13 @@ class LLaDAEvalHarness(LM):
                 mask_id=self.mask_id,
                 token_selection_confidence_threshold=self.token_selection_confidence_threshold,
                 min_transfer_tokens=self.min_transfer_tokens,
-                return_trace=self.return_trace,
+                return_trace=profile_trace,
                 trace_token_snapshots=self.trace_token_snapshots or self.trace_decode_snapshots,
+                tokenizer=self.tokenizer,
             )
             elapsed = time.perf_counter() - started
             cuda_stats = self._cuda_stats_after()
-            if self.return_trace:
+            if profile_trace:
                 generated_answer, trace = generated
             else:
                 generated_answer, trace = generated, None
@@ -385,9 +387,16 @@ class LLaDAEvalHarness(LM):
                 'min_transfer_tokens': self.min_transfer_tokens,
                 'forward_passes': int(self.steps),
                 'effective_parallelism': float(self.gen_length / self.steps) if self.steps else None,
+                'planned_parallelism': float(self.gen_length / self.steps) if self.steps else None,
                 'arness': float(self.steps / self.gen_length) if self.gen_length else None,
                 'final_mask_count': trace.get('final_mask_count') if trace else None,
-                'fallback_transfer_count': trace.get('fallback_transfer_count') if trace else None,
+                'remaining_masks': trace.get('final_mask_count') if trace else None,
+                'completion_rate': trace.get('completion_rate') if trace else None,
+                'actual_parallelism': trace.get('actual_parallelism') if trace else None,
+                'scheduled_transfer_count': trace.get('scheduled_transfer_count') if trace else None,
+                'threshold_passed_count': trace.get('threshold_passed_count') if trace else None,
+                'fallback_forced_count': trace.get('fallback_forced_count') if trace else None,
+                'actual_transfer_count': trace.get('actual_transfer_count') if trace else None,
                 **cuda_stats,
             }
             self._write_jsonl(self.per_sample_output, [per_sample_record])

@@ -5,10 +5,10 @@
 # Examples:
 #   python run_test.py --dry-run
 #   python run_test.py --only context
-#   python run_test.py --only paper_anchor_gsm8k
+#   python run_test.py --only cheap_anchor_gsm8k
 
 run:
-  # Choose from: paper_anchor, parallel, context, arness, trace_audit, capability, all
+  # Choose from: cheap_anchor, paper_budget_probe, parallel, context, arness, mechanism, trace_audit, capability, all
   tasks: [parallel]
   # Optional direct experiment names. Usually leave empty and use tasks above.
   experiments: []
@@ -71,10 +71,10 @@ defaults:
   context_prefix_tokens: 0
 
 tasks:
-  paper_anchor:
-    description: Full run on a small set of paper-anchor benchmarks; not a full paper reproduction.
+  cheap_anchor:
+    description: Cheap benchmark anchors for quick sanity checks; not a full paper reproduction.
     experiments:
-      - name: paper_anchor_arc_c
+      - name: cheap_anchor_arc_c
         # ARC-Challenge test is about 1.2k examples. null means run the full selected split.
         # For a cheap smoke test, set sample_limit to "[:100]".
         benchmark: arc_c
@@ -85,7 +85,7 @@ tasks:
           gen_blocksize: 512
           diff_confidence_eos_eot_inf: false
 
-      - name: paper_anchor_gsm8k
+      - name: cheap_anchor_gsm8k
         # GSM8K test has 1,319 examples. null means run the full selected split.
         # For a cheap smoke test, set sample_limit to "[:100]".
         benchmark: gsm8k
@@ -96,7 +96,7 @@ tasks:
           gen_blocksize: 32
           diff_confidence_eos_eot_inf: true
 
-      - name: paper_anchor_mbpp
+      - name: cheap_anchor_mbpp
         # MBPP/sanitized-MBPP is a few hundred examples depending on split.
         # null means run the full selected split. For a cheap smoke test, set "[:50]".
         benchmark: mbpp
@@ -110,27 +110,27 @@ tasks:
   parallel:
     description: Parallel token commitment sweep on math and code generation.
     experiments:
-      - name: parallel_gsm8k
+      - name: parallel_gsm8k_steps
         # GSM8K full test: 1,319. Start with 100; set null only for final full run.
         benchmark: gsm8k
         params:
           sample_limit: 100
           gen_length: 256
-          gen_steps: 256
           diff_confidence_eos_eot_inf: true
         sweep:
-          gen_blocksize: [1, 4, 8, 16, 32, 64, 128, 256]
+          gen_blocksize: [32, 64, 128]
+          gen_steps: [256, 128, 64, 32, 16, 8]
 
-      - name: parallel_mbpp
+      - name: parallel_mbpp_steps
         # MBPP full split is small but code execution is slower; start with 50.
         benchmark: mbpp
         params:
           sample_limit: 50
           gen_length: 512
-          gen_steps: 512
           diff_confidence_eos_eot_inf: true
         sweep:
-          gen_blocksize: [1, 4, 8, 16, 32, 64, 128, 256]
+          gen_blocksize: [32, 64, 128]
+          gen_steps: [512, 256, 128, 64, 32, 16]
 
   context:
     description: Context length diagnostic, primarily Needle/Passkey.
@@ -139,14 +139,15 @@ tasks:
         # Synthetic task. num_samples controls examples per context_length x position cell.
         benchmark: needle_passkey
         params:
-          num_samples: 20
+          num_samples: 30
           gen_length: 32
           gen_steps: 32
           gen_blocksize: 32
+          max_seq_len: 8192
           seed: 20260630
           return_trace: true
         sweep:
-          context_length: [512, 1024, 2048, 4096, 6144, 8192]
+          context_length: [512, 1024, 2048, 4096, 6144, 7600]
           needle_position: [front, middle, end]
 
       - name: context_gsm8k_padding_aux
@@ -164,33 +165,87 @@ tasks:
   arness:
     description: Confidence threshold and block-size grid for ARness analysis.
     experiments:
-      - name: arness_gsm8k_threshold
+      - name: arness_gsm8k_threshold_strict
         # GSM8K full test: 1,319. 100 samples x 12 grid cells is already useful.
         # For human inspection of every diffusion edit, use the trace_audit task below.
         benchmark: gsm8k
         params:
           sample_limit: 100
           gen_length: 256
-          gen_steps: 256
+          gen_steps: 64
+          gen_blocksize: 32
           diff_confidence_eos_eot_inf: true
+          min_transfer_tokens: 0
+          return_trace: true
         sweep:
-          gen_blocksize: [1, 8, 32]
-          token_selection_confidence_threshold: [null, 0.4, 0.6, 0.8]
-          return_trace: [true]
+          token_selection_confidence_threshold: [null, 0.5, 0.7, 0.85, 0.9, 0.95]
 
-      - name: arness_mbpp_threshold
-        # MBPP is slower because of code evaluation; start with 50 samples.
-        # For human inspection of every diffusion edit, use the trace_audit task below.
-        benchmark: mbpp
+      - name: arness_math_threshold_strict
+        benchmark: math
         params:
           sample_limit: 50
           gen_length: 512
-          gen_steps: 512
+          gen_steps: 128
+          gen_blocksize: 64
           diff_confidence_eos_eot_inf: true
+          min_transfer_tokens: 0
+          return_trace: true
         sweep:
-          gen_blocksize: [1, 8, 32]
-          token_selection_confidence_threshold: [null, 0.4, 0.6, 0.8]
-          return_trace: [true]
+          token_selection_confidence_threshold: [null, 0.7, 0.85, 0.9, 0.95]
+
+  mechanism:
+    description: Mechanism validation benchmarks outside the main GSM8K/MBPP sweep.
+    experiments:
+      - name: mechanism_math_subset
+        benchmark: math
+        params:
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 128
+          gen_blocksize: 64
+          diff_confidence_eos_eot_inf: true
+          return_trace: true
+
+      - name: mechanism_humaneval
+        benchmark: humaneval
+        params:
+          sample_limit: null
+          gen_length: 512
+          gen_steps: 128
+          gen_blocksize: 64
+          diff_logits_eos_inf: true
+          diff_confidence_eos_eot_inf: false
+          return_trace: true
+
+  paper_budget_probe:
+    description: Small probes using generation budgets closer to published settings.
+    experiments:
+      - name: paper_budget_probe_gsm8k
+        benchmark: gsm8k
+        params:
+          sample_limit: 50
+          gen_length: 2048
+          gen_steps: 2048
+          gen_blocksize: 32
+          diff_confidence_eos_eot_inf: true
+
+      - name: paper_budget_probe_mbpp
+        benchmark: mbpp
+        params:
+          sample_limit: 30
+          gen_length: 2048
+          gen_steps: 2048
+          gen_blocksize: 16
+          diff_confidence_eos_eot_inf: true
+
+      - name: paper_budget_probe_math
+        benchmark: math
+        params:
+          sample_limit: 30
+          gen_length: 4096
+          gen_steps: 4096
+          gen_blocksize: 32
+          diff_confidence_eos_eot_inf: true
 
   trace_audit:
     description: Small manually inspectable runs with full decoded per-step snapshots.

@@ -41,10 +41,34 @@ def get_num_transfer_tokens(mask_index, steps):
 
 
 @ torch.no_grad()
+def _dynamic_stop_token_ids(tokenizer=None, stop_token_ids=None):
+    ids = []
+    if stop_token_ids is not None:
+        ids.extend(stop_token_ids)
+    if tokenizer is not None:
+        candidates = [
+            getattr(tokenizer, 'eos_token_id', None),
+            tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+            tokenizer.convert_tokens_to_ids("</think>"),
+        ]
+        unk_id = getattr(tokenizer, 'unk_token_id', None)
+        vocab_size = len(tokenizer) if hasattr(tokenizer, '__len__') else None
+        for token_id in candidates:
+            if token_id is None:
+                continue
+            if token_id == unk_id:
+                continue
+            if vocab_size is not None and not (0 <= int(token_id) < vocab_size):
+                continue
+            ids.append(int(token_id))
+    return sorted(set(int(token_id) for token_id in ids if token_id is not None))
+
+
 def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, block_length=128, temperature=0.,
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False,
              confidence_eos_eot_inf=False, token_selection_confidence_threshold=None,
-             min_transfer_tokens=1, return_trace=False, trace_token_snapshots=False):
+             min_transfer_tokens=1, return_trace=False, trace_token_snapshots=False,
+             tokenizer=None, stop_token_ids=None):
     '''
     Args:
         model: Mask predictor.
@@ -66,6 +90,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         return_trace: If True, return (tokens, trace) with per-step transfer statistics.
         trace_token_snapshots: If True, include generated-region token IDs after every diffusion step.
     '''
+    planned_steps = int(steps)
+    stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
+
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
@@ -85,10 +112,16 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'gen_length': int(gen_length),
         'block_length': int(block_length),
         'steps_per_block': int(steps),
+        'planned_steps': int(planned_steps),
+        'num_blocks': int(num_blocks),
         'mask_id': int(mask_id),
+        'stop_token_ids': stop_token_ids,
         'token_selection_confidence_threshold': token_selection_confidence_threshold,
         'min_transfer_tokens': int(min_transfer_tokens),
-        'fallback_transfer_count': 0,
+        'scheduled_transfer_count': 0,
+        'threshold_passed_count': 0,
+        'fallback_forced_count': 0,
+        'actual_transfer_count': 0,
         'step_stats': [],
         'token_snapshots': [] if trace_token_snapshots else None,
     } if return_trace else None
@@ -110,14 +143,11 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             else:
                 logits = model(x, attention_mask=attention_mask).logits
 
-            if logits_eos_inf:
-                logits[:, :, 126081] = -torch.inf
+            if logits_eos_inf and stop_token_ids:
+                logits[:, :, stop_token_ids] = -torch.inf
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-            
-            if confidence_eos_eot_inf:
-                logits_with_noise[:, :, 126081] = logits[:, :, 126348] = -torch.inf
 
             if remasking == 'low_confidence':
                 p = F.softmax(logits, dim=-1)
@@ -132,45 +162,69 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
             x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, -np.inf)
+            if confidence_eos_eot_inf and stop_token_ids:
+                stop_predictions = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                for token_id in stop_token_ids:
+                    stop_predictions |= x0 == token_id
+                confidence = torch.where(stop_predictions, torch.full_like(confidence, -torch.inf), confidence)
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            step_transfer_count = 0
+            step_scheduled_count = 0
+            step_passed_count = 0
+            step_forced_count = 0
+            step_actual_count = 0
             step_confidence_sum = 0.0
             for j in range(confidence.shape[0]):
                 scheduled_count = int(num_transfer_tokens[j, i].item())
                 if scheduled_count <= 0:
                     continue
+                step_scheduled_count += scheduled_count
                 select_confidence, select_index = torch.topk(confidence[j], k=scheduled_count)
+                passed_count = scheduled_count
+                forced_count = 0
                 if token_selection_confidence_threshold is not None:
                     keep = select_confidence >= token_selection_confidence_threshold
+                    passed_count = int(keep.sum().item())
                     if keep.sum().item() == 0 and min_transfer_tokens > 0:
                         keep[:min(min_transfer_tokens, scheduled_count)] = True
-                        if trace is not None:
-                            trace['fallback_transfer_count'] += int(keep.sum().item())
+                        forced_count = int(keep.sum().item())
                     select_confidence = select_confidence[keep]
                     select_index = select_index[keep]
                 transfer_index[j, select_index] = True
-                step_transfer_count += int(select_index.numel())
+                actual_count = int(select_index.numel())
+                step_passed_count += passed_count
+                step_forced_count += forced_count
+                step_actual_count += actual_count
                 if select_confidence.numel() > 0:
                     step_confidence_sum += float(select_confidence.float().sum().item())
             x[transfer_index] = x0[transfer_index]
             if trace is not None:
+                trace['scheduled_transfer_count'] += int(step_scheduled_count)
+                trace['threshold_passed_count'] += int(step_passed_count)
+                trace['fallback_forced_count'] += int(step_forced_count)
+                trace['actual_transfer_count'] += int(step_actual_count)
                 trace['step_stats'].append({
-                    'block': int(num_block),
-                    'step': int(i),
-                    'transferred_tokens': step_transfer_count,
-                    'mean_confidence': step_confidence_sum / step_transfer_count if step_transfer_count else None,
+                    'block_id': int(num_block),
+                    'step_id': int(i),
+                    'scheduled': int(step_scheduled_count),
+                    'passed': int(step_passed_count),
+                    'forced': int(step_forced_count),
+                    'actual': int(step_actual_count),
+                    'transferred_tokens': int(step_actual_count),
+                    'mean_confidence': step_confidence_sum / step_actual_count if step_actual_count else None,
                     'remaining_masks': int((x == mask_id).sum().item()),
                 })
                 if trace_token_snapshots:
                     trace['token_snapshots'].append({
-                        'block': int(num_block),
-                        'step': int(i),
+                        'block_id': int(num_block),
+                        'step_id': int(i),
                         'generated_token_ids': x[:, prompt.shape[1]:].detach().cpu().tolist(),
                     })
 
     if trace is not None:
         trace['final_mask_count'] = int((x == mask_id).sum().item())
+        trace['completion_rate'] = 1.0 if trace['final_mask_count'] == 0 else 0.0
+        trace['actual_parallelism'] = trace['actual_transfer_count'] / planned_steps if planned_steps else None
     return (x, trace) if return_trace else x
 
 
@@ -208,7 +262,8 @@ def main():
     attention_mask = encoded_outputs['attention_mask'].to(device)
 
     out = generate(model, input_ids, attention_mask, steps=128, gen_length=128, block_length=32,
-                   temperature=0., cfg_scale=0., remasking='low_confidence', mask_id=mask_id)
+                   temperature=0., cfg_scale=0., remasking='low_confidence', mask_id=mask_id,
+                   tokenizer=tokenizer)
     output = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
     for o in output:
         print(o)

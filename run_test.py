@@ -74,13 +74,130 @@ def load_yaml(path: Path) -> Dict[str, Any]:
     try:
         import yaml
     except ImportError as exc:
-        raise SystemExit(
-            "PyYAML is required to read test_config.yaml. Install it with `pip install pyyaml`."
-        ) from exc
+        return load_simple_yaml(path)
 
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
+        raise SystemExit(f"Config must be a YAML mapping: {path}")
+    return data
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for idx, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:idx]
+    return line
+
+
+def _split_inline_list(value: str) -> List[str]:
+    items = []
+    current = []
+    in_single = False
+    in_double = False
+    for char in value:
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        if char == "," and not in_single and not in_double:
+            items.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    value = value.strip()
+    if value == "":
+        return None
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_yaml_scalar(item) for item in _split_inline_list(inner)]
+    lowered = value.lower()
+    if lowered in ("null", "none", "~"):
+        return None
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def load_simple_yaml(path: Path) -> Dict[str, Any]:
+    raw_lines = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            clean = _strip_yaml_comment(line).rstrip()
+            if clean.strip():
+                raw_lines.append((len(clean) - len(clean.lstrip(" ")), clean.strip()))
+
+    def parse_block(index: int, indent: int):
+        if index >= len(raw_lines):
+            return {}, index
+        if raw_lines[index][0] < indent:
+            return {}, index
+        is_list = raw_lines[index][0] == indent and raw_lines[index][1].startswith("- ")
+        if is_list:
+            result = []
+            while index < len(raw_lines) and raw_lines[index][0] == indent and raw_lines[index][1].startswith("- "):
+                item_text = raw_lines[index][1][2:].strip()
+                index += 1
+                if item_text == "":
+                    item, index = parse_block(index, indent + 2)
+                    result.append(item)
+                    continue
+                if ":" in item_text:
+                    key, value = item_text.split(":", 1)
+                    item = {key.strip(): _parse_yaml_scalar(value)}
+                    if index < len(raw_lines) and raw_lines[index][0] > indent:
+                        child, index = parse_block(index, indent + 2)
+                        if isinstance(child, dict):
+                            item.update(child)
+                    result.append(item)
+                else:
+                    result.append(_parse_yaml_scalar(item_text))
+            return result, index
+
+        result = {}
+        while index < len(raw_lines) and raw_lines[index][0] == indent and not raw_lines[index][1].startswith("- "):
+            text = raw_lines[index][1]
+            if ":" not in text:
+                raise SystemExit(f"Unsupported YAML line in {path}: {text}")
+            key, value = text.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            index += 1
+            if value:
+                result[key] = _parse_yaml_scalar(value)
+            else:
+                child, index = parse_block(index, indent + 2)
+                result[key] = child
+        return result, index
+
+    data, index = parse_block(0, 0)
+    if index != len(raw_lines) or not isinstance(data, dict):
         raise SystemExit(f"Config must be a YAML mapping: {path}")
     return data
 
@@ -435,6 +552,100 @@ def find_latest_opencompass_summary(work_dir: Path) -> Dict[str, Any]:
     return {"opencompass_summary_csv": str(latest)}
 
 
+PRIMARY_METRIC_CANDIDATES = [
+    "accuracy",
+    "acc",
+    "pass@1",
+    "exact_match",
+    "em",
+    "score",
+]
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("%"):
+        text = text[:-1]
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_opencompass_primary_metric(work_dir: Path, benchmark: str) -> Dict[str, Any]:
+    summary = find_latest_opencompass_summary(work_dir)
+    path_text = summary.get("opencompass_summary_csv")
+    if not path_text:
+        return summary
+    path = Path(path_text)
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return summary
+    if not rows:
+        return summary
+
+    def row_matches(row: Dict[str, Any]) -> bool:
+        haystack = " ".join(str(value).lower() for value in row.values() if value is not None)
+        return benchmark.lower() in haystack
+
+    candidate_rows = [row for row in rows if row_matches(row)] or rows
+
+    for metric_name in PRIMARY_METRIC_CANDIDATES:
+        for row in candidate_rows:
+            for key, value in row.items():
+                key_norm = (key or "").strip().lower()
+                if key_norm == metric_name:
+                    parsed = _to_float(value)
+                    if parsed is not None:
+                        return {
+                            **summary,
+                            "primary_metric_name": key,
+                            "primary_metric_value": parsed,
+                        }
+
+    for row in candidate_rows:
+        metric_label = None
+        for label_key in ("metric", "metrics", "name", "dataset"):
+            label = row.get(label_key)
+            if label and str(label).strip().lower() in PRIMARY_METRIC_CANDIDATES:
+                metric_label = str(label).strip()
+                break
+        if not metric_label:
+            continue
+        for key, value in row.items():
+            if key in ("metric", "metrics", "name", "dataset", "version", "mode"):
+                continue
+            parsed = _to_float(value)
+            if parsed is not None:
+                return {
+                    **summary,
+                    "primary_metric_name": metric_label,
+                    "primary_metric_value": parsed,
+                }
+
+    for metric_name in PRIMARY_METRIC_CANDIDATES:
+        for row in candidate_rows:
+            for key, value in row.items():
+                if metric_name in (str(key).lower() + " " + str(value).lower()):
+                    parsed = _to_float(value)
+                    if parsed is not None:
+                        return {
+                            **summary,
+                            "primary_metric_name": key,
+                            "primary_metric_value": parsed,
+                        }
+    return summary
+
+
 def upsert_csv_row(output_path: Path, row: Dict[str, Any]):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, Any]] = []
@@ -473,11 +684,23 @@ def write_run_summary(
     peak_alloc = numeric_values(samples, "cuda_max_memory_allocated_mb")
     peak_reserved = numeric_values(samples, "cuda_max_memory_reserved_mb")
     final_masks = numeric_values(samples, "final_mask_count")
-    fallback_counts = numeric_values(samples, "fallback_transfer_count")
+    completion_rates = numeric_values(samples, "completion_rate")
+    actual_parallelism = numeric_values(samples, "actual_parallelism")
+    scheduled_counts = numeric_values(samples, "scheduled_transfer_count")
+    threshold_passed_counts = numeric_values(samples, "threshold_passed_count")
+    fallback_forced_counts = numeric_values(samples, "fallback_forced_count")
+    actual_transfer_counts = numeric_values(samples, "actual_transfer_count")
     correctness = numeric_values(samples, "correctness")
     scores = numeric_values(samples, "score")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
     arness = numeric_values(samples, "arness")
+    gen_length = _to_float(params.get("gen_length"))
+    gen_steps = _to_float(params.get("gen_steps"))
+    gen_blocksize = _to_float(params.get("gen_blocksize"))
+    planned_parallelism = gen_length / gen_steps if gen_length and gen_steps else None
+    num_blocks = gen_length / gen_blocksize if gen_length and gen_blocksize else None
+    steps_per_block = gen_steps / num_blocks if gen_steps and num_blocks else None
+    peak_vram = max(peak_reserved or peak_alloc) if (peak_reserved or peak_alloc) else None
 
     row = {
         "run_name": run_name,
@@ -489,20 +712,38 @@ def write_run_summary(
         "latency_mean_s": mean(latencies),
         "latency_p50_s": percentile(latencies, 0.5),
         "latency_p95_s": percentile(latencies, 0.95),
+        "latency_mean": mean(latencies),
         "tokens_per_second_mean": mean(tps),
         "tokens_per_second_p50": percentile(tps, 0.5),
         "tokens_per_second_p95": percentile(tps, 0.95),
+        "peak_vram": peak_vram,
         "cuda_max_memory_allocated_mb": max(peak_alloc) if peak_alloc else None,
         "cuda_max_memory_reserved_mb": max(peak_reserved) if peak_reserved else None,
         "final_mask_count_sum": sum(final_masks) if final_masks else None,
-        "fallback_transfer_count_sum": sum(fallback_counts) if fallback_counts else None,
+        "final_mask_count": mean(final_masks),
+        "completion_rate": mean(completion_rates),
+        "planned_parallelism": planned_parallelism,
+        "num_blocks": num_blocks,
+        "steps_per_block": steps_per_block,
+        "actual_parallelism": mean(actual_parallelism),
+        "scheduled_transfer_count_sum": sum(scheduled_counts) if scheduled_counts else None,
+        "threshold_passed_count_sum": sum(threshold_passed_counts) if threshold_passed_counts else None,
+        "fallback_forced_count_sum": sum(fallback_forced_counts) if fallback_forced_counts else None,
+        "actual_transfer_count_sum": sum(actual_transfer_counts) if actual_transfer_counts else None,
         "accuracy_or_pass_rate": mean(correctness) if correctness else None,
         "score_mean": mean(scores) if scores else None,
         "effective_parallelism_mean": mean(effective_parallelism),
         "arness_mean": mean(arness),
         **telemetry_summary(telemetry_path),
-        **find_latest_opencompass_summary(work_dir),
+        **parse_opencompass_primary_metric(work_dir, benchmark),
     }
+    if row.get("primary_metric_value") is None:
+        if scores:
+            row["primary_metric_name"] = "score"
+            row["primary_metric_value"] = mean(scores)
+        elif correctness:
+            row["primary_metric_name"] = "correctness"
+            row["primary_metric_value"] = mean(correctness)
     for key, value in params.items():
         row[f"param_{key}"] = value
 
@@ -611,6 +852,7 @@ def run_needle_passkey(
     gen_steps = int(params.get("gen_steps", gen_length))
     gen_blocksize = int(params.get("gen_blocksize", gen_length))
     mask_id = int(model_cfg.get("mask_id", 5))
+    model_max_seq_len = int(params.get("max_seq_len", model_cfg.get("max_seq_len", 4096)))
     per_sample_path = Path(model_cfg["per_sample_output"])
     step_trace_path = Path(model_cfg["step_trace_output"]) if model_cfg.get("step_trace_output") else None
     per_sample_path.parent.mkdir(parents=True, exist_ok=True)
@@ -621,6 +863,9 @@ def run_needle_passkey(
         prompt = build_needle_prompt(tokenizer, context_length, needle_position, secret, sample_seed)
         encoded = tokenizer([prompt], add_special_tokens=False, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"].to(device)
+        actual_prompt_tokens = int(input_ids.shape[1])
+        actual_total_tokens = actual_prompt_tokens + gen_length
+        truncated = actual_total_tokens > model_max_seq_len
         attention_mask = encoded.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
@@ -644,6 +889,7 @@ def run_needle_passkey(
             min_transfer_tokens=int(params.get("min_transfer_tokens", 1)),
             return_trace=True,
             trace_token_snapshots=bool(params.get("trace_token_snapshots") or params.get("trace_decode_snapshots")),
+            tokenizer=tokenizer,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = cuda_stats_after(model.device)
@@ -660,8 +906,13 @@ def run_needle_passkey(
             "score": correct,
             "evaluator_status": "exact_secret_substring",
             "context_length": context_length,
+            "requested_context_length": context_length,
+            "actual_prompt_tokens": actual_prompt_tokens,
+            "actual_total_tokens": actual_total_tokens,
+            "model_max_seq_len": model_max_seq_len,
+            "truncated": truncated,
             "needle_position": needle_position,
-            "prompt_tokens": int(input_ids.shape[1]),
+            "prompt_tokens": actual_prompt_tokens,
             "generated_tokens": gen_length,
             "elapsed_seconds": round(elapsed, 6),
             "tokens_per_second": round(gen_length / elapsed, 6) if elapsed > 0 else None,
@@ -670,12 +921,19 @@ def run_needle_passkey(
             "block_length": gen_blocksize,
             "forward_passes": gen_steps,
             "effective_parallelism": float(gen_length / gen_steps) if gen_steps else None,
+            "planned_parallelism": float(gen_length / gen_steps) if gen_steps else None,
             "arness": float(gen_steps / gen_length) if gen_length else None,
             "mask_id": mask_id,
             "token_selection_confidence_threshold": params.get("token_selection_confidence_threshold"),
             "min_transfer_tokens": int(params.get("min_transfer_tokens", 1)),
             "final_mask_count": trace.get("final_mask_count"),
-            "fallback_transfer_count": trace.get("fallback_transfer_count"),
+            "remaining_masks": trace.get("final_mask_count"),
+            "completion_rate": trace.get("completion_rate"),
+            "actual_parallelism": trace.get("actual_parallelism"),
+            "scheduled_transfer_count": trace.get("scheduled_transfer_count"),
+            "threshold_passed_count": trace.get("threshold_passed_count"),
+            "fallback_forced_count": trace.get("fallback_forced_count"),
+            "actual_transfer_count": trace.get("actual_transfer_count"),
             **cuda_stats,
         }
         with per_sample_path.open("a", encoding="utf-8") as f:
