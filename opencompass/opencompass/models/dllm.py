@@ -468,61 +468,27 @@ class LLaDAModel(BaseModel):
         total_generated_tokens = self.gen_length * batch_size
         per_sample_records = []
         step_trace_records = []
-        trace_actual_transfer_count = trace.get('actual_transfer_count') if trace else None
-        trace_visible_tokens = [
-            len(self.tokenizer(response, add_special_tokens=False)['input_ids'])
-            for response in responses
-        ]
         for i in range(batch_size):
             sample_idx = self._profile_sample_idx
-            visible_output_tokens = int(trace_visible_tokens[i])
             record = {
-                'task_id': self.task_id,
                 'benchmark': self.benchmark,
                 'sample_idx': sample_idx,
                 'decoding_config_name': self.decoding_config_name,
-                'batch_size': int(batch_size),
-                'batch_item_idx': int(i),
                 'input': prompt_texts[i],
-                'tokenized_prompt': tokenized_prompts[i] if i < len(tokenized_prompts) else None,
                 'prediction': responses[i],
-                'target': None,
-                'correctness': None,
-                'official_score': None,
-                'score': None,
-                'evaluator_status': 'pending_opencompass_eval',
                 'failure_type': self._failure_type(responses[i], None, trace),
-                'prompt_tokens': int(prompt_tokens),
-                'generated_tokens': int(self.gen_length),
-                'batch_generated_tokens': int(total_generated_tokens),
                 'elapsed_seconds': round(elapsed, 6),
                 'tokens_per_second': round(total_generated_tokens / elapsed, 6) if elapsed > 0 else None,
-                'actual_commit_tps': round(trace_actual_transfer_count / elapsed, 6) if elapsed > 0 and trace_actual_transfer_count is not None else None,
-                'visible_tps': round(sum(trace_visible_tokens) / elapsed, 6) if elapsed > 0 else None,
-                'visible_output_tokens': visible_output_tokens,
                 'steps': int(self.gen_steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.gen_blocksize),
-                'mask_id': int(self.mask_id),
-                'remasking': self.remasking,
-                'cfg': float(self.cfg),
-                'temperature': float(self.temperature),
-                'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
-                'min_transfer_tokens': self.min_transfer_tokens,
-                'context_prefix_tokens': self.context_prefix_tokens,
                 'context_length': self.context_length,
                 'needle_position': self.needle_position,
-                'truncated': False,
                 'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
                 'arness': float(self.gen_steps / self.gen_length) if self.gen_length else None,
-                'final_mask_count': trace.get('final_mask_count') if trace else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
                 'actual_arness': trace.get('actual_arness') if trace else None,
-                'scheduled_transfer_count': trace.get('scheduled_transfer_count') if trace else None,
-                'threshold_passed_count': trace.get('threshold_passed_count') if trace else None,
-                'fallback_forced_count': trace.get('fallback_forced_count') if trace else None,
-                'actual_transfer_count': trace.get('actual_transfer_count') if trace else None,
                 'threshold_pass_rate': trace.get('threshold_pass_rate') if trace else None,
                 'fallback_rate': trace.get('fallback_rate') if trace else None,
                 **cuda_stats,

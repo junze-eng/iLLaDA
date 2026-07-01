@@ -563,10 +563,8 @@ def telemetry_summary(path: Path) -> Dict[str, Any]:
 
 
 def find_latest_opencompass_summary(work_dir: Path) -> Dict[str, Any]:
-    summary_dir = work_dir / "summary"
-    if not summary_dir.exists():
-        return {}
-    csv_files = sorted(summary_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # OpenCompass writes into work_dir/<timestamp>/summary/*.csv, not work_dir/summary directly.
+    csv_files = sorted(work_dir.glob("*/summary/*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not csv_files:
         return {}
     latest = csv_files[0]
@@ -704,29 +702,13 @@ def write_run_summary(
     tps = numeric_values(samples, "tokens_per_second")
     peak_alloc = numeric_values(samples, "cuda_max_memory_allocated_mb")
     peak_reserved = numeric_values(samples, "cuda_max_memory_reserved_mb")
-    final_masks = numeric_values(samples, "final_mask_count")
     completion_rates = numeric_values(samples, "completion_rate")
     actual_parallelism = numeric_values(samples, "actual_parallelism")
     actual_arness = numeric_values(samples, "actual_arness")
-    scheduled_counts = numeric_values(samples, "scheduled_transfer_count")
-    threshold_passed_counts = numeric_values(samples, "threshold_passed_count")
-    fallback_forced_counts = numeric_values(samples, "fallback_forced_count")
-    actual_transfer_counts = numeric_values(samples, "actual_transfer_count")
     threshold_pass_rates = numeric_values(samples, "threshold_pass_rate")
     fallback_rates = numeric_values(samples, "fallback_rate")
-    actual_commit_tps = numeric_values(samples, "actual_commit_tps")
-    visible_tps = numeric_values(samples, "visible_tps")
-    budget_tps = numeric_values(samples, "budget_tps")
-    correctness = numeric_values(samples, "correctness")
-    scores = numeric_values(samples, "official_score") or numeric_values(samples, "score")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
     arness = numeric_values(samples, "arness")
-    gen_length = _to_float(params.get("gen_length"))
-    gen_steps = _to_float(params.get("gen_steps"))
-    gen_blocksize = _to_float(params.get("gen_blocksize"))
-    planned_parallelism = gen_length / gen_steps if gen_length and gen_steps else None
-    num_blocks = gen_length / gen_blocksize if gen_length and gen_blocksize else None
-    steps_per_block = gen_steps / num_blocks if gen_steps and num_blocks else None
     peak_vram = max(peak_reserved or peak_alloc) if (peak_reserved or peak_alloc) else None
     failure_types = [str(sample.get("failure_type")) for sample in samples if sample.get("failure_type")]
 
@@ -736,7 +718,6 @@ def write_run_summary(
         return sum(1 for item in failure_types if item == name) / len(samples)
 
     row = {
-        "task_id": samples[0].get("task_id") if samples else None,
         "run_name": run_name,
         "experiment": experiment,
         "benchmark": benchmark,
@@ -744,27 +725,12 @@ def write_run_summary(
         "returncode": returncode,
         "elapsed_seconds": elapsed_seconds,
         "num_samples": len(samples),
-        "accuracy": mean(correctness) if correctness else None,
-        "official_score_avg": mean(scores) if scores else None,
         "format_failure_rate": failure_rate("format_failure"),
         "retrieval_failure_rate": failure_rate("retrieval_failure"),
         "task_failure_rate": failure_rate("task_failure"),
         "unfinished_generation_rate": failure_rate("unfinished_generation"),
         "truncation_failure_rate": failure_rate("truncation_failure"),
         "empty_output_rate": failure_rate("empty_output"),
-        "avg_elapsed_seconds": mean(latencies),
-        "avg_tokens_per_second": mean(tps),
-        "avg_visible_tps": mean(visible_tps),
-        "avg_forward_passes": mean(numeric_values(samples, "forward_passes") or numeric_values(samples, "steps")),
-        "avg_actual_parallelism": mean(actual_parallelism),
-        "avg_completion_rate": mean(completion_rates),
-        "avg_cuda_memory_allocated_mb": mean(peak_alloc),
-        "avg_cuda_memory_reserved_mb": mean(peak_reserved),
-        "arness": samples[0].get("arness") if samples else (gen_steps / gen_length if gen_length else None),
-        "block_length": samples[0].get("block_length") if samples else gen_blocksize,
-        "gen_length": samples[0].get("gen_length") if samples else gen_length,
-        "context_length": samples[0].get("context_length") if samples else params.get("context_length"),
-        "needle_position": samples[0].get("needle_position") if samples else params.get("needle_position"),
         "latency_mean_s": mean(latencies),
         "latency_p50_s": percentile(latencies, 0.5),
         "latency_p95_s": percentile(latencies, 0.95),
@@ -774,37 +740,16 @@ def write_run_summary(
         "peak_vram": peak_vram,
         "cuda_max_memory_allocated_mb": max(peak_alloc) if peak_alloc else None,
         "cuda_max_memory_reserved_mb": max(peak_reserved) if peak_reserved else None,
-        "final_mask_count_sum": sum(final_masks) if final_masks else None,
-        "final_mask_count": mean(final_masks),
         "completion_rate": mean(completion_rates),
-        "planned_parallelism": planned_parallelism,
-        "num_blocks": num_blocks,
-        "steps_per_block": steps_per_block,
         "actual_parallelism": mean(actual_parallelism),
         "actual_arness_mean": mean(actual_arness),
-        "scheduled_transfer_count_sum": sum(scheduled_counts) if scheduled_counts else None,
-        "threshold_passed_count_sum": sum(threshold_passed_counts) if threshold_passed_counts else None,
-        "fallback_forced_count_sum": sum(fallback_forced_counts) if fallback_forced_counts else None,
-        "actual_transfer_count_sum": sum(actual_transfer_counts) if actual_transfer_counts else None,
         "threshold_pass_rate_mean": mean(threshold_pass_rates),
         "fallback_rate_mean": mean(fallback_rates),
-        "actual_commit_tps_mean": mean(actual_commit_tps),
-        "visible_tps_mean": mean(visible_tps),
-        "budget_tps_mean": mean(budget_tps),
-        "accuracy_or_pass_rate": mean(correctness) if correctness else None,
-        "score_mean": mean(scores) if scores else None,
         "effective_parallelism_mean": mean(effective_parallelism),
         "arness_mean": mean(arness),
         **telemetry_summary(telemetry_path),
         **parse_opencompass_primary_metric(work_dir, benchmark),
     }
-    if row.get("primary_metric_value") is None:
-        if scores:
-            row["primary_metric_name"] = "score"
-            row["primary_metric_value"] = mean(scores)
-        elif correctness:
-            row["primary_metric_name"] = "correctness"
-            row["primary_metric_value"] = mean(correctness)
     for key, value in params.items():
         row[f"param_{key}"] = value
 
@@ -821,25 +766,18 @@ def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "decoding_config_name": row.get("decoding_config_name"),
         "primary_metric_name": row.get("primary_metric_name"),
         "primary_metric_value": row.get("primary_metric_value"),
-        "latency_mean": row.get("latency_mean_s") or row.get("avg_elapsed_seconds"),
-        "tokens_per_second_mean": row.get("tokens_per_second_mean") or row.get("avg_tokens_per_second"),
-        "visible_tps_mean": row.get("visible_tps_mean"),
-        "budget_tps_mean": row.get("budget_tps_mean"),
-        "actual_commit_tps_mean": row.get("actual_commit_tps_mean"),
+        "latency_mean": row.get("latency_mean_s"),
+        "tokens_per_second_mean": row.get("tokens_per_second_mean"),
         "peak_vram": row.get("peak_vram"),
-        "planned_parallelism": row.get("planned_parallelism"),
-        "actual_parallelism": row.get("actual_parallelism") or row.get("avg_actual_parallelism"),
-        "final_mask_count": row.get("final_mask_count"),
-        "completion_rate": row.get("completion_rate") or row.get("avg_completion_rate"),
-        "gen_length": row.get("gen_length"),
+        "actual_parallelism": row.get("actual_parallelism"),
+        "completion_rate": row.get("completion_rate"),
+        "gen_length": row.get("param_gen_length"),
         "gen_steps": row.get("param_gen_steps"),
-        "gen_blocksize": row.get("param_gen_blocksize") or row.get("block_length"),
-        "num_blocks": row.get("num_blocks"),
-        "steps_per_block": row.get("steps_per_block"),
+        "gen_blocksize": row.get("param_gen_blocksize"),
         "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
         "min_transfer_tokens": row.get("param_min_transfer_tokens"),
-        "context_length": row.get("context_length"),
-        "needle_position": row.get("needle_position"),
+        "context_length": row.get("param_context_length"),
+        "needle_position": row.get("param_needle_position"),
         "num_samples": row.get("num_samples"),
         "returncode": row.get("returncode"),
     }
