@@ -21,48 +21,18 @@ BENCHMARKS = {
         "module": "opencompass.configs.datasets.gsm8k.gsm8k_gen",
         "var": "gsm8k_datasets",
     },
-    "math": {
-        "module": "opencompass.configs.datasets.math.math_gen",
-        "var": "math_datasets",
-    },
-    "gpqa": {
-        "module": "opencompass.configs.datasets.gpqa.gpqa_gen",
-        "var": "gpqa_datasets",
-    },
-    "mmlu": {
-        "module": "opencompass.configs.datasets.mmlu.mmlu_gen_a484b3",
-        "var": "mmlu_datasets",
-        "summary_module": "opencompass.configs.summarizers.groups.mmlu",
-        "summary_var": "mmlu_summary_groups",
-    },
-    "mmlu_pro": {
-        "module": "opencompass.configs.datasets.mmlu_pro.mmlu_pro_gen",
-        "var": "mmlu_pro_datasets",
-    },
-    "hellaswag": {
-        "module": "opencompass.configs.datasets.hellaswag.hellaswag_gen",
-        "var": "hellaswag_datasets",
-    },
-    "arc_c": {
-        "module": "opencompass.configs.datasets.ARC_c.ARC_c_gen",
-        "var": "ARC_c_datasets",
-    },
-    "humaneval": {
-        "module": "opencompass.configs.datasets.humaneval.humaneval_gen",
-        "var": "humaneval_datasets",
-    },
     "mbpp": {
         "module": "opencompass.configs.datasets.mbpp.mbpp_gen",
         "var": "mbpp_datasets",
     },
-    "ifeval": {
-        "module": "opencompass.configs.datasets.IFEval.IFEval_gen",
-        "var": "ifeval_datasets",
+    "ruler_niah_single_1": {
+        "module": "opencompass.configs.datasets.ruler.ruler_niah_single_1",
+        "var": "ruler_niah_single_1_datasets",
     },
 }
 
-CUSTOM_BENCHMARKS = {"needle_passkey"}
-EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices"}
+CUSTOM_BENCHMARKS = set()
+EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "num_samples", "seed"}
 
 MODEL_TYPES = {
     "instruct": "LLaDAModel",
@@ -297,6 +267,8 @@ def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchm
     model_cfg["abbr"] = safe_name(f"{model_cfg['abbr']}_{run_name}")
     model_cfg["type"] = MODEL_TYPES[model_type]
     model_cfg.update({key: value for key, value in params.items() if key not in EXPERIMENT_ONLY_KEYS})
+    model_cfg["benchmark"] = benchmark
+    model_cfg["decoding_config_name"] = run_name
     return model_cfg
 
 
@@ -306,6 +278,7 @@ def render_opencompass_config(
     runner_cfg: Dict[str, Any],
     sample_limit: Any = None,
     sample_indices: Any = None,
+    experiment_params: Optional[Dict[str, Any]] = None,
 ) -> str:
     if benchmark not in BENCHMARKS:
         raise SystemExit(f"Unknown benchmark `{benchmark}`. Available: {', '.join(sorted(BENCHMARKS))}")
@@ -340,6 +313,22 @@ def render_opencompass_config(
         imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
     if "summary_var" in bench:
         imports.append(f"summarizer = dict(summary_groups={bench['summary_var']})")
+    if benchmark == "ruler_niah_single_1":
+        experiment_params = experiment_params or {}
+        context_length = model_cfg.get("context_length")
+        num_samples = experiment_params.get("num_samples")
+        needle_position = model_cfg.get("needle_position")
+        depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
+        imports.append("for _dataset in datasets:")
+        if context_length is not None:
+            imports.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
+        if num_samples is not None:
+            imports.append(f"    _dataset['num_samples'] = {python_literal(int(num_samples))}")
+        if needle_position is not None:
+            depths = depth_by_position.get(str(needle_position), None)
+            if depths is None:
+                raise SystemExit(f"Unsupported needle_position `{needle_position}` for ruler_niah_single_1.")
+            imports.append(f"    _dataset['depth_percents'] = {python_literal(depths)}")
 
     model_entries = ",\n        ".join(
         f"{key}={python_literal(value)}" for key, value in model_cfg.items()
@@ -696,7 +685,7 @@ def write_run_summary(
     actual_commit_tps = numeric_values(samples, "actual_commit_tps")
     visible_tps = numeric_values(samples, "visible_tps")
     correctness = numeric_values(samples, "correctness")
-    scores = numeric_values(samples, "score")
+    scores = numeric_values(samples, "official_score") or numeric_values(samples, "score")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
     arness = numeric_values(samples, "arness")
     gen_length = _to_float(params.get("gen_length"))
@@ -706,14 +695,43 @@ def write_run_summary(
     num_blocks = gen_length / gen_blocksize if gen_length and gen_blocksize else None
     steps_per_block = gen_steps / num_blocks if gen_steps and num_blocks else None
     peak_vram = max(peak_reserved or peak_alloc) if (peak_reserved or peak_alloc) else None
+    failure_types = [str(sample.get("failure_type")) for sample in samples if sample.get("failure_type")]
+
+    def failure_rate(name: str) -> Optional[float]:
+        if not samples:
+            return None
+        return sum(1 for item in failure_types if item == name) / len(samples)
 
     row = {
+        "task_id": samples[0].get("task_id") if samples else None,
         "run_name": run_name,
         "experiment": experiment,
         "benchmark": benchmark,
+        "decoding_config_name": samples[0].get("decoding_config_name") if samples else run_name,
         "returncode": returncode,
         "elapsed_seconds": elapsed_seconds,
         "num_samples": len(samples),
+        "accuracy": mean(correctness) if correctness else None,
+        "official_score_avg": mean(scores) if scores else None,
+        "format_failure_rate": failure_rate("format_failure"),
+        "retrieval_failure_rate": failure_rate("retrieval_failure"),
+        "task_failure_rate": failure_rate("task_failure"),
+        "unfinished_generation_rate": failure_rate("unfinished_generation"),
+        "truncation_failure_rate": failure_rate("truncation_failure"),
+        "empty_output_rate": failure_rate("empty_output"),
+        "avg_elapsed_seconds": mean(latencies),
+        "avg_tokens_per_second": mean(tps),
+        "avg_visible_tps": mean(visible_tps),
+        "avg_forward_passes": mean(numeric_values(samples, "forward_passes") or numeric_values(samples, "steps")),
+        "avg_actual_parallelism": mean(actual_parallelism),
+        "avg_completion_rate": mean(completion_rates),
+        "avg_cuda_memory_allocated_mb": mean(peak_alloc),
+        "avg_cuda_memory_reserved_mb": mean(peak_reserved),
+        "arness": samples[0].get("arness") if samples else (gen_steps / gen_length if gen_length else None),
+        "block_length": samples[0].get("block_length") if samples else gen_blocksize,
+        "gen_length": samples[0].get("gen_length") if samples else gen_length,
+        "context_length": samples[0].get("context_length") if samples else params.get("context_length"),
+        "needle_position": samples[0].get("needle_position") if samples else params.get("needle_position"),
         "latency_mean_s": mean(latencies),
         "latency_p50_s": percentile(latencies, 0.5),
         "latency_p95_s": percentile(latencies, 0.95),
@@ -791,6 +809,8 @@ def cuda_stats_after(device) -> Dict[str, Any]:
 
 
 def build_needle_prompt(tokenizer, context_length: int, needle_position: str, secret: str, seed: int) -> str:
+    """Deprecated: kept only to document the removed synthetic benchmark path."""
+    raise RuntimeError("needle_passkey is deprecated and is not available from the main runner.")
     filler_unit = (
         f"Record {seed}: ocean logistics, warehouse timing, and invoice notes are unrelated. "
         "The evaluation should ignore these details. "
@@ -828,6 +848,8 @@ def run_needle_passkey(
     params: Dict[str, Any],
     work_dir: Path,
 ) -> int:
+    """Deprecated: custom needle_passkey runs are intentionally disabled."""
+    raise RuntimeError("needle_passkey is deprecated and is not available from the main runner.")
     try:
         import torch
         from transformers import AutoModel, AutoTokenizer
@@ -1017,26 +1039,22 @@ def main() -> int:
                 run_name = safe_name(f"{exp_name}_{benchmark}_{idx}")
                 work_dir = output_dir / run_name
                 model_cfg = build_model_cfg(global_model, merged_params, benchmark, run_name)
+                model_cfg["task_id"] = experiment.get("task")
                 if execution_cfg.get("collect_metrics", True) and not model_cfg.get("metrics_output"):
-                    model_cfg["per_sample_output"] = str(work_dir / "per_sample.jsonl")
-                    if model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
-                        model_cfg["step_trace_output"] = str(work_dir / "step_trace.jsonl")
-                    model_cfg["metrics_output"] = str(work_dir / "per_sample.jsonl")
+                    model_cfg["per_sample_output"] = str(work_dir / "summary.jsonl")
+                    if model_cfg.get("return_trace") or model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
+                        model_cfg["step_trace_output"] = str(work_dir / "trace.jsonl")
+                    model_cfg["metrics_output"] = str(work_dir / "summary.jsonl")
                 generated_config = generated_dir / f"{run_name}.py"
-                if is_custom_benchmark(benchmark):
-                    generated_config.write_text(
-                        "# Custom diagnostic benchmark; executed directly by run_test.py.\n",
-                        encoding="utf-8",
-                    )
-                else:
-                    config_text = render_opencompass_config(
-                        benchmark,
-                        deepcopy(model_cfg),
-                        runner_cfg,
-                        sample_limit=merged_params.get("sample_limit"),
-                        sample_indices=merged_params.get("sample_indices"),
-                    )
-                    generated_config.write_text(config_text, encoding="utf-8")
+                config_text = render_opencompass_config(
+                    benchmark,
+                    deepcopy(model_cfg),
+                    runner_cfg,
+                    sample_limit=merged_params.get("sample_limit"),
+                    sample_indices=merged_params.get("sample_indices"),
+                    experiment_params=merged_params,
+                )
+                generated_config.write_text(config_text, encoding="utf-8")
                 work_dir.mkdir(parents=True, exist_ok=True)
                 run_config = {
                     "run_name": run_name,
@@ -1055,18 +1073,15 @@ def main() -> int:
                     encoding="utf-8",
                 )
 
-                if is_custom_benchmark(benchmark):
-                    command = [sys.executable, "run_test.py", "--custom-benchmark", benchmark, "--run-name", run_name]
-                else:
-                    command = [
-                        sys.executable,
-                        "run.py",
-                        str(generated_config),
-                        "-w",
-                        str(work_dir),
-                    ]
-                    extra_args = execution_cfg.get("opencompass_args", []) or []
-                    command.extend(str(item) for item in extra_args)
+                command = [
+                    sys.executable,
+                    "run.py",
+                    str(generated_config),
+                    "-w",
+                    str(work_dir),
+                ]
+                extra_args = execution_cfg.get("opencompass_args", []) or []
+                command.extend(str(item) for item in extra_args)
 
                 manifest = {
                     "run_name": run_name,
@@ -1083,10 +1098,10 @@ def main() -> int:
                     "gpu_before": current_gpu_snapshot(),
                     "artifacts": {
                         "config_json": str(work_dir / "config.json"),
-                        "per_sample_jsonl": model_cfg.get("per_sample_output") or model_cfg.get("metrics_output"),
-                        "step_trace_jsonl": model_cfg.get("step_trace_output"),
+                        "summary_jsonl": model_cfg.get("per_sample_output") or model_cfg.get("metrics_output"),
+                        "trace_jsonl": model_cfg.get("step_trace_output"),
                         "gpu_telemetry_csv": str(work_dir / "gpu_telemetry.csv"),
-                        "summary_csv": str(work_dir / "summary.csv"),
+                        "aggregate_csv": str(work_dir / "aggregate.csv"),
                     },
                 }
                 print(f"[{run_name}] config: {generated_config}")
@@ -1101,11 +1116,7 @@ def main() -> int:
                         telemetry.start()
                     start = time.perf_counter()
                     try:
-                        if is_custom_benchmark(benchmark):
-                            print(f"$ run custom benchmark {benchmark} ({run_name})", flush=True)
-                            returncode = run_needle_passkey(model_cfg, merged_params, work_dir)
-                        else:
-                            returncode = run_command(command, OPENCOMPASS_DIR, env)
+                        returncode = run_command(command, OPENCOMPASS_DIR, env)
                     finally:
                         if telemetry is not None:
                             telemetry.stop()
@@ -1114,7 +1125,7 @@ def main() -> int:
                     manifest["returncode"] = returncode
                     manifest["gpu_after"] = current_gpu_snapshot()
                     run_summary = write_run_summary(
-                        output_path=work_dir / "summary.csv",
+                        output_path=work_dir / "aggregate.csv",
                         run_name=run_name,
                         experiment=exp_name,
                         benchmark=benchmark,
@@ -1125,7 +1136,7 @@ def main() -> int:
                         returncode=returncode,
                         elapsed_seconds=elapsed_seconds,
                     )
-                    upsert_csv_row(output_dir / "summary_all.csv", run_summary)
+                    upsert_csv_row(output_dir / "aggregate_all.csv", run_summary)
                     with manifest_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(manifest, ensure_ascii=False) + "\n")
                     if returncode != 0 and execution_cfg.get("stop_on_error", True):

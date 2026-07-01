@@ -1,16 +1,8 @@
-# Default iLLaDA experiment plan.
-# Edit `run.tasks` to choose which task section to run, then:
-#   python run_test.py
-#
-# Examples:
-#   python run_test.py --dry-run
-#   python run_test.py --only context
-#   python run_test.py --only parallel_gsm8k_steps
+# First-stage iLLaDA evaluation plan.
+# Official benchmark prompts/evaluators are owned by OpenCompass configs.
 
 run:
-  # Choose from: parallel, context, arness, trace_audit, capability, all
   tasks: [parallel, context, arness]
-  # Optional direct experiment names. Usually leave empty and use tasks above.
   experiments: []
 
 execution:
@@ -51,260 +43,135 @@ runner:
     retry: 1
 
 defaults:
-  # Standard OpenCompass benchmarks use sample_limit -> reader_cfg.test_range.
-  # Set sample_limit: null for full dataset, or a string like "[:200]" / "[200:400]".
-  # For manual trace audits, prefer sample_indices: [0, 7, 23] to lock exact examples.
-  sample_limit: 100
+  sample_limit: 50
   sample_indices: null
   gen_length: 256
   gen_steps: 256
-  gen_blocksize: 16
+  gen_blocksize: 256
   diff_confidence_eos_eot_inf: true
   diff_logits_eos_inf: false
   token_selection_confidence_threshold: null
   min_transfer_tokens: 1
-  return_trace: false
-  # Keep snapshots off for normal sweeps because they can make step_trace.jsonl large.
-  # For 1-3 human-inspection samples, set both return_trace and trace_decode_snapshots to true.
+  return_trace: true
   trace_token_snapshots: false
   trace_decode_snapshots: false
   context_prefix_tokens: 0
+  context_length: null
+  needle_position: null
 
 tasks:
   parallel:
-    description: Main generation parallelism sweep. Also produces trace-derived ARness baseline.
+    description: "Task 1: GSM8K/MBPP parallel token restoration sweep."
     experiments:
-      - name: parallel_gsm8k_steps
-        # GSM8K full test: 1,319. Start with 100; set null only for final full run.
+      - name: task1_gsm8k_ar_like
         benchmark: gsm8k
         params:
-          sample_limit: 100
+          sample_limit: 50
           gen_length: 256
-          diff_confidence_eos_eot_inf: true
-          return_trace: true
-          trace_token_snapshots: false
-          trace_decode_snapshots: false
-        sweep:
-          gen_blocksize: [32, 64, 128]
-          gen_steps: [256, 128, 64, 32, 16, 8]
+          gen_steps: 256
+          gen_blocksize: 256
+          min_transfer_tokens: 1
 
-      - name: parallel_mbpp_steps
-        # MBPP full split is small but code execution is slower; start with 50.
+      - name: task1_gsm8k_mild_parallel
+        benchmark: gsm8k
+        params:
+          sample_limit: 50
+          gen_length: 256
+          gen_steps: 64
+          gen_blocksize: 256
+          min_transfer_tokens: 4
+
+      - name: task1_gsm8k_strong_parallel
+        benchmark: gsm8k
+        params:
+          sample_limit: 50
+          gen_length: 256
+          gen_steps: 32
+          gen_blocksize: 256
+          min_transfer_tokens: 8
+
+      - name: task1_mbpp_ar_like
         benchmark: mbpp
         params:
           sample_limit: 50
           gen_length: 512
-          diff_confidence_eos_eot_inf: true
-          return_trace: true
-          trace_token_snapshots: false
-          trace_decode_snapshots: false
-        sweep:
-          gen_blocksize: [32, 64, 128]
-          gen_steps: [512, 256, 128, 64, 32, 16]
+          gen_steps: 512
+          gen_blocksize: 512
+          min_transfer_tokens: 1
+
+      - name: task1_mbpp_mild_parallel
+        benchmark: mbpp
+        params:
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 128
+          gen_blocksize: 512
+          min_transfer_tokens: 4
+
+      - name: task1_mbpp_strong_parallel
+        benchmark: mbpp
+        params:
+          sample_limit: 50
+          gen_length: 512
+          gen_steps: 64
+          gen_blocksize: 512
+          min_transfer_tokens: 8
 
   context:
-    description: Context length diagnostic, retrieval plus distraction robustness.
+    description: "Task 2: RULER NIAH single_1 context-length sweep."
     experiments:
-      - name: context_needle_passkey
-        # Synthetic task. num_samples controls examples per context_length x position cell.
-        benchmark: needle_passkey
+      - name: task2_ruler_niah_single_1
+        benchmark: ruler_niah_single_1
         params:
-          num_samples: 30
-          # Was 32/32/32: the instruct model emits a <think>...</think> preamble before the
-          # answer, so 32 tokens got cut off mid-thought before ever stating the code
-          # (every sample scored correctness=0 regardless of retrieval ability). Bumped to
-          # 128 so there's room to finish reasoning and actually answer.
+          sample_limit: null
+          num_samples: 20
           gen_length: 128
-          gen_steps: 128
           gen_blocksize: 128
           max_seq_len: 8192
-          seed: 20260630
-          return_trace: true
+          min_transfer_tokens: 1
         sweep:
-          context_length: [512, 1024, 2048, 4096, 6144, 7600]
-          needle_position: [front, middle, end]
-
-      - name: context_gsm8k_padding_aux
-        # Auxiliary distraction check on GSM8K. Keep small unless needed.
-        benchmark: gsm8k
-        params:
-          sample_limit: 100
-          gen_length: 256
-          gen_steps: 256
-          gen_blocksize: 32
-          max_seq_len: 8192
-          diff_confidence_eos_eot_inf: true
-          return_trace: true
-        sweep:
-          context_prefix_tokens: [0, 512, 1024, 2048, 4096, 6144]
+          context_length: [512, 2048, 8192]
+          needle_position: [front, middle, back]
+          gen_steps: [128, 32, 16]
 
   arness:
-    description: Threshold extension of task1, not a separate benchmark family.
+    description: "Task 3: small counterfactual threshold runs on Task 1/2 benchmarks."
     experiments:
-      - name: arness_gsm8k_threshold_extension
-        # GSM8K full test: 1,319. 100 samples x 12 grid cells is already useful.
-        # For human inspection of every diffusion edit, use the trace_audit task below.
+      - name: task3_gsm8k_threshold_counterfactual
         benchmark: gsm8k
         params:
-          sample_limit: 100
+          sample_limit: 10
           gen_length: 256
-          gen_steps: 64
-          gen_blocksize: 32
-          diff_confidence_eos_eot_inf: true
-          min_transfer_tokens: 0
-          return_trace: true
-          trace_token_snapshots: false
-          trace_decode_snapshots: false
-        sweep:
-          token_selection_confidence_threshold: [null, 0.5, 0.7, 0.85, 0.9, 0.95]
-
-      - name: arness_mbpp_threshold_extension
-        benchmark: mbpp
-        params:
-          sample_limit: 50
-          gen_length: 512
-          gen_steps: 128
-          gen_blocksize: 64
-          diff_confidence_eos_eot_inf: true
-          min_transfer_tokens: 0
-          return_trace: true
-          trace_token_snapshots: false
-          trace_decode_snapshots: false
-        sweep:
-          token_selection_confidence_threshold: [null, 0.5, 0.7, 0.85, 0.9, 0.95]
-
-  trace_audit:
-    description: Small manually inspectable runs with full decoded per-step snapshots.
-    experiments:
-      - name: trace_audit_gsm8k
-        # These are original GSM8K split indices, not positions after sample_limit.
-        # Workflow: first inspect per_sample.jsonl from a trend run, then put interesting sample_idx values here.
-        benchmark: gsm8k
-        params:
-          sample_limit: null
-          sample_indices: [0, 7, 23]
-          gen_length: 256
-          gen_steps: 256
-          diff_confidence_eos_eot_inf: true
-          return_trace: true
-          trace_decode_snapshots: true
-        sweep:
-          gen_blocksize: [1, 8, 32]
-          token_selection_confidence_threshold: [null, 0.6, 0.8]
-
-      - name: trace_audit_mbpp
-        # These are original MBPP split indices, not positions after sample_limit.
-        # Keep this tiny because each snapshot stores decoded text for every diffusion step.
-        benchmark: mbpp
-        params:
-          sample_limit: null
-          sample_indices: [0, 5, 12]
-          gen_length: 512
-          gen_steps: 512
-          diff_confidence_eos_eot_inf: true
-          return_trace: true
-          trace_decode_snapshots: true
-        sweep:
-          gen_blocksize: [1, 8, 32]
-          token_selection_confidence_threshold: [null, 0.6, 0.8]
-
-  capability:
-    description: Optional broader paper-comparable snapshots. Disabled unless selected via run.tasks or --only.
-    experiments:
-      - name: capability_mmlu
-        # MMLU is large across many subjects. Use 200 for a quick snapshot.
-        benchmark: mmlu
-        params:
-          sample_limit: 200
-          gen_length: 3
-          gen_steps: 3
-          gen_blocksize: 3
-          diff_confidence_eos_eot_inf: false
-
-      - name: capability_mmlu_pro
-        # MMLU-Pro is large and slower. Use 200 unless doing a final run.
-        benchmark: mmlu_pro
-        params:
-          sample_limit: 200
-          gen_length: 256
-          gen_steps: 256
           gen_blocksize: 256
-          diff_confidence_eos_eot_inf: false
+          return_trace: true
+        sweep:
+          gen_steps: [256, 128, 64, 32]
+          token_selection_confidence_threshold: [0.8, 0.9]
+          min_transfer_tokens: [1]
 
-      - name: capability_hellaswag
-        # HellaSwag validation/test is large. Use 200 for snapshot.
-        benchmark: hellaswag
-        params:
-          sample_limit: 200
-          gen_length: 3
-          gen_steps: 3
-          gen_blocksize: 3
-          diff_confidence_eos_eot_inf: false
-
-      - name: capability_arc_c
-        benchmark: arc_c
-        params:
-          sample_limit: 200
-          gen_length: 512
-          gen_steps: 512
-          gen_blocksize: 512
-          diff_confidence_eos_eot_inf: false
-
-      - name: capability_gsm8k
-        benchmark: gsm8k
-        params:
-          sample_limit: 200
-          gen_length: 256
-          gen_steps: 256
-          gen_blocksize: 16
-          diff_confidence_eos_eot_inf: true
-
-      - name: capability_math
-        # MATH is larger and generation-heavy. Use 200 for snapshot.
-        benchmark: math
-        params:
-          sample_limit: 200
-          gen_length: 512
-          gen_steps: 512
-          gen_blocksize: 64
-          diff_confidence_eos_eot_inf: true
-
-      - name: capability_gpqa
-        # GPQA is smaller but expensive to generate/judge. Use 200 or full after smoke.
-        benchmark: gpqa
-        params:
-          sample_limit: 200
-          gen_length: 64
-          gen_steps: 64
-          gen_blocksize: 64
-          diff_confidence_eos_eot_inf: true
-
-      - name: capability_humaneval
-        # HumanEval has 164 problems; null means full HumanEval.
-        benchmark: humaneval
-        params:
-          sample_limit: null
-          gen_length: 512
-          gen_steps: 512
-          gen_blocksize: 512
-          diff_logits_eos_inf: true
-          diff_confidence_eos_eot_inf: false
-
-      - name: capability_mbpp
+      - name: task3_mbpp_threshold_counterfactual
         benchmark: mbpp
         params:
-          sample_limit: 100
-          gen_length: 256
-          gen_steps: 256
-          gen_blocksize: 256
-          diff_confidence_eos_eot_inf: true
-
-      - name: capability_ifeval
-        # IFEval has a few hundred prompts. Use 200 for snapshot.
-        benchmark: ifeval
-        params:
-          sample_limit: 200
+          sample_limit: 10
           gen_length: 512
-          gen_steps: 512
           gen_blocksize: 512
-          diff_confidence_eos_eot_inf: true
+          return_trace: true
+        sweep:
+          gen_steps: [512, 256, 128, 64]
+          token_selection_confidence_threshold: [0.8, 0.9]
+          min_transfer_tokens: [1]
+
+      - name: task3_ruler_threshold_counterfactual
+        benchmark: ruler_niah_single_1
+        params:
+          sample_limit: null
+          num_samples: 5
+          gen_length: 128
+          gen_blocksize: 128
+          context_length: 2048
+          needle_position: middle
+          return_trace: true
+        sweep:
+          gen_steps: [128, 64, 32, 16]
+          token_selection_confidence_threshold: [0.8, 0.9]
+          min_transfer_tokens: [1]

@@ -155,6 +155,12 @@ class LLaDAModel(BaseModel):
                  trace_decode_snapshots = False,
                  context_prefix_tokens = 0,
                  context_prefix_text = 'Context padding sentence. ',
+                 benchmark = None,
+                 task_id = None,
+                 decoding_config_name = None,
+                 context_length = None,
+                 needle_position = None,
+                 **kwargs,
                  ) -> None:
         super().__init__(path=path,
                          max_seq_len=max_seq_len,
@@ -204,6 +210,11 @@ class LLaDAModel(BaseModel):
         self.trace_decode_snapshots = bool(trace_decode_snapshots)
         self.context_prefix_tokens = int(context_prefix_tokens)
         self.context_prefix_text = context_prefix_text
+        self.benchmark = benchmark
+        self.task_id = task_id
+        self.decoding_config_name = decoding_config_name
+        self.context_length = context_length
+        self.needle_position = needle_position
         self._profile_sample_idx = 0
         for output_path in (self.per_sample_output, self.step_trace_output):
             if output_path:
@@ -436,7 +447,22 @@ class LLaDAModel(BaseModel):
         trace['token_snapshots'] = snapshots
         return trace
 
-    def _build_profile_records(self, prompt_texts, responses, prompt_tokens, elapsed, trace, cuda_stats):
+    def _failure_type(self, prediction, correctness, trace):
+        if correctness == 1:
+            return 'correct'
+        if prediction is None or str(prediction).strip() == '':
+            return 'empty_output'
+        if trace and (trace.get('final_mask_count', 0) > 0 or (trace.get('completion_rate') is not None and trace.get('completion_rate') < 1)):
+            return 'unfinished_generation'
+        lower = str(prediction).strip().lower()
+        role_like = lower in ('assistant', '<think>', '</think>') or lower.startswith('assistant') or lower.startswith('<think>')
+        if role_like:
+            return 'format_failure'
+        if self.benchmark and 'ruler_niah' in str(self.benchmark):
+            return 'retrieval_failure'
+        return 'task_failure'
+
+    def _build_profile_records(self, prompt_texts, tokenized_prompts, responses, prompt_tokens, elapsed, trace, cuda_stats):
         batch_size = len(responses)
         total_generated_tokens = self.gen_length * batch_size
         per_sample_records = []
@@ -450,14 +476,26 @@ class LLaDAModel(BaseModel):
             sample_idx = self._profile_sample_idx
             visible_output_tokens = int(trace_visible_tokens[i])
             record = {
+                'task_id': self.task_id,
+                'benchmark': self.benchmark,
                 'sample_idx': sample_idx,
+                'sample_id': sample_idx,
+                'decoding_config_name': self.decoding_config_name,
                 'batch_size': int(batch_size),
                 'batch_item_idx': int(i),
                 'input': prompt_texts[i],
+                'raw_prompt': prompt_texts[i],
+                'tokenized_prompt': tokenized_prompts[i] if i < len(tokenized_prompts) else None,
                 'prediction': responses[i],
+                'raw_prediction': responses[i],
+                'decoded_prediction': responses[i],
+                'normalized_prediction': responses[i].strip() if isinstance(responses[i], str) else responses[i],
+                'target': None,
                 'correctness': None,
+                'official_score': None,
                 'score': None,
                 'evaluator_status': 'pending_opencompass_eval',
+                'failure_type': self._failure_type(responses[i], None, trace),
                 'prompt_tokens': int(prompt_tokens),
                 'generated_tokens': int(self.gen_length),
                 'batch_generated_tokens': int(total_generated_tokens),
@@ -467,6 +505,7 @@ class LLaDAModel(BaseModel):
                 'visible_tps': round(sum(trace_visible_tokens) / elapsed, 6) if elapsed > 0 else None,
                 'visible_output_tokens': visible_output_tokens,
                 'steps': int(self.gen_steps),
+                'forward_passes': trace.get('forward_passes') if trace else int(self.gen_steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.gen_blocksize),
                 'mask_id': int(self.mask_id),
@@ -476,9 +515,15 @@ class LLaDAModel(BaseModel):
                 'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
                 'min_transfer_tokens': self.min_transfer_tokens,
                 'context_prefix_tokens': self.context_prefix_tokens,
+                'context_length': self.context_length,
+                'needle_position': self.needle_position,
+                'truncated': False,
+                'budget_tps': round(self.gen_length / elapsed, 6) if elapsed > 0 else None,
                 'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
+                'planned_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
                 'arness': float(self.gen_steps / self.gen_length) if self.gen_length else None,
                 'final_mask_count': trace.get('final_mask_count') if trace else None,
+                'remaining_masks': trace.get('final_mask_count') if trace else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
                 'actual_arness': trace.get('actual_arness') if trace else None,
@@ -492,11 +537,39 @@ class LLaDAModel(BaseModel):
             }
             per_sample_records.append(record)
             if trace is not None:
-                step_trace_records.append({
-                    'sample_idx': sample_idx,
-                    'batch_item_idx': int(i),
-                    'trace': self._trace_with_decoded_snapshots(trace),
-                })
+                for step in trace.get('step_stats') or []:
+                    if int(step.get('batch_item_idx', 0)) != i:
+                        continue
+                    selected_ids = step.get('selected_token_ids') or []
+                    step_trace_records.append({
+                        'task_id': self.task_id,
+                        'sample_id': sample_idx,
+                        'sample_idx': sample_idx,
+                        'benchmark': self.benchmark,
+                        'decoding_config_name': self.decoding_config_name,
+                        'batch_item_idx': int(i),
+                        'step_idx': step.get('step_idx'),
+                        'block_idx': step.get('block_idx'),
+                        'mask_count_before': step.get('mask_count_before'),
+                        'mask_count_after': step.get('mask_count_after'),
+                        'selected_positions': step.get('selected_positions') or [],
+                        'selected_token_ids': selected_ids,
+                        'selected_decoded_tokens': [
+                            self.tokenizer.decode([token_id], skip_special_tokens=False)
+                            for token_id in selected_ids
+                        ],
+                        'selected_confidences': step.get('selected_confidences') or [],
+                        'transfer_reason': step.get('transfer_reason'),
+                        'cumulative_transferred_tokens': step.get('cumulative_transferred_tokens'),
+                        'current_completion_rate': step.get('current_completion_rate'),
+                        'current_partial_output': None,
+                        'target_tokens_present': None,
+                        'target_tokens_positions': None,
+                        'target_tokens_changed_later': None,
+                        'output_prefix_stability': None,
+                        'syntax_or_format_break_step': None,
+                        'final_answer_region_changed_later': None,
+                    })
             self._profile_sample_idx += 1
         return per_sample_records, step_trace_records
 
@@ -539,6 +612,7 @@ class LLaDAModel(BaseModel):
         self.tokenizer.padding_side = "left" 
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
+        tokenized_prompts = prompt.detach().cpu().tolist()
         attention_mask = encoded_prompt.get('attention_mask')
         profile_trace = self.return_trace or bool(self.per_sample_output)
         self._cuda_stats_before()
@@ -575,6 +649,7 @@ class LLaDAModel(BaseModel):
             responses.append(self.tokenizer.decode(x[i, -self.gen_length:], skip_special_tokens=True))
         per_sample_records, step_trace_records = self._build_profile_records(
             prompt_texts=prompt_texts,
+            tokenized_prompts=tokenized_prompts,
             responses=responses,
             prompt_tokens=prompt.shape[1],
             elapsed=elapsed,
@@ -707,6 +782,7 @@ class LLaDABaseModel(LLaDAModel):
         self.tokenizer.padding_side = "left" 
         encoded_prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
         prompt = encoded_prompt['input_ids']
+        tokenized_prompts = prompt.detach().cpu().tolist()
         attention_mask = encoded_prompt.get('attention_mask')
         profile_trace = self.return_trace or bool(self.per_sample_output)
         self._cuda_stats_before()
@@ -756,6 +832,7 @@ class LLaDABaseModel(LLaDAModel):
             responses[i] = response
         per_sample_records, step_trace_records = self._build_profile_records(
             prompt_texts=prompt_texts,
+            tokenized_prompts=tokenized_prompts,
             responses=responses,
             prompt_tokens=prompt.shape[1],
             elapsed=elapsed,

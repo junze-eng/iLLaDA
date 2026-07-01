@@ -38,6 +38,7 @@ class RulerNiahDataset(BaseDataset):
         type_needle_k: str = 'words',
         type_needle_v: str = 'numbers',
         remove_newline_tab: str = '',
+        depth_percents=None,
     ) -> Dataset:
 
         data = {'prompt': [], 'answer': []}
@@ -87,6 +88,8 @@ class RulerNiahDataset(BaseDataset):
         # Positions
         DEPTHS = list(
             np.round(np.linspace(0, 100, num=40, endpoint=True)).astype(int))
+        if depth_percents is not None:
+            DEPTHS = [int(depth) for depth in depth_percents]
 
         def _generate_random_number(num_digits=7):
             lower_bound = 10**(num_digits - 1)
@@ -135,9 +138,13 @@ class RulerNiahDataset(BaseDataset):
                 document_sents = [
                     sentence.strip() for sentence in document_sents if sentence
                 ]  # remove possible whitespace
+                if len(DEPTHS) >= len(needles):
+                    sampled_depths = random.sample(DEPTHS, len(needles))
+                else:
+                    sampled_depths = [DEPTHS[i % len(DEPTHS)] for i in range(len(needles))]
                 insertion_positions = ([0] + sorted([
                     int(len(document_sents) * (depth / 100))
-                    for depth in random.sample(DEPTHS, len(needles))
+                    for depth in sampled_depths
                 ]) + [len(document_sents)])
                 document_sents_list = []
                 for i in range(1, len(insertion_positions)):

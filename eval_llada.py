@@ -53,6 +53,9 @@ class LLaDAEvalHarness(LM):
         return_trace=False,
         trace_token_snapshots=False,
         trace_decode_snapshots=False,
+        benchmark=None,
+        task_id=None,
+        decoding_config_name=None,
         device="cuda",
         **kwargs,
     ):
@@ -123,6 +126,9 @@ class LLaDAEvalHarness(LM):
         self.return_trace = return_trace
         self.trace_token_snapshots = bool(trace_token_snapshots)
         self.trace_decode_snapshots = bool(trace_decode_snapshots)
+        self.benchmark = benchmark
+        self.task_id = task_id
+        self.decoding_config_name = decoding_config_name
 
         if self.rank == 0:
             for output_path in (self.per_sample_output, self.step_trace_output):
@@ -311,6 +317,20 @@ class LLaDAEvalHarness(LM):
         trace['token_snapshots'] = snapshots
         return trace
 
+    def _failure_type(self, prediction, correctness, trace):
+        if correctness == 1:
+            return 'correct'
+        if prediction is None or str(prediction).strip() == '':
+            return 'empty_output'
+        if trace and (trace.get('final_mask_count', 0) > 0 or (trace.get('completion_rate') is not None and trace.get('completion_rate') < 1)):
+            return 'unfinished_generation'
+        lower = str(prediction).strip().lower()
+        if lower in ('assistant', '<think>', '</think>') or lower.startswith('assistant') or lower.startswith('<think>'):
+            return 'format_failure'
+        if self.benchmark and 'ruler_niah' in str(self.benchmark):
+            return 'retrieval_failure'
+        return 'task_failure'
+
     def generate_until(self, requests: list[Instance]):
         def _tokenize(e):
             return {
@@ -369,12 +389,24 @@ class LLaDAEvalHarness(LM):
             visible_output_tokens = len(self.tokenizer(generated_answer, add_special_tokens=False)["input_ids"])
             actual_transfer_count = trace.get('actual_transfer_count') if trace else None
             per_sample_record = {
+                'task_id': self.task_id,
+                'benchmark': self.benchmark,
                 'sample_idx': sample_idx,
+                'sample_id': sample_idx,
+                'decoding_config_name': self.decoding_config_name,
                 'input': elem["question_text"],
+                'raw_prompt': elem["question_text"],
+                'tokenized_prompt': prompt.detach().cpu().tolist()[0],
                 'prediction': generated_answer,
+                'raw_prediction': generated_answer,
+                'decoded_prediction': generated_answer,
+                'normalized_prediction': generated_answer.strip(),
+                'target': None,
                 'correctness': None,
+                'official_score': None,
                 'score': None,
                 'evaluator_status': 'pending_lm_eval_aggregation',
+                'failure_type': self._failure_type(generated_answer, None, trace),
                 'prompt_tokens': int(prompt.shape[1]),
                 'generated_tokens': int(generated_tokens),
                 'visible_output_tokens': int(visible_output_tokens),
@@ -382,7 +414,9 @@ class LLaDAEvalHarness(LM):
                 'tokens_per_second': round(generated_tokens / elapsed, 6) if elapsed > 0 else None,
                 'actual_commit_tps': round(actual_transfer_count / elapsed, 6) if elapsed > 0 and actual_transfer_count is not None else None,
                 'visible_tps': round(visible_output_tokens / elapsed, 6) if elapsed > 0 else None,
+                'budget_tps': round(self.gen_length / elapsed, 6) if elapsed > 0 else None,
                 'steps': int(self.steps),
+                'forward_passes': trace.get('forward_passes') if trace else int(self.steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.block_length),
                 'mask_id': int(self.mask_id),
@@ -391,8 +425,10 @@ class LLaDAEvalHarness(LM):
                 'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
                 'min_transfer_tokens': self.min_transfer_tokens,
                 'effective_parallelism': float(self.gen_length / self.steps) if self.steps else None,
+                'planned_parallelism': float(self.gen_length / self.steps) if self.steps else None,
                 'arness': float(self.steps / self.gen_length) if self.gen_length else None,
                 'final_mask_count': trace.get('final_mask_count') if trace else None,
+                'remaining_masks': trace.get('final_mask_count') if trace else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
                 'actual_arness': trace.get('actual_arness') if trace else None,
@@ -406,10 +442,38 @@ class LLaDAEvalHarness(LM):
             }
             self._write_jsonl(self.per_sample_output, [per_sample_record])
             if trace is not None:
-                self._write_jsonl(self.step_trace_output, [{
-                    'sample_idx': sample_idx,
-                    'trace': self._trace_with_decoded_snapshots(trace),
-                }])
+                rows = []
+                for step in (trace.get('step_stats') or []):
+                    selected_ids = step.get('selected_token_ids') or []
+                    rows.append({
+                        'task_id': self.task_id,
+                        'sample_id': sample_idx,
+                        'sample_idx': sample_idx,
+                        'benchmark': self.benchmark,
+                        'decoding_config_name': self.decoding_config_name,
+                        'step_idx': step.get('step_idx'),
+                        'block_idx': step.get('block_idx'),
+                        'mask_count_before': step.get('mask_count_before'),
+                        'mask_count_after': step.get('mask_count_after'),
+                        'selected_positions': step.get('selected_positions') or [],
+                        'selected_token_ids': selected_ids,
+                        'selected_decoded_tokens': [
+                            self.tokenizer.decode([token_id], skip_special_tokens=False)
+                            for token_id in selected_ids
+                        ],
+                        'selected_confidences': step.get('selected_confidences') or [],
+                        'transfer_reason': step.get('transfer_reason'),
+                        'cumulative_transferred_tokens': step.get('cumulative_transferred_tokens'),
+                        'current_completion_rate': step.get('current_completion_rate'),
+                        'current_partial_output': None,
+                        'target_tokens_present': None,
+                        'target_tokens_positions': None,
+                        'target_tokens_changed_later': None,
+                        'output_prefix_stability': None,
+                        'syntax_or_format_break_step': None,
+                        'final_answer_region_changed_later': None,
+                    })
+                self._write_jsonl(self.step_trace_output, rows)
 
             if self.accelerator is not None:
                 self.accelerator.wait_for_everyone()

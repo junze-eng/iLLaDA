@@ -176,20 +176,28 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             step_forced_count = 0
             step_actual_count = 0
             step_confidence_sum = 0.0
+            step_records = []
+            mask_count_before = int((x[:, prompt.shape[1]:] == mask_id).sum().item()) if trace is not None else None
             for j in range(confidence.shape[0]):
                 scheduled_count = int(num_transfer_tokens[j, i].item())
                 if scheduled_count <= 0:
                     continue
                 step_scheduled_count += scheduled_count
                 select_confidence, select_index = torch.topk(confidence[j], k=scheduled_count)
+                original_select_confidence = select_confidence
+                original_select_index = select_index
                 passed_count = scheduled_count
                 forced_count = 0
+                transfer_reason = 'scheduled'
                 if token_selection_confidence_threshold is not None:
                     keep = select_confidence >= token_selection_confidence_threshold
                     passed_count = int(keep.sum().item())
                     if keep.sum().item() == 0 and min_transfer_tokens > 0:
                         keep[:min(min_transfer_tokens, scheduled_count)] = True
                         forced_count = int(keep.sum().item())
+                        transfer_reason = 'threshold_fallback_forced'
+                    else:
+                        transfer_reason = 'threshold_pass'
                     select_confidence = select_confidence[keep]
                     select_index = select_index[keep]
                 transfer_index[j, select_index] = True
@@ -199,24 +207,83 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 step_actual_count += actual_count
                 if select_confidence.numel() > 0:
                     step_confidence_sum += float(select_confidence.float().sum().item())
+                if trace is not None:
+                    prompt_len = int(prompt.shape[1])
+                    selected_positions = [
+                        int(pos) - prompt_len for pos in select_index.detach().cpu().tolist()
+                        if int(pos) >= prompt_len
+                    ]
+                    selected_token_ids = [
+                        int(x0[j, int(pos)].detach().cpu().item())
+                        for pos in select_index.detach().cpu().tolist()
+                        if int(pos) >= prompt_len
+                    ]
+                    selected_confidences = [
+                        float(value)
+                        for value in select_confidence.detach().float().cpu().tolist()
+                    ]
+                    step_records.append({
+                        'batch_item_idx': int(j),
+                        'block_idx': int(num_block),
+                        'step_idx': int(num_block * steps + i),
+                        'step_idx_in_block': int(i),
+                        'mask_count_before': None,
+                        'selected_positions': selected_positions,
+                        'selected_token_ids': selected_token_ids,
+                        'selected_confidences': selected_confidences,
+                        'transfer_reason': transfer_reason,
+                        'scheduled_transfer_count': int(scheduled_count),
+                        'threshold_passed_count': int(passed_count),
+                        'fallback_forced_count': int(forced_count),
+                        'actual_transfer_count': int(actual_count),
+                        'candidate_positions': [
+                            int(pos) - prompt_len for pos in original_select_index.detach().cpu().tolist()
+                            if int(pos) >= prompt_len
+                        ],
+                        'candidate_confidences': [
+                            float(value)
+                            for value in original_select_confidence.detach().float().cpu().tolist()
+                        ],
+                    })
             x[transfer_index] = x0[transfer_index]
             if trace is not None:
                 generated_region = x[:, prompt.shape[1]:]
+                mask_count_after = int((generated_region == mask_id).sum().item())
                 trace['scheduled_transfer_count'] += int(step_scheduled_count)
                 trace['threshold_passed_count'] += int(step_passed_count)
                 trace['fallback_forced_count'] += int(step_forced_count)
                 trace['actual_transfer_count'] += int(step_actual_count)
-                trace['step_stats'].append({
-                    'block_id': int(num_block),
-                    'step_id': int(i),
-                    'scheduled': int(step_scheduled_count),
-                    'passed': int(step_passed_count),
-                    'forced': int(step_forced_count),
-                    'actual': int(step_actual_count),
-                    'transferred_tokens': int(step_actual_count),
-                    'mean_confidence': step_confidence_sum / step_actual_count if step_actual_count else None,
-                    'remaining_masks': int((generated_region == mask_id).sum().item()),
-                })
+                if not step_records:
+                    step_records.append({
+                        'batch_item_idx': 0,
+                        'block_idx': int(num_block),
+                        'step_idx': int(num_block * steps + i),
+                        'step_idx_in_block': int(i),
+                        'mask_count_before': mask_count_before,
+                        'selected_positions': [],
+                        'selected_token_ids': [],
+                        'selected_confidences': [],
+                        'transfer_reason': 'no_scheduled_transfer',
+                        'scheduled_transfer_count': 0,
+                        'threshold_passed_count': 0,
+                        'fallback_forced_count': 0,
+                        'actual_transfer_count': 0,
+                    })
+                for step_record in step_records:
+                    item_idx = int(step_record.get('batch_item_idx', 0))
+                    item_region = generated_region[item_idx:item_idx + 1]
+                    item_mask_after = int((item_region == mask_id).sum().item())
+                    item_total = int(item_region.numel())
+                    step_record['mask_count_before'] = mask_count_before
+                    step_record['mask_count_after'] = item_mask_after
+                    step_record['remaining_masks'] = item_mask_after
+                    step_record['cumulative_transferred_tokens'] = int(trace['actual_transfer_count'])
+                    step_record['current_completion_rate'] = (item_total - item_mask_after) / max(item_total, 1)
+                    step_record['mean_confidence'] = (
+                        sum(step_record['selected_confidences']) / len(step_record['selected_confidences'])
+                        if step_record.get('selected_confidences') else None
+                    )
+                    trace['step_stats'].append(step_record)
                 if trace_token_snapshots:
                     trace['token_snapshots'].append({
                         'block_id': int(num_block),
