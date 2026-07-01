@@ -441,8 +441,14 @@ class LLaDAModel(BaseModel):
         total_generated_tokens = self.gen_length * batch_size
         per_sample_records = []
         step_trace_records = []
+        trace_actual_transfer_count = trace.get('actual_transfer_count') if trace else None
+        trace_visible_tokens = [
+            len(self.tokenizer(response, add_special_tokens=False)['input_ids'])
+            for response in responses
+        ]
         for i in range(batch_size):
             sample_idx = self._profile_sample_idx
+            visible_output_tokens = int(trace_visible_tokens[i])
             record = {
                 'sample_idx': sample_idx,
                 'batch_size': int(batch_size),
@@ -457,6 +463,10 @@ class LLaDAModel(BaseModel):
                 'batch_generated_tokens': int(total_generated_tokens),
                 'elapsed_seconds': round(elapsed, 6),
                 'tokens_per_second': round(total_generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'budget_tps': round(total_generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'actual_commit_tps': round(trace_actual_transfer_count / elapsed, 6) if elapsed > 0 and trace_actual_transfer_count is not None else None,
+                'visible_tps': round(sum(trace_visible_tokens) / elapsed, 6) if elapsed > 0 else None,
+                'visible_output_tokens': visible_output_tokens,
                 'steps': int(self.gen_steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.gen_blocksize),
@@ -475,10 +485,13 @@ class LLaDAModel(BaseModel):
                 'remaining_masks': trace.get('final_mask_count') if trace else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
+                'actual_arness': trace.get('actual_arness') if trace else None,
                 'scheduled_transfer_count': trace.get('scheduled_transfer_count') if trace else None,
                 'threshold_passed_count': trace.get('threshold_passed_count') if trace else None,
                 'fallback_forced_count': trace.get('fallback_forced_count') if trace else None,
                 'actual_transfer_count': trace.get('actual_transfer_count') if trace else None,
+                'threshold_pass_rate': trace.get('threshold_pass_rate') if trace else None,
+                'fallback_rate': trace.get('fallback_rate') if trace else None,
                 **cuda_stats,
             }
             per_sample_records.append(record)

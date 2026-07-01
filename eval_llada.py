@@ -36,7 +36,7 @@ class LLaDAEvalHarness(LM):
         self,
         model_path='',
         mask_id=126336,
-        max_length=4096,
+        max_length=8192,
         batch_size=32,
         mc_num=128,
         is_check_greedy=True,
@@ -251,7 +251,7 @@ class LLaDAEvalHarness(LM):
         ds = ds.with_format("torch")
         prompt_len = [len(x["prefix"]) + len(x["target"]) for x in ds]
 
-        assert max(prompt_len) <= 4096
+        assert max(prompt_len) <= self.max_length
 
         out = []
         with torch.no_grad():
@@ -361,11 +361,13 @@ class LLaDAEvalHarness(LM):
                         generated_answer = generated_answer.split(stop_seq)[0]
 
             # remove special tokens
-            generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
+            generated_answer_ids = self.tokenizer(generated_answer, add_special_tokens=False)["input_ids"]
             generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
             out.append(generated_answer)
 
             generated_tokens = self.gen_length
+            visible_output_tokens = len(self.tokenizer(generated_answer, add_special_tokens=False)["input_ids"])
+            actual_transfer_count = trace.get('actual_transfer_count') if trace else None
             per_sample_record = {
                 'sample_idx': sample_idx,
                 'input': elem["question_text"],
@@ -375,8 +377,12 @@ class LLaDAEvalHarness(LM):
                 'evaluator_status': 'pending_lm_eval_aggregation',
                 'prompt_tokens': int(prompt.shape[1]),
                 'generated_tokens': int(generated_tokens),
+                'visible_output_tokens': int(visible_output_tokens),
                 'elapsed_seconds': round(elapsed, 6),
                 'tokens_per_second': round(generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'budget_tps': round(generated_tokens / elapsed, 6) if elapsed > 0 else None,
+                'actual_commit_tps': round(actual_transfer_count / elapsed, 6) if elapsed > 0 and actual_transfer_count is not None else None,
+                'visible_tps': round(visible_output_tokens / elapsed, 6) if elapsed > 0 else None,
                 'steps': int(self.steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.block_length),
@@ -393,10 +399,13 @@ class LLaDAEvalHarness(LM):
                 'remaining_masks': trace.get('final_mask_count') if trace else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
+                'actual_arness': trace.get('actual_arness') if trace else None,
                 'scheduled_transfer_count': trace.get('scheduled_transfer_count') if trace else None,
                 'threshold_passed_count': trace.get('threshold_passed_count') if trace else None,
                 'fallback_forced_count': trace.get('fallback_forced_count') if trace else None,
                 'actual_transfer_count': trace.get('actual_transfer_count') if trace else None,
+                'threshold_pass_rate': trace.get('threshold_pass_rate') if trace else None,
+                'fallback_rate': trace.get('fallback_rate') if trace else None,
                 **cuda_stats,
             }
             self._write_jsonl(self.per_sample_output, [per_sample_record])

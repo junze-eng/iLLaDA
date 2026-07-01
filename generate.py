@@ -113,7 +113,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'block_length': int(block_length),
         'steps_per_block': int(steps),
         'planned_steps': int(planned_steps),
+        'forward_passes': int(planned_steps),
         'num_blocks': int(num_blocks),
+        'planned_parallelism': float(gen_length / planned_steps) if planned_steps else None,
         'mask_id': int(mask_id),
         'stop_token_ids': stop_token_ids,
         'token_selection_confidence_threshold': token_selection_confidence_threshold,
@@ -199,6 +201,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     step_confidence_sum += float(select_confidence.float().sum().item())
             x[transfer_index] = x0[transfer_index]
             if trace is not None:
+                generated_region = x[:, prompt.shape[1]:]
                 trace['scheduled_transfer_count'] += int(step_scheduled_count)
                 trace['threshold_passed_count'] += int(step_passed_count)
                 trace['fallback_forced_count'] += int(step_forced_count)
@@ -212,7 +215,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     'actual': int(step_actual_count),
                     'transferred_tokens': int(step_actual_count),
                     'mean_confidence': step_confidence_sum / step_actual_count if step_actual_count else None,
-                    'remaining_masks': int((x == mask_id).sum().item()),
+                    'remaining_masks': int((generated_region == mask_id).sum().item()),
                 })
                 if trace_token_snapshots:
                     trace['token_snapshots'].append({
@@ -222,9 +225,15 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     })
 
     if trace is not None:
-        trace['final_mask_count'] = int((x == mask_id).sum().item())
-        trace['completion_rate'] = 1.0 if trace['final_mask_count'] == 0 else 0.0
-        trace['actual_parallelism'] = trace['actual_transfer_count'] / planned_steps if planned_steps else None
+        generated_region = x[:, prompt.shape[1]:]
+        final_mask_count = int((generated_region == mask_id).sum().item())
+        total_gen_tokens = int(generated_region.numel())
+        trace['final_mask_count'] = final_mask_count
+        trace['completion_rate'] = (total_gen_tokens - final_mask_count) / max(total_gen_tokens, 1)
+        trace['actual_parallelism'] = trace['actual_transfer_count'] / max(trace['forward_passes'], 1)
+        trace['actual_arness'] = trace['forward_passes'] / max(trace['actual_transfer_count'], 1)
+        trace['threshold_pass_rate'] = trace['threshold_passed_count'] / max(trace['scheduled_transfer_count'], 1)
+        trace['fallback_rate'] = trace['fallback_forced_count'] / max(trace['actual_transfer_count'], 1)
     return (x, trace) if return_trace else x
 
 

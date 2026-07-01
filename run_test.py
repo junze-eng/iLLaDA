@@ -686,10 +686,16 @@ def write_run_summary(
     final_masks = numeric_values(samples, "final_mask_count")
     completion_rates = numeric_values(samples, "completion_rate")
     actual_parallelism = numeric_values(samples, "actual_parallelism")
+    actual_arness = numeric_values(samples, "actual_arness")
     scheduled_counts = numeric_values(samples, "scheduled_transfer_count")
     threshold_passed_counts = numeric_values(samples, "threshold_passed_count")
     fallback_forced_counts = numeric_values(samples, "fallback_forced_count")
     actual_transfer_counts = numeric_values(samples, "actual_transfer_count")
+    threshold_pass_rates = numeric_values(samples, "threshold_pass_rate")
+    fallback_rates = numeric_values(samples, "fallback_rate")
+    budget_tps = numeric_values(samples, "budget_tps")
+    actual_commit_tps = numeric_values(samples, "actual_commit_tps")
+    visible_tps = numeric_values(samples, "visible_tps")
     correctness = numeric_values(samples, "correctness")
     scores = numeric_values(samples, "score")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
@@ -722,14 +728,23 @@ def write_run_summary(
         "final_mask_count_sum": sum(final_masks) if final_masks else None,
         "final_mask_count": mean(final_masks),
         "completion_rate": mean(completion_rates),
+        "completion_rate_mean": mean(completion_rates),
         "planned_parallelism": planned_parallelism,
         "num_blocks": num_blocks,
         "steps_per_block": steps_per_block,
         "actual_parallelism": mean(actual_parallelism),
+        "actual_parallelism_mean": mean(actual_parallelism),
+        "actual_arness_mean": mean(actual_arness),
+        "final_mask_count_mean": mean(final_masks),
         "scheduled_transfer_count_sum": sum(scheduled_counts) if scheduled_counts else None,
         "threshold_passed_count_sum": sum(threshold_passed_counts) if threshold_passed_counts else None,
         "fallback_forced_count_sum": sum(fallback_forced_counts) if fallback_forced_counts else None,
         "actual_transfer_count_sum": sum(actual_transfer_counts) if actual_transfer_counts else None,
+        "threshold_pass_rate_mean": mean(threshold_pass_rates),
+        "fallback_rate_mean": mean(fallback_rates),
+        "budget_tps_mean": mean(budget_tps),
+        "actual_commit_tps_mean": mean(actual_commit_tps),
+        "visible_tps_mean": mean(visible_tps),
         "accuracy_or_pass_rate": mean(correctness) if correctness else None,
         "score_mean": mean(scores) if scores else None,
         "effective_parallelism_mean": mean(effective_parallelism),
@@ -894,6 +909,7 @@ def run_needle_passkey(
         elapsed = time.perf_counter() - started
         cuda_stats = cuda_stats_after(model.device)
         prediction = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
+        visible_output_tokens = len(tokenizer(prediction, add_special_tokens=False)["input_ids"])
         correct = 1 if secret in prediction else 0
         record = {
             "sample_idx": sample_idx,
@@ -914,8 +930,12 @@ def run_needle_passkey(
             "needle_position": needle_position,
             "prompt_tokens": actual_prompt_tokens,
             "generated_tokens": gen_length,
+            "visible_output_tokens": visible_output_tokens,
             "elapsed_seconds": round(elapsed, 6),
             "tokens_per_second": round(gen_length / elapsed, 6) if elapsed > 0 else None,
+            "budget_tps": round(gen_length / elapsed, 6) if elapsed > 0 else None,
+            "actual_commit_tps": round(trace.get("actual_transfer_count") / elapsed, 6) if elapsed > 0 and trace.get("actual_transfer_count") is not None else None,
+            "visible_tps": round(visible_output_tokens / elapsed, 6) if elapsed > 0 else None,
             "steps": gen_steps,
             "gen_length": gen_length,
             "block_length": gen_blocksize,
@@ -930,10 +950,13 @@ def run_needle_passkey(
             "remaining_masks": trace.get("final_mask_count"),
             "completion_rate": trace.get("completion_rate"),
             "actual_parallelism": trace.get("actual_parallelism"),
+            "actual_arness": trace.get("actual_arness"),
             "scheduled_transfer_count": trace.get("scheduled_transfer_count"),
             "threshold_passed_count": trace.get("threshold_passed_count"),
             "fallback_forced_count": trace.get("fallback_forced_count"),
             "actual_transfer_count": trace.get("actual_transfer_count"),
+            "threshold_pass_rate": trace.get("threshold_pass_rate"),
+            "fallback_rate": trace.get("fallback_rate"),
             **cuda_stats,
         }
         with per_sample_path.open("a", encoding="utf-8") as f:
@@ -1006,7 +1029,7 @@ def main() -> int:
                 model_cfg = build_model_cfg(global_model, merged_params, benchmark, run_name)
                 if execution_cfg.get("collect_metrics", True) and not model_cfg.get("metrics_output"):
                     model_cfg["per_sample_output"] = str(work_dir / "per_sample.jsonl")
-                    if model_cfg.get("return_trace") or is_custom_benchmark(benchmark):
+                    if model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
                         model_cfg["step_trace_output"] = str(work_dir / "step_trace.jsonl")
                     model_cfg["metrics_output"] = str(work_dir / "per_sample.jsonl")
                 generated_config = generated_dir / f"{run_name}.py"
