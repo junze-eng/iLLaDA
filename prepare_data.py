@@ -1,5 +1,6 @@
 import argparse
 import csv
+import importlib
 import json
 import os
 import sys
@@ -9,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from run_test import (
     ROOT,
+    BENCHMARKS,
+    as_list,
     collect_experiments,
     deep_merge,
     expand_matrix,
@@ -20,6 +23,7 @@ from run_test import (
 
 OPENCOMPASS_DIR = ROOT / "opencompass"
 DEPTH_BY_POSITION = {"front": [0], "middle": [50], "back": [100], "end": [100]}
+DATASET_META_KEYS = {"type", "abbr", "reader_cfg", "infer_cfg", "eval_cfg"}
 
 
 def json_default(value):
@@ -46,6 +50,80 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def dataset_size(dataset) -> Dict[str, Any]:
+    if hasattr(dataset, "keys"):
+        sizes = {}
+        total = 0
+        for split in dataset.keys():
+            try:
+                size = len(dataset[split])
+            except Exception:
+                size = None
+            sizes[f"{split}_size"] = size
+            if isinstance(size, int):
+                total += size
+        sizes["total_size"] = total if total else None
+        return sizes
+    try:
+        return {"total_size": len(dataset)}
+    except Exception:
+        return {"total_size": None}
+
+
+def benchmark_conditions(config: Dict[str, Any], selected: set) -> List[Dict[str, Any]]:
+    defaults = config.get("defaults", {}) or {}
+    rows = []
+    for experiment in collect_experiments(config, selected):
+        for benchmark in as_list(experiment.get("benchmark")):
+            if not benchmark:
+                continue
+            for params in expand_matrix(experiment):
+                rows.append({
+                    "experiment": experiment.get("name"),
+                    "task": experiment.get("task"),
+                    "benchmark": benchmark,
+                    "params": deep_merge(defaults, params),
+                })
+    return rows
+
+
+def preflight_opencompass_benchmark(benchmark: str) -> Dict[str, Any]:
+    if benchmark not in BENCHMARKS:
+        return {
+            "benchmark": benchmark,
+            "status": "failed",
+            "error": f"Unknown benchmark `{benchmark}`",
+        }
+    sys.path.insert(0, str(OPENCOMPASS_DIR))
+    bench = BENCHMARKS[benchmark]
+    try:
+        module = importlib.import_module(bench["module"])
+        dataset_cfgs = getattr(module, bench["var"])
+        loaded = []
+        for index, dataset_cfg in enumerate(dataset_cfgs):
+            cfg = dict(dataset_cfg)
+            dataset_type = cfg.pop("type")
+            abbr = cfg.get("abbr", f"{benchmark}_{index}")
+            load_kwargs = {key: value for key, value in cfg.items() if key not in DATASET_META_KEYS}
+            dataset = dataset_type.load(**load_kwargs)
+            loaded.append({
+                "abbr": abbr,
+                "dataset_type": getattr(dataset_type, "__name__", str(dataset_type)),
+                **dataset_size(dataset),
+            })
+        return {
+            "benchmark": benchmark,
+            "status": "ok",
+            "datasets": json.dumps(loaded, ensure_ascii=False, default=json_default),
+        }
+    except Exception as exc:
+        return {
+            "benchmark": benchmark,
+            "status": "failed",
+            "error": repr(exc),
+        }
 
 
 def iter_context_conditions(config: Dict[str, Any], selected: set) -> Iterable[Dict[str, Any]]:
@@ -206,7 +284,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--only", action="append", default=[], help="Limit to task or experiment name.")
     parser.add_argument("--dry-run", action="store_true", help="Only expand conditions and check paths.")
-    parser.add_argument("--skip-tokenizer-check", action="store_true")
+    parser.add_argument("--skip-opencompass-check", action="store_true", help="Do not pre-load GSM8K/MBPP OpenCompass datasets.")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -224,6 +302,10 @@ def main() -> int:
         output_dir = ROOT / output_dir
 
     selected = set(args.only or [])
+    benchmark_rows = benchmark_conditions(config, selected)
+    unique_benchmarks = sorted({row["benchmark"] for row in benchmark_rows})
+    print(f"Benchmark plan: {len(benchmark_rows)} run condition(s), {len(unique_benchmarks)} benchmark(s): {', '.join(unique_benchmarks)}")
+
     raw_conditions = list(iter_context_conditions(config, selected))
     conditions_by_id: Dict[str, Dict[str, Any]] = {}
     for condition in raw_conditions:
@@ -243,22 +325,53 @@ def main() -> int:
             f"samples={params.get('num_samples')} used_by={len(condition.get('experiments_using', []))}"
         )
 
-    if not haystack_path.exists():
-        print(f"Missing RULER haystack file: {haystack_path}", file=sys.stderr)
-        return 2
     if args.dry_run:
-        print(f"Haystack OK: {haystack_path}")
+        if not conditions:
+            print("RULER haystack not needed for the selected experiments.")
+        elif not haystack_path.exists():
+            print(f"Missing RULER haystack file: {haystack_path}", file=sys.stderr)
+        else:
+            print(f"Haystack OK: {haystack_path}")
         print(f"Prepared output dir: {output_dir}")
-        return 0
+        return 2 if conditions and not haystack_path.exists() else 0
+
+    preflight_rows = []
+    if not args.skip_opencompass_check:
+        for benchmark in unique_benchmarks:
+            if benchmark == "ruler_niah_single_1":
+                continue
+            result = preflight_opencompass_benchmark(benchmark)
+            preflight_rows.append({"kind": "opencompass_dataset", **result})
+            status = result.get("status")
+            if status == "ok":
+                print(f"OpenCompass dataset OK: {benchmark}")
+            else:
+                print(f"OpenCompass dataset FAILED: {benchmark} | {result.get('error')}", file=sys.stderr)
+
+    if conditions and not haystack_path.exists():
+        preflight_rows.append({
+            "kind": "ruler_haystack",
+            "benchmark": "ruler_niah_single_1",
+            "status": "failed",
+            "path": str(haystack_path),
+            "error": "missing local RULER haystack file",
+        })
+        write_csv(output_dir / "data_preflight_report.csv", preflight_rows)
+        print(f"Missing RULER haystack file: {haystack_path}", file=sys.stderr)
+        print(f"Data preflight report: {output_dir / 'data_preflight_report.csv'}")
+        return 2
+
+    if not conditions:
+        write_csv(output_dir / "data_preflight_report.csv", preflight_rows)
+        failed = [row for row in preflight_rows if row.get("status") != "ok"]
+        print(f"Data preflight report: {output_dir / 'data_preflight_report.csv'}")
+        return 4 if failed else 0
 
     model_cfg = deepcopy(config.get("model", {}) or {})
     model_path = str(model_cfg.get("path", "GSAI-ML/iLLaDA-8B-Instruct"))
     model_max_seq_len = int(model_cfg.get("max_seq_len", 8192))
 
-    if args.skip_tokenizer_check:
-        ruler_tokenizer, model_tokenizer = load_tokenizers(model_path)
-    else:
-        ruler_tokenizer, model_tokenizer = load_tokenizers(model_path)
+    ruler_tokenizer, model_tokenizer = load_tokenizers(model_path)
 
     condition_summaries = []
     sample_manifest = []
@@ -276,10 +389,24 @@ def main() -> int:
 
     write_jsonl(output_dir / "prepared_manifest.jsonl", sample_manifest)
     write_csv(output_dir / "condition_summary.csv", condition_summaries)
+    for summary in condition_summaries:
+        preflight_rows.append({
+            "kind": "ruler_prepared_condition",
+            "benchmark": summary["benchmark"],
+            "status": "ok",
+            "condition": summary["condition"],
+            "prepared_jsonl": summary["prepared_jsonl"],
+            "num_samples": summary["num_samples"],
+            "truncated_samples": summary["truncated_samples"],
+            "underfilled_samples": summary["underfilled_samples"],
+            "max_actual_total_tokens": summary["max_actual_total_tokens"],
+        })
+    write_csv(output_dir / "data_preflight_report.csv", preflight_rows)
 
     bad = [row for row in condition_summaries if row["truncated_samples"] or row["underfilled_samples"]]
     print(f"Wrote prepared data to: {output_dir}")
     print(f"Condition summary: {output_dir / 'condition_summary.csv'}")
+    print(f"Data preflight report: {output_dir / 'data_preflight_report.csv'}")
     if bad:
         print("Length validation found risky conditions:", file=sys.stderr)
         for row in bad:
@@ -289,7 +416,8 @@ def main() -> int:
                 file=sys.stderr,
             )
         return 3
-    return 0
+    failed = [row for row in preflight_rows if row.get("status") != "ok"]
+    return 4 if failed else 0
 
 
 if __name__ == "__main__":
