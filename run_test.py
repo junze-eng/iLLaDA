@@ -32,7 +32,8 @@ BENCHMARKS = {
 }
 
 CUSTOM_BENCHMARKS = set()
-EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "num_samples", "seed"}
+DATASET_PARAM_KEYS = {"context_length", "needle_position", "num_samples", "depth_percents"}
+EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "seed"} | DATASET_PARAM_KEYS
 
 MODEL_TYPES = {
     "instruct": "LLaDAModel",
@@ -257,6 +258,25 @@ def safe_name(value: str) -> str:
     return "_".join("".join(keep).split("_"))
 
 
+def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
+    seed = int(params.get("seed", 42) or 42)
+    return safe_name(
+        "ruler_niah_single_1_"
+        f"ctx{params.get('context_length')}_"
+        f"pos{params.get('needle_position')}_"
+        f"gen{params.get('gen_length', 128)}_"
+        f"samples{params.get('num_samples', 20)}_"
+        f"seed{seed}"
+    )
+
+
+def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any]) -> Path:
+    prepared_dir = Path(data_cfg.get("prepared_dir", "data/prepared"))
+    if not prepared_dir.is_absolute():
+        prepared_dir = ROOT / prepared_dir
+    return prepared_dir / "ruler_niah_single_1" / f"{ruler_prepared_condition_id(params)}.jsonl"
+
+
 def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchmark: str, run_name: str) -> Dict[str, Any]:
     model_cfg = deepcopy(global_model)
     model_type = model_cfg.pop("type", "instruct")
@@ -268,7 +288,11 @@ def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchm
     model_cfg["type"] = MODEL_TYPES[model_type]
     model_cfg.update({key: value for key, value in params.items() if key not in EXPERIMENT_ONLY_KEYS})
     model_cfg["benchmark"] = benchmark
-    model_cfg["decoding_config_name"] = run_name
+    if "context_length" in params:
+        model_cfg["context_length"] = params.get("context_length")
+    if "needle_position" in params:
+        model_cfg["needle_position"] = params.get("needle_position")
+    model_cfg.setdefault("decoding_config_name", run_name)
     return model_cfg
 
 
@@ -279,6 +303,7 @@ def render_opencompass_config(
     sample_limit: Any = None,
     sample_indices: Any = None,
     experiment_params: Optional[Dict[str, Any]] = None,
+    data_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     if benchmark not in BENCHMARKS:
         raise SystemExit(f"Unknown benchmark `{benchmark}`. Available: {', '.join(sorted(BENCHMARKS))}")
@@ -315,13 +340,20 @@ def render_opencompass_config(
         imports.append(f"summarizer = dict(summary_groups={bench['summary_var']})")
     if benchmark == "ruler_niah_single_1":
         experiment_params = experiment_params or {}
-        context_length = model_cfg.get("context_length")
+        context_length = experiment_params.get("context_length")
         num_samples = experiment_params.get("num_samples")
-        needle_position = model_cfg.get("needle_position")
+        needle_position = experiment_params.get("needle_position")
+        tokens_to_generate = model_cfg.get("gen_length")
+        prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params)
         depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
         imports.append("for _dataset in datasets:")
+        if prepared_path.exists():
+            imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
         if context_length is not None:
             imports.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
+        if tokens_to_generate is not None:
+            imports.append(f"    _dataset['tokens_to_generate'] = {python_literal(int(tokens_to_generate))}")
+            imports.append("    _dataset.setdefault('infer_cfg', {}).setdefault('inferencer', {})['max_out_len'] = _dataset['tokens_to_generate']")
         if num_samples is not None:
             imports.append(f"    _dataset['num_samples'] = {python_literal(int(num_samples))}")
         if needle_position is not None:
@@ -684,6 +716,7 @@ def write_run_summary(
     fallback_rates = numeric_values(samples, "fallback_rate")
     actual_commit_tps = numeric_values(samples, "actual_commit_tps")
     visible_tps = numeric_values(samples, "visible_tps")
+    budget_tps = numeric_values(samples, "budget_tps")
     correctness = numeric_values(samples, "correctness")
     scores = numeric_values(samples, "official_score") or numeric_values(samples, "score")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
@@ -757,6 +790,7 @@ def write_run_summary(
         "fallback_rate_mean": mean(fallback_rates),
         "actual_commit_tps_mean": mean(actual_commit_tps),
         "visible_tps_mean": mean(visible_tps),
+        "budget_tps_mean": mean(budget_tps),
         "accuracy_or_pass_rate": mean(correctness) if correctness else None,
         "score_mean": mean(scores) if scores else None,
         "effective_parallelism_mean": mean(effective_parallelism),
@@ -776,6 +810,39 @@ def write_run_summary(
 
     upsert_csv_row(output_path, row)
     return row
+
+
+def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact table used for cross-run experiment reading."""
+    return {
+        "run_name": row.get("run_name"),
+        "experiment": row.get("experiment"),
+        "benchmark": row.get("benchmark"),
+        "decoding_config_name": row.get("decoding_config_name"),
+        "primary_metric_name": row.get("primary_metric_name"),
+        "primary_metric_value": row.get("primary_metric_value"),
+        "latency_mean": row.get("latency_mean_s") or row.get("avg_elapsed_seconds"),
+        "tokens_per_second_mean": row.get("tokens_per_second_mean") or row.get("avg_tokens_per_second"),
+        "visible_tps_mean": row.get("visible_tps_mean"),
+        "budget_tps_mean": row.get("budget_tps_mean"),
+        "actual_commit_tps_mean": row.get("actual_commit_tps_mean"),
+        "peak_vram": row.get("peak_vram"),
+        "planned_parallelism": row.get("planned_parallelism"),
+        "actual_parallelism": row.get("actual_parallelism") or row.get("avg_actual_parallelism"),
+        "final_mask_count": row.get("final_mask_count"),
+        "completion_rate": row.get("completion_rate") or row.get("avg_completion_rate"),
+        "gen_length": row.get("gen_length"),
+        "gen_steps": row.get("param_gen_steps"),
+        "gen_blocksize": row.get("param_gen_blocksize") or row.get("block_length"),
+        "num_blocks": row.get("num_blocks"),
+        "steps_per_block": row.get("steps_per_block"),
+        "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
+        "min_transfer_tokens": row.get("param_min_transfer_tokens"),
+        "context_length": row.get("context_length"),
+        "needle_position": row.get("needle_position"),
+        "num_samples": row.get("num_samples"),
+        "returncode": row.get("returncode"),
+    }
 
 
 def run_command(command: List[str], cwd: Path, env: Dict[str, str]) -> int:
@@ -808,188 +875,6 @@ def cuda_stats_after(device) -> Dict[str, Any]:
     }
 
 
-def build_needle_prompt(tokenizer, context_length: int, needle_position: str, secret: str, seed: int) -> str:
-    """Deprecated: kept only to document the removed synthetic benchmark path."""
-    raise RuntimeError("needle_passkey is deprecated and is not available from the main runner.")
-    filler_unit = (
-        f"Record {seed}: ocean logistics, warehouse timing, and invoice notes are unrelated. "
-        "The evaluation should ignore these details. "
-    )
-    filler = filler_unit
-    while len(tokenizer.encode(filler, add_special_tokens=False)) < max(1, context_length):
-        filler += filler_unit
-    filler_ids = tokenizer.encode(filler, add_special_tokens=False)[:max(1, context_length)]
-    needle = f"The secret code is {secret}."
-    needle_ids = tokenizer.encode(" " + needle + " ", add_special_tokens=False)
-    if len(needle_ids) >= len(filler_ids):
-        filler_ids = []
-
-    available = max(0, context_length - len(needle_ids))
-    filler_ids = filler_ids[:available]
-    if needle_position == "front":
-        insert_at = 0
-    elif needle_position == "middle":
-        insert_at = len(filler_ids) // 2
-    elif needle_position == "end":
-        insert_at = len(filler_ids)
-    else:
-        raise ValueError(f"Unknown needle_position `{needle_position}`.")
-    context_ids = filler_ids[:insert_at] + needle_ids + filler_ids[insert_at:]
-    context = tokenizer.decode(context_ids, skip_special_tokens=True)
-    return (
-        "You will receive a long context. Find the exact secret code in it.\n\n"
-        f"{context}\n\n"
-        "Question: What is the secret code? Reply with only the digits."
-    )
-
-
-def run_needle_passkey(
-    model_cfg: Dict[str, Any],
-    params: Dict[str, Any],
-    work_dir: Path,
-) -> int:
-    """Deprecated: custom needle_passkey runs are intentionally disabled."""
-    raise RuntimeError("needle_passkey is deprecated and is not available from the main runner.")
-    try:
-        import torch
-        from transformers import AutoModel, AutoTokenizer
-        from generate import generate
-    except ImportError as exc:
-        print(f"Missing dependency for needle_passkey: {exc}", file=sys.stderr)
-        return 1
-
-    model_path = model_cfg["path"]
-    dtype_name = (model_cfg.get("model_kwargs", {}) or {}).get("torch_dtype", "torch.bfloat16")
-    torch_dtype = {
-        "torch.float16": torch.float16,
-        "torch.bfloat16": torch.bfloat16,
-        "torch.float32": torch.float32,
-        "torch.float": torch.float32,
-    }.get(dtype_name, torch.bfloat16)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AutoModel.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch_dtype,
-    ).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer.padding_side = "left"
-
-    num_samples = int(params.get("num_samples", 20))
-    context_length = int(params.get("context_length", params.get("context_prefix_tokens", 2048)))
-    needle_position = params.get("needle_position", "middle")
-    seed = int(params.get("seed", 1234))
-    gen_length = int(params.get("gen_length", 32))
-    gen_steps = int(params.get("gen_steps", gen_length))
-    gen_blocksize = int(params.get("gen_blocksize", gen_length))
-    mask_id = int(model_cfg.get("mask_id", 5))
-    model_max_seq_len = int(params.get("max_seq_len", model_cfg.get("max_seq_len", 4096)))
-    per_sample_path = Path(model_cfg["per_sample_output"])
-    step_trace_path = Path(model_cfg["step_trace_output"]) if model_cfg.get("step_trace_output") else None
-    per_sample_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for sample_idx in range(num_samples):
-        sample_seed = seed + sample_idx
-        secret = f"{(sample_seed * 7919) % 1000000:06d}"
-        prompt = build_needle_prompt(tokenizer, context_length, needle_position, secret, sample_seed)
-        encoded = tokenizer([prompt], add_special_tokens=False, padding=True, return_tensors="pt")
-        input_ids = encoded["input_ids"].to(device)
-        actual_prompt_tokens = int(input_ids.shape[1])
-        actual_total_tokens = actual_prompt_tokens + gen_length
-        truncated = actual_total_tokens > model_max_seq_len
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-
-        cuda_stats_before(model.device)
-        started = time.perf_counter()
-        generated, trace = generate(
-            model=model,
-            prompt=input_ids,
-            attention_mask=attention_mask,
-            steps=gen_steps,
-            gen_length=gen_length,
-            block_length=gen_blocksize,
-            temperature=float(model_cfg.get("temperature", 0.0)),
-            cfg_scale=float(model_cfg.get("cfg", 0.0)),
-            remasking=model_cfg.get("remasking", "low_confidence"),
-            mask_id=mask_id,
-            confidence_eos_eot_inf=bool(params.get("diff_confidence_eos_eot_inf", False)),
-            logits_eos_inf=bool(params.get("diff_logits_eos_inf", False)),
-            token_selection_confidence_threshold=params.get("token_selection_confidence_threshold"),
-            min_transfer_tokens=int(params.get("min_transfer_tokens", 1)),
-            return_trace=True,
-            trace_token_snapshots=bool(params.get("trace_token_snapshots") or params.get("trace_decode_snapshots")),
-            tokenizer=tokenizer,
-        )
-        elapsed = time.perf_counter() - started
-        cuda_stats = cuda_stats_after(model.device)
-        prediction = tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
-        visible_output_tokens = len(tokenizer(prediction, add_special_tokens=False)["input_ids"])
-        correct = 1 if secret in prediction else 0
-        record = {
-            "sample_idx": sample_idx,
-            "seed": sample_seed,
-            "benchmark": "needle_passkey",
-            "input": prompt,
-            "prediction": prediction,
-            "target": secret,
-            "correctness": correct,
-            "score": correct,
-            "evaluator_status": "exact_secret_substring",
-            "context_length": context_length,
-            "requested_context_length": context_length,
-            "actual_prompt_tokens": actual_prompt_tokens,
-            "actual_total_tokens": actual_total_tokens,
-            "model_max_seq_len": model_max_seq_len,
-            "truncated": truncated,
-            "needle_position": needle_position,
-            "prompt_tokens": actual_prompt_tokens,
-            "generated_tokens": gen_length,
-            "visible_output_tokens": visible_output_tokens,
-            "elapsed_seconds": round(elapsed, 6),
-            "tokens_per_second": round(gen_length / elapsed, 6) if elapsed > 0 else None,
-            "actual_commit_tps": round(trace.get("actual_transfer_count") / elapsed, 6) if elapsed > 0 and trace.get("actual_transfer_count") is not None else None,
-            "visible_tps": round(visible_output_tokens / elapsed, 6) if elapsed > 0 else None,
-            "steps": gen_steps,
-            "gen_length": gen_length,
-            "block_length": gen_blocksize,
-            "effective_parallelism": float(gen_length / gen_steps) if gen_steps else None,
-            "arness": float(gen_steps / gen_length) if gen_length else None,
-            "mask_id": mask_id,
-            "token_selection_confidence_threshold": params.get("token_selection_confidence_threshold"),
-            "min_transfer_tokens": int(params.get("min_transfer_tokens", 1)),
-            "final_mask_count": trace.get("final_mask_count"),
-            "completion_rate": trace.get("completion_rate"),
-            "actual_parallelism": trace.get("actual_parallelism"),
-            "actual_arness": trace.get("actual_arness"),
-            "scheduled_transfer_count": trace.get("scheduled_transfer_count"),
-            "threshold_passed_count": trace.get("threshold_passed_count"),
-            "fallback_forced_count": trace.get("fallback_forced_count"),
-            "actual_transfer_count": trace.get("actual_transfer_count"),
-            "threshold_pass_rate": trace.get("threshold_pass_rate"),
-            "fallback_rate": trace.get("fallback_rate"),
-            **cuda_stats,
-        }
-        with per_sample_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if step_trace_path is not None:
-            if params.get("trace_decode_snapshots") and trace.get("token_snapshots"):
-                snapshots = []
-                for snapshot in trace.get("token_snapshots") or []:
-                    item = dict(snapshot)
-                    item["generated_text"] = [
-                        tokenizer.decode(token_ids, skip_special_tokens=False)
-                        for token_ids in item.get("generated_token_ids") or []
-                    ]
-                    snapshots.append(item)
-                trace = dict(trace)
-                trace["token_snapshots"] = snapshots
-            with step_trace_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"sample_idx": sample_idx, "trace": trace}, ensure_ascii=False) + "\n")
-    return 0
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run iLLaDA/LLaDA benchmark experiments from test_config.yaml.")
     parser.add_argument("--config", default="test_config.yaml", help="Path to the YAML config.")
@@ -1012,6 +897,7 @@ def main() -> int:
     dry_run = args.dry_run or bool(execution_cfg.get("dry_run", False))
     telemetry_enabled = bool(execution_cfg.get("gpu_telemetry", {}).get("enabled", True))
     telemetry_interval = float(execution_cfg.get("gpu_telemetry", {}).get("interval_seconds", 1.0))
+    data_cfg = config.get("data", {}) or {}
     global_model = config.get("model", {}) or {}
     runner_cfg = config.get("runner", {}) or {}
     default_params = config.get("defaults", {}) or {}
@@ -1053,6 +939,7 @@ def main() -> int:
                     sample_limit=merged_params.get("sample_limit"),
                     sample_indices=merged_params.get("sample_indices"),
                     experiment_params=merged_params,
+                    data_cfg=data_cfg,
                 )
                 generated_config.write_text(config_text, encoding="utf-8")
                 work_dir.mkdir(parents=True, exist_ok=True)
@@ -1125,7 +1012,7 @@ def main() -> int:
                     manifest["returncode"] = returncode
                     manifest["gpu_after"] = current_gpu_snapshot()
                     run_summary = write_run_summary(
-                        output_path=work_dir / "aggregate.csv",
+                        output_path=work_dir / "run_summary.csv",
                         run_name=run_name,
                         experiment=exp_name,
                         benchmark=benchmark,
@@ -1136,7 +1023,10 @@ def main() -> int:
                         returncode=returncode,
                         elapsed_seconds=elapsed_seconds,
                     )
-                    upsert_csv_row(output_dir / "aggregate_all.csv", run_summary)
+                    compact_summary = aggregate_row(run_summary)
+                    upsert_csv_row(work_dir / "aggregate.csv", compact_summary)
+                    upsert_csv_row(output_dir / "aggregate.csv", compact_summary)
+                    upsert_csv_row(output_dir / "summary_all.csv", run_summary)
                     with manifest_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(manifest, ensure_ascii=False) + "\n")
                     if returncode != 0 and execution_cfg.get("stop_on_error", True):

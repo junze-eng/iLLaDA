@@ -15,6 +15,10 @@ execution:
     interval_seconds: 5
   opencompass_args: []
 
+data:
+  ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
+  prepared_dir: data/prepared
+
 model:
   type: instruct
   path: GSAI-ML/iLLaDA-8B-Instruct
@@ -66,6 +70,8 @@ tasks:
       - name: task1_gsm8k_ar_like
         benchmark: gsm8k
         params:
+          decoding_config_name: ar_like
+          arness: 1
           sample_limit: 50
           gen_length: 256
           gen_steps: 256
@@ -75,6 +81,8 @@ tasks:
       - name: task1_gsm8k_mild_parallel
         benchmark: gsm8k
         params:
+          decoding_config_name: mild_parallel
+          arness: 4
           sample_limit: 50
           gen_length: 256
           gen_steps: 64
@@ -84,6 +92,8 @@ tasks:
       - name: task1_gsm8k_strong_parallel
         benchmark: gsm8k
         params:
+          decoding_config_name: strong_parallel
+          arness: 8
           sample_limit: 50
           gen_length: 256
           gen_steps: 32
@@ -93,6 +103,8 @@ tasks:
       - name: task1_mbpp_ar_like
         benchmark: mbpp
         params:
+          decoding_config_name: ar_like
+          arness: 1
           sample_limit: 50
           gen_length: 512
           gen_steps: 512
@@ -102,6 +114,8 @@ tasks:
       - name: task1_mbpp_mild_parallel
         benchmark: mbpp
         params:
+          decoding_config_name: mild_parallel
+          arness: 4
           sample_limit: 50
           gen_length: 512
           gen_steps: 128
@@ -111,6 +125,8 @@ tasks:
       - name: task1_mbpp_strong_parallel
         benchmark: mbpp
         params:
+          decoding_config_name: strong_parallel
+          arness: 8
           sample_limit: 50
           gen_length: 512
           gen_steps: 64
@@ -120,19 +136,53 @@ tasks:
   context:
     description: "Task 2: RULER NIAH single_1 context-length sweep."
     experiments:
-      - name: task2_ruler_niah_single_1
+      - name: task2_ruler_niah_single_1_ar_like
         benchmark: ruler_niah_single_1
         params:
+          decoding_config_name: ar_like
+          arness: 1
           sample_limit: null
           num_samples: 20
           gen_length: 128
+          gen_steps: 128
           gen_blocksize: 128
           max_seq_len: 8192
           min_transfer_tokens: 1
         sweep:
           context_length: [512, 2048, 8192]
           needle_position: [front, middle, back]
-          gen_steps: [128, 32, 16]
+
+      - name: task2_ruler_niah_single_1_mild_parallel
+        benchmark: ruler_niah_single_1
+        params:
+          decoding_config_name: mild_parallel
+          arness: 4
+          sample_limit: null
+          num_samples: 20
+          gen_length: 128
+          gen_steps: 32
+          gen_blocksize: 128
+          max_seq_len: 8192
+          min_transfer_tokens: 4
+        sweep:
+          context_length: [512, 2048, 8192]
+          needle_position: [front, middle, back]
+
+      - name: task2_ruler_niah_single_1_strong_parallel
+        benchmark: ruler_niah_single_1
+        params:
+          decoding_config_name: strong_parallel
+          arness: 8
+          sample_limit: null
+          num_samples: 20
+          gen_length: 128
+          gen_steps: 16
+          gen_blocksize: 128
+          max_seq_len: 8192
+          min_transfer_tokens: 8
+        sweep:
+          context_length: [512, 2048, 8192]
+          needle_position: [front, middle, back]
 
   arness:
     description: "Task 3: small counterfactual threshold runs on Task 1/2 benchmarks."

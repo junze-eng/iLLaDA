@@ -39,9 +39,21 @@ class RulerNiahDataset(BaseDataset):
         type_needle_v: str = 'numbers',
         remove_newline_tab: str = '',
         depth_percents=None,
+        prepared_file_path: str = '',
     ) -> Dataset:
 
         data = {'prompt': [], 'answer': []}
+        if prepared_file_path:
+            prepared = get_data_path(prepared_file_path, local_mode=True)
+            with open(prepared, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    data['prompt'].append(item['prompt'])
+                    data['answer'].append(item['answer'])
+            return Dataset.from_dict(data)
+
         if tokenizer_model == 'gpt-4':
             tokenizer = tiktoken.encoding_for_model(tokenizer_model)
         else:
