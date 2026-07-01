@@ -11,7 +11,7 @@ run:
   # Choose from: cheap_anchor, paper_budget_probe, parallel, context, arness, mechanism, trace_audit, capability, all
   tasks: [parallel]
   # Optional direct experiment names. Usually leave empty and use tasks above.
-  experiments: []
+  experiments: [capability_ifeval]
 
 execution:
   output_dir: outputs/illada_runs
