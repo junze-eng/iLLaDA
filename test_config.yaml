@@ -168,7 +168,7 @@ tasks:
           trace_decode_snapshots: false
         sweep:
           gen_steps: [256, 128, 64, 32, 16]
-          token_selection_confidence_threshold: [null, 0.6, 0.8]
+          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
 
       - name: arness_trace_mbpp_sample6
         benchmark: mbpp
