@@ -153,11 +153,13 @@ class LLaDAModel(BaseModel):
                  return_trace = False,
                  trace_token_snapshots = False,
                  trace_decode_snapshots = False,
+                 arness_trace_output = None,
                  context_prefix_tokens = 0,
                  context_prefix_text = 'Context padding sentence. ',
                  benchmark = None,
                  task_id = None,
                  decoding_config_name = None,
+                 profile_sample_indices = None,
                  context_length = None,
                  needle_position = None,
                  **kwargs,
@@ -208,11 +210,13 @@ class LLaDAModel(BaseModel):
         self.return_trace = return_trace
         self.trace_token_snapshots = bool(trace_token_snapshots)
         self.trace_decode_snapshots = bool(trace_decode_snapshots)
+        self.arness_trace_output = arness_trace_output or os.environ.get('ILLADA_ARNESS_TRACE_DIR')
         self.context_prefix_tokens = int(context_prefix_tokens)
         self.context_prefix_text = context_prefix_text
         self.benchmark = benchmark
         self.task_id = task_id
         self.decoding_config_name = decoding_config_name
+        self.profile_sample_indices = profile_sample_indices or []
         self.context_length = context_length
         self.needle_position = needle_position
         self._profile_sample_idx = 0
@@ -469,7 +473,10 @@ class LLaDAModel(BaseModel):
         per_sample_records = []
         step_trace_records = []
         for i in range(batch_size):
-            sample_idx = self._profile_sample_idx
+            if self._profile_sample_idx < len(self.profile_sample_indices):
+                sample_idx = int(self.profile_sample_indices[self._profile_sample_idx])
+            else:
+                sample_idx = self._profile_sample_idx
             record = {
                 'benchmark': self.benchmark,
                 'sample_idx': sample_idx,
@@ -480,8 +487,12 @@ class LLaDAModel(BaseModel):
                 'elapsed_seconds': round(elapsed, 6),
                 'tokens_per_second': round(total_generated_tokens / elapsed, 6) if elapsed > 0 else None,
                 'steps': int(self.gen_steps),
+                'gen_steps': int(self.gen_steps),
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.gen_blocksize),
+                'gen_blocksize': int(self.gen_blocksize),
+                'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
+                'min_transfer_tokens': self.min_transfer_tokens,
                 'context_length': self.context_length,
                 'needle_position': self.needle_position,
                 'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
@@ -491,9 +502,23 @@ class LLaDAModel(BaseModel):
                 'actual_arness': trace.get('actual_arness') if trace else None,
                 'threshold_pass_rate': trace.get('threshold_pass_rate') if trace else None,
                 'fallback_rate': trace.get('fallback_rate') if trace else None,
+                'final_mask_count': trace.get('final_mask_count') if trace else None,
                 **cuda_stats,
             }
             per_sample_records.append(record)
+            if trace is not None and self.arness_trace_output:
+                try:
+                    from tools.arness_trace_writer import write_live_sample_artifacts
+                    write_live_sample_artifacts(
+                        self.arness_trace_output,
+                        record,
+                        trace,
+                        batch_item_idx=i,
+                        response=responses[i] if i < len(responses) else None,
+                        tokenizer=self.tokenizer,
+                    )
+                except Exception as exc:
+                    print(f"[WARN] failed to write ARness trace artifacts: {exc}")
             if trace is not None:
                 for step in trace.get('step_stats') or []:
                     if int(step.get('batch_item_idx', 0)) != i:

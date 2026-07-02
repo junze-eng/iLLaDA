@@ -288,6 +288,8 @@ def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchm
     model_cfg["type"] = MODEL_TYPES[model_type]
     model_cfg.update({key: value for key, value in params.items() if key not in EXPERIMENT_ONLY_KEYS})
     model_cfg["benchmark"] = benchmark
+    if "sample_indices" in params and params.get("sample_indices") is not None:
+        model_cfg["profile_sample_indices"] = [int(item) for item in as_list(params.get("sample_indices"))]
     if "context_length" in params:
         model_cfg["context_length"] = params.get("context_length")
     if "needle_position" in params:
