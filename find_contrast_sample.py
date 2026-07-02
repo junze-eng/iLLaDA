@@ -13,7 +13,15 @@ import json
 import re
 
 
+def _first(value):
+    return value[0] if isinstance(value, list) else value
+
+
 def load_correctness(results_path):
+    """Handles both schemas seen in OpenCompass results/*.json:
+    - GSM8K-style: {"pred": [...], "answer": [...], "correct": [bool]}
+    - MBPP-style:  {"programs": [...], "result": [str], "is_correct": [bool]}
+    """
     with open(results_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     by_idx = {}
@@ -22,12 +30,18 @@ def load_correctness(results_path):
         if not match:
             continue
         idx = int(match.group(1))
-        correct = item.get("correct")
-        by_idx[idx] = {
-            "correct": bool(correct[0]) if isinstance(correct, list) else bool(correct),
-            "pred": item.get("pred"),
-            "answer": item.get("answer"),
-        }
+        if "correct" in item:
+            by_idx[idx] = {
+                "correct": bool(_first(item.get("correct"))),
+                "pred": item.get("pred"),
+                "answer": item.get("answer"),
+            }
+        else:
+            by_idx[idx] = {
+                "correct": bool(_first(item.get("is_correct"))),
+                "pred": _first(item.get("result")),
+                "answer": "pass",
+            }
     return by_idx
 
 
