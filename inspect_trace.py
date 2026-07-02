@@ -6,6 +6,7 @@ Usage:
         --sample-idx 7 --plot
 """
 import argparse
+import csv
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -128,6 +129,32 @@ def write_narrative(rows, dominant_token, token_counts, sample_idx, trace_jsonl,
     print(f"[+] Saved narrative to {output_path}")
 
 
+def write_csv(rows, sample_idx, output_path):
+    """One row per diffusion step: how mask count/completion progressed, and exactly which
+    tokens (with confidence) got committed that step -- the raw iteration-by-iteration table."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "block_idx", "step_idx", "mask_count_before", "mask_count_after",
+            "completion_rate", "num_tokens_committed", "tokens_committed", "confidences_committed",
+        ])
+        for row in rows:
+            tokens = row.get("selected_decoded_tokens") or []
+            confidences = row.get("selected_confidences") or []
+            writer.writerow([
+                row.get("block_idx"),
+                row.get("step_idx"),
+                row.get("mask_count_before"),
+                row.get("mask_count_after"),
+                row.get("current_completion_rate"),
+                len(tokens),
+                ";".join(repr(t) for t in tokens),
+                ";".join(f"{c:.4f}" if isinstance(c, (int, float)) else str(c) for c in confidences),
+            ])
+    print(f"[+] Saved CSV to {output_path}")
+
+
 def plot_collapse_curve(rows, dominant_token, sample_idx, trace_jsonl, output_path):
     try:
         import matplotlib.pyplot as plt
@@ -184,6 +211,11 @@ def main():
     parser.add_argument("--narrative-output", default=None,
                          help="Path for --narrative output "
                               "(default: outputs/report_figures/trace_<sample_idx>_narrative.md)")
+    parser.add_argument("--csv", action="store_true",
+                         help="Also write a CSV: one row per step, with mask progress, completion "
+                              "rate, and every token+confidence committed that step.")
+    parser.add_argument("--csv-output", default=None,
+                         help="Path for --csv output (default: outputs/report_figures/trace_<sample_idx>.csv)")
     args = parser.parse_args()
 
     rows = load_steps(args.trace_jsonl, args.sample_idx)
@@ -193,6 +225,11 @@ def main():
 
     print(f"{len(rows)} step(s) for sample_idx={args.sample_idx}\n")
     token_counts = print_steps(rows, args.limit)
+
+    if args.csv:
+        csv_path = (Path(args.csv_output) if args.csv_output
+                    else Path("outputs/report_figures") / f"trace_{args.sample_idx}.csv")
+        write_csv(rows, args.sample_idx, csv_path)
 
     if args.plot or args.narrative:
         if not token_counts:
