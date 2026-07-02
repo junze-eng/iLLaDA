@@ -155,6 +155,48 @@ def write_csv(rows, sample_idx, output_path):
     print(f"[+] Saved CSV to {output_path}")
 
 
+MASK_PLACEHOLDER = "▢"  # matches the "unrevealed" square used elsewhere in this repo's trace tooling
+
+
+def write_snapshot_csv(rows, sample_idx, trace_jsonl, output_path):
+    """One row per step, but each row holds the FULL sequence's state as of that step (not just
+    what changed that step) -- unfilled positions shown as a placeholder square. Lets you watch
+    the whole generation fill in progressively, row by row, in a spreadsheet."""
+    any_positions = any(row.get("selected_positions") for row in rows)
+    if not any_positions:
+        print("[-] No 'selected_positions' found in this trace.jsonl -- can't build snapshots "
+              "(older trace file?).")
+        return
+
+    max_position = -1
+    for row in rows:
+        for pos in (row.get("selected_positions") or []):
+            max_position = max(max_position, pos)
+    seq_len = max_position + 1
+
+    slots = [None] * seq_len
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["global_step", "block_idx", "step_idx", "mask_count_after",
+                          "completion_rate", "sequence_snapshot"])
+        for global_step, row in enumerate(rows, start=1):
+            positions = row.get("selected_positions") or []
+            tokens = row.get("selected_decoded_tokens") or []
+            for pos, tok in zip(positions, tokens):
+                slots[pos] = tok
+            snapshot = "".join(tok if tok is not None else MASK_PLACEHOLDER for tok in slots)
+            writer.writerow([
+                global_step,
+                row.get("block_idx"),
+                row.get("step_idx"),
+                row.get("mask_count_after"),
+                row.get("current_completion_rate"),
+                snapshot,
+            ])
+    print(f"[+] Saved snapshot CSV to {output_path}")
+
+
 def write_continuous(rows, sample_idx, trace_jsonl, output_path):
     """Reassemble the final generation in true left-to-right position order (not step-commit
     order -- diffusion fills positions out of order, so the raw step log reads jumbled even when
@@ -267,6 +309,13 @@ def main():
     parser.add_argument("--continuous-output", default=None,
                          help="Path for --continuous output "
                               "(default: outputs/report_figures/trace_<sample_idx>_continuous.md)")
+    parser.add_argument("--snapshot-csv", action="store_true",
+                         help="Also write a CSV where each row is the FULL sequence's state as of "
+                              "that step (cumulative, not just what changed) -- watch generation "
+                              "fill in progressively, row by row.")
+    parser.add_argument("--snapshot-csv-output", default=None,
+                         help="Path for --snapshot-csv output "
+                              "(default: outputs/report_figures/trace_<sample_idx>_snapshots.csv)")
     args = parser.parse_args()
 
     rows = load_steps(args.trace_jsonl, args.sample_idx)
@@ -286,6 +335,11 @@ def main():
         continuous_path = (Path(args.continuous_output) if args.continuous_output
                            else Path("outputs/report_figures") / f"trace_{args.sample_idx}_continuous.md")
         write_continuous(rows, args.sample_idx, args.trace_jsonl, continuous_path)
+
+    if args.snapshot_csv:
+        snapshot_path = (Path(args.snapshot_csv_output) if args.snapshot_csv_output
+                         else Path("outputs/report_figures") / f"trace_{args.sample_idx}_snapshots.csv")
+        write_snapshot_csv(rows, args.sample_idx, args.trace_jsonl, snapshot_path)
 
     if args.plot or args.narrative:
         if not token_counts:
