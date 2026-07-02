@@ -10,6 +10,7 @@ work_dirs/
 opencompass/outputs/
 opencompass/work_dirs/
 data/prepared/
+visual/
 
 .venv/
 venv/

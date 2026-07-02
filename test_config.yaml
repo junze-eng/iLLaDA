@@ -168,106 +168,21 @@ tasks:
           trace_decode_snapshots: false
         sweep:
           gen_steps: [256, 128, 64, 32, 16]
-          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
 
       - name: arness_trace_mbpp_sample6
         benchmark: mbpp
         params:
           sample_indices: [6]
           gen_length: 512
-          gen_blocksize: 128
+          gen_blocksize: 16
           min_transfer_tokens: 1
-          return_trace: true
+          return_trace: true 
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
-          gen_steps: [512, 256, 128, 64, 32, 16]
-          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
-
-  custom_benchmark:
-    description: "Task 5: parallel-decoding mechanism study on custom_math (self-authored, paper-clean -- fine to use as headline evaluation evidence). task5_custom_math_ar_like/mild/strong_parallel mirror Task 1's steps-only sweep (block_length held at gen_length). task5_custom_math_block_grid extends this to the block_length=32/8 rows of a full gen_steps x block_length grid (block_length=256 row already covered by the ar_like/mild/strong experiments above) to test whether semi-autoregressive block splitting changes the strong_parallel collapse (see Task 1/Task 3 sample7 case study). task5_custom_math_overprovisioned_steps tests gen_steps > gen_length (2x) crossed with confidence threshold, to isolate whether threshold's completion_rate drop (seen in Task 3/4) is a real filtering effect or just a steps-budget artifact -- see generate.py's get_num_transfer_tokens: when steps > block_length, each masked position gets scheduled exactly once, so the threshold fallback (min_transfer_tokens) becomes unconditional and every position should eventually get force-committed. Mirrored on gsm8k as Task 6 (gsm8k_mechanism) so the two can run on separate GPUs in parallel."
-    experiments:
-      - name: task5_custom_math_ar_like
-        benchmark: custom_math
-        params:
-          decoding_config_name: ar_like
-          arness: 1
-          sample_limit: null
-          gen_length: 256
-          gen_steps: 256
-          gen_blocksize: 256
-          min_transfer_tokens: 1
-
-      - name: task5_custom_math_mild_parallel
-        benchmark: custom_math
-        params:
-          decoding_config_name: mild_parallel
-          arness: 4
-          sample_limit: null
-          gen_length: 256
-          gen_steps: 64
-          gen_blocksize: 256
-          min_transfer_tokens: 4
-
-      - name: task5_custom_math_strong_parallel
-        benchmark: custom_math
-        params:
-          decoding_config_name: strong_parallel
-          arness: 8
-          sample_limit: null
-          gen_length: 256
-          gen_steps: 32
-          gen_blocksize: 256
-          min_transfer_tokens: 8
-
-      - name: task5_custom_math_block_grid
-        benchmark: custom_math
-        params:
-          sample_limit: null
-          gen_length: 256
-          min_transfer_tokens: 1
-        sweep:
-          gen_blocksize: [32, 8]
-          gen_steps: [256, 64, 32]
-
-      - name: task5_custom_math_overprovisioned_steps
-        benchmark: custom_math
-        params:
-          sample_limit: 10
-          gen_length: 256
-          gen_blocksize: 256
-          temperature: 0.0
-          min_transfer_tokens: 1
-          return_trace: true
-        sweep:
-          gen_steps: [512]
-          token_selection_confidence_threshold: [null, 0.8, 0.9]
-
-  gsm8k_mechanism:
-    description: "Task 6: gsm8k mirror of Task 5's mechanism study (block_length grid + overprovisioned-steps), run as its own task group so it can go on a separate GPU in parallel with Task 5. gsm8k is a paper benchmark, so these results are cross-dataset mechanism confirmation only -- not headline evaluation evidence for the report (that role stays with custom_math / Task 5). task6_gsm8k_block_grid adds the block_length=32/8 rows (block_length=256 row already covered by Task 1's task1_gsm8k_ar_like/mild/strong_parallel). task6_gsm8k_overprovisioned_steps mirrors task5_custom_math_overprovisioned_steps exactly (gen_steps=512=2x gen_length, crossed with threshold, temperature fixed at 0.0)."
-    experiments:
-      - name: task6_gsm8k_block_grid
-        benchmark: gsm8k
-        params:
-          sample_limit: 30
-          gen_length: 256
-          min_transfer_tokens: 1
-        sweep:
-          gen_blocksize: [32, 8]
-          gen_steps: [256, 64, 32]
-
-      - name: task6_gsm8k_overprovisioned_steps
-        benchmark: gsm8k
-        params:
-          sample_limit: 10
-          gen_length: 256
-          gen_blocksize: 256
-          temperature: 0.0
-          min_transfer_tokens: 1
-          return_trace: true
-        sweep:
-          gen_steps: [512]
-          token_selection_confidence_threshold: [null, 0.8, 0.9]
+          gen_steps: [512, 256, 128, 64, 32]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
 
   temp_threshold_study:
     description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
@@ -284,3 +199,45 @@ tasks:
           gen_steps: [256, 64, 32]
           temperature: [0.0, 0.3]
           token_selection_confidence_threshold: [null, 0.8, 0.9]
+  baseline:
+    description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
+    experiments:
+      - name: paper_baseline_gsm8k_instruct
+        benchmark: gsm8k
+        params:
+          decoding_config_name: paper_anchor_gsm8k_len2048_block32_steps2048
+          sample_limit: 50
+          gen_length: 2048
+          gen_steps: 2048
+          gen_blocksize: 32
+          max_out_len: 2048
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          remasking: low_confidence
+          diff_confidence_eos_eot_inf: true
+          diff_logits_eos_inf: false
+          return_trace: false
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: paper_baseline_mbpp_instruct
+        benchmark: mbpp
+        params:
+          decoding_config_name: paper_anchor_mbpp_len2048_block16_steps2048
+          sample_limit: 50
+          gen_length: 2048
+          gen_steps: 2048
+          gen_blocksize: 16
+          max_out_len: 2048
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          remasking: low_confidence
+          diff_confidence_eos_eot_inf: true
+          diff_logits_eos_inf: false
+          return_trace: false
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
