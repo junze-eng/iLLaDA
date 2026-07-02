@@ -19,10 +19,13 @@ import string
 import subprocess
 import sys
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+SCRIPT_VERSION = "context_light_ui_v2"
 
 def find_repo_root(start: Path) -> Path:
     """Find repo root so this file can live either in repo root or tools/."""
@@ -309,6 +312,125 @@ def mean(values: Sequence[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "--"
+    seconds = max(0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{sec:02d}s"
+
+
+def progress_bar(done: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    done = max(0, min(done, total))
+    filled = int(round(width * done / total))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def truncate_text(text: Any, max_len: int = 120) -> str:
+    text = "" if text is None else str(text)
+    text = text.replace("\n", " ").strip()
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+def print_run_header(args: argparse.Namespace, selected: List[Dict[str, Any]], pending: List[Dict[str, Any]], output_dir: Path) -> None:
+    print("\n" + "=" * 88)
+    print(f"context_light: prepared RULER NIAH lightweight probe ({SCRIPT_VERSION})")
+    print("=" * 88)
+    print(f"Model        : {args.model_path}")
+    print(f"Output       : {output_dir}")
+    print(f"Contexts     : {' / '.join(str(x) for x in args.context_lengths)}")
+    print(f"Positions    : {' / '.join(args.needle_positions)}")
+    print(f"Samples      : selected={len(selected)} pending={len(pending)} already_done={len(selected) - len(pending)}")
+    print(f"Generation   : len={args.gen_length}, steps={args.gen_steps}, block={args.gen_blocksize}, temp={args.temperature}, cfg={args.cfg}")
+    print(f"Mask ID      : {args.mask_id}")
+    print("=" * 88 + "\n")
+
+
+def print_selected_table(selected: List[Dict[str, Any]], done_ids: set[str]) -> None:
+    print("Selected samples:")
+    print(f"{'#':>3}  {'status':<7} {'ctx':>5}  {'pos':<6} {'line':>5}  gold")
+    print("-" * 88)
+    for idx, sample in enumerate(selected, start=1):
+        status = "done" if sample["sample_id"] in done_ids else "pending"
+        print(
+            f"{idx:>3}  {status:<7} {sample['context_length']:>5}  "
+            f"{sample['needle_position']:<6} {sample['source_line']:>5}  "
+            f"{truncate_text(sample['groundtruth'], 42)}"
+        )
+    print("-" * 88 + "\n")
+
+
+def print_progress_line(done_now: int, total_pending: int, started_all: float, last_latency: Optional[float], match: Optional[bool], sample: Dict[str, Any], prediction: str) -> None:
+    elapsed = time.perf_counter() - started_all
+    avg = elapsed / done_now if done_now else None
+    remain = (total_pending - done_now) * avg if avg is not None else None
+    pct = (100.0 * done_now / total_pending) if total_pending else 100.0
+    print(
+        f"{progress_bar(done_now, total_pending)} "
+        f"{done_now:>2}/{total_pending:<2} {pct:5.1f}% | "
+        f"elapsed {format_duration(elapsed)} | eta {format_duration(remain)} | "
+        f"last {format_duration(last_latency)} | "
+        f"ctx={sample['context_length']} pos={sample['needle_position']:<6} "
+        f"match={str(match):<5} | pred={truncate_text(prediction, 90)!r}",
+        flush=True,
+    )
+
+
+class LiveSpinner:
+    """Tiny dependency-free spinner used while one long model generation is running."""
+
+    def __init__(self, message_fn, interval: float = 0.5):
+        self.message_fn = message_fn
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        def _run() -> None:
+            frames = "|/-\\"
+            i = 0
+            while not self._stop.is_set():
+                msg = self.message_fn()
+                sys.stdout.write("\r" + frames[i % len(frames)] + " " + msg)
+                sys.stdout.flush()
+                i += 1
+                self._stop.wait(self.interval)
+            sys.stdout.write("\r" + " " * 140 + "\r")
+            sys.stdout.flush()
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
+def make_running_message(progress_idx: int, total_pending: int, sample: Dict[str, Any], overall_started: float, sample_started: float, completed_latencies: Sequence[float]) -> str:
+    completed = progress_idx - 1
+    elapsed_all = time.perf_counter() - overall_started
+    elapsed_this = time.perf_counter() - sample_started
+    avg_done = mean([float(x) for x in completed_latencies])
+    eta = None
+    if avg_done is not None:
+        eta = (total_pending - completed - 1) * avg_done + elapsed_this
+    pct = 100.0 * completed / total_pending if total_pending else 100.0
+    return (
+        f"{progress_bar(completed, total_pending)} {completed:>2}/{total_pending:<2} {pct:5.1f}% | "
+        f"running ctx={sample['context_length']} pos={sample['needle_position']:<6} "
+        f"sample_elapsed={format_duration(elapsed_this)} | total_elapsed={format_duration(elapsed_all)} | eta~{format_duration(eta)}"
+    )
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -452,6 +574,7 @@ def main() -> int:
     pending = [sample for sample in selected if sample["sample_id"] not in done_ids]
 
     run_config = {
+        "script_version": SCRIPT_VERSION,
         "argv": sys.argv,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_commit(),
@@ -469,19 +592,12 @@ def main() -> int:
     with (output_dir / "run_config.json").open("w", encoding="utf-8") as f:
         json.dump(run_config, f, ensure_ascii=False, indent=2)
 
-    print(f"[context_light] prepared_root={prepared_root}")
-    print(f"[context_light] output_dir={output_dir}")
-    print(f"[context_light] selected={len(selected)} pending={len(pending)} mask_id={args.mask_id}")
-    for sample in selected:
-        status = "done" if sample["sample_id"] in done_ids else "pending"
-        print(
-            f"[context_light] {status}: ctx={sample['context_length']} pos={sample['needle_position']} "
-            f"line={sample['source_line']} gold={sample['groundtruth']!r}",
-            flush=True,
-        )
+    print_run_header(args, selected, pending, output_dir)
+    print(f"Prepared data : {prepared_root}")
+    print_selected_table(selected, done_ids)
 
     if args.dry_run:
-        print("[context_light] dry-run only; no model loaded.")
+        print("Dry-run only; no model loaded. Run `python context_light.py` to start inference.")
         return 0
 
     if not pending:
@@ -497,6 +613,8 @@ def main() -> int:
     torch.manual_seed(args.seed)
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
 
+    print(f"Loading tokenizer/model on {device} ...", flush=True)
+    load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
     model = AutoModel.from_pretrained(
@@ -504,9 +622,19 @@ def main() -> int:
         trust_remote_code=True,
         torch_dtype=get_torch_dtype(args.torch_dtype) if device.type == "cuda" else torch.float32,
     ).to(device).eval()
+    print(f"Model loaded in {format_duration(time.perf_counter() - load_started)}. Starting {len(pending)} sample(s).\n", flush=True)
 
+    total_pending = len(pending)
+    overall_started = time.perf_counter()
+    completed_latencies: List[float] = []
     with predictions_path.open("a", encoding="utf-8") as pred_f, prompts_path.open("a", encoding="utf-8") as prompt_f:
-        for sample in pending:
+        for progress_idx, sample in enumerate(pending, start=1):
+            print(
+                f"Running {progress_idx}/{total_pending}: ctx={sample['context_length']} "
+                f"pos={sample['needle_position']} line={sample['source_line']} "
+                f"gold={truncate_text(sample['groundtruth'], 60)!r}",
+                flush=True,
+            )
             full_prompt = build_prompt(tokenizer, sample["prompt"], args.apply_chat_template)
             encoded = tokenizer(full_prompt, add_special_tokens=args.add_special_tokens, return_tensors="pt")
             input_ids = encoded["input_ids"].to(device)
@@ -518,27 +646,33 @@ def main() -> int:
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
-            with torch.inference_mode():
-                generated = call_llada_generate(
-                    LLaDA_generate,
-                    model=model,
-                    prompt=input_ids,
-                    attention_mask=attention_mask,
-                    steps=args.gen_steps,
-                    gen_length=args.gen_length,
-                    block_length=args.gen_blocksize,
-                    temperature=args.temperature,
-                    cfg_scale=args.cfg,
-                    remasking=args.remasking,
-                    mask_id=args.mask_id,
-                    token_selection_confidence_threshold=args.token_selection_confidence_threshold,
-                    return_trace=args.return_trace,
-                    trace_token_snapshots=args.trace_token_snapshots,
-                    tokenizer=tokenizer,
+            with LiveSpinner(
+                lambda idx=progress_idx, sample=sample, started=started: make_running_message(
+                    idx, total_pending, sample, overall_started, started, completed_latencies
                 )
+            ):
+                with torch.inference_mode():
+                    generated = call_llada_generate(
+                        LLaDA_generate,
+                        model=model,
+                        prompt=input_ids,
+                        attention_mask=attention_mask,
+                        steps=args.gen_steps,
+                        gen_length=args.gen_length,
+                        block_length=args.gen_blocksize,
+                        temperature=args.temperature,
+                        cfg_scale=args.cfg,
+                        remasking=args.remasking,
+                        mask_id=args.mask_id,
+                        token_selection_confidence_threshold=args.token_selection_confidence_threshold,
+                        return_trace=args.return_trace,
+                        trace_token_snapshots=args.trace_token_snapshots,
+                        tokenizer=tokenizer,
+                    )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             latency = time.perf_counter() - started
+            completed_latencies.append(latency)
 
             if args.return_trace and isinstance(generated, tuple):
                 generated_tokens, _trace = generated
@@ -586,24 +720,36 @@ def main() -> int:
             prompt_f.write(json.dumps(prompt_record, ensure_ascii=False) + "\n")
             prompt_f.flush()
 
-            short_pred = prediction.replace("\n", " ")[:160]
-            print(
-                "[context_light] "
-                f"ctx={sample['context_length']} pos={sample['needle_position']} "
-                f"line={sample['source_line']} match={record['keyword_match']} "
-                f"latency={latency:.2f}s tps={record['tokens_per_second']} pred={short_pred!r}",
-                flush=True,
+            print_progress_line(
+                progress_idx,
+                total_pending,
+                overall_started,
+                latency,
+                record["keyword_match"],
+                sample,
+                prediction,
             )
 
     write_summaries(output_dir)
     rows = load_jsonl(predictions_path)
+    print("\n" + "=" * 88)
+    print("Finished. Summary by context length")
+    print("=" * 88)
+    print(f"{'ctx':>6}  {'n':>3}  {'pass':>5}  {'acc':>7}  {'mean latency':>13}  {'mean tps':>10}")
+    print("-" * 88)
     for ctx in args.context_lengths:
         ctx_rows = [row for row in rows if row.get("context_length") == ctx]
         if not ctx_rows:
             continue
         passed = sum(1 for row in ctx_rows if row.get("keyword_match"))
         lat = mean([float(row["latency_sec"]) for row in ctx_rows if row.get("latency_sec") is not None])
-        print(f"[context_light] ctx={ctx} acc={passed}/{len(ctx_rows)} mean_latency={lat}", flush=True)
+        tps = mean([float(row["tokens_per_second"]) for row in ctx_rows if row.get("tokens_per_second") is not None])
+        acc = passed / len(ctx_rows) if ctx_rows else 0.0
+        print(f"{ctx:>6}  {len(ctx_rows):>3}  {passed:>5}  {acc:>7.2%}  {format_duration(lat):>13}  {tps if tps is not None else '--':>10}")
+    print("-" * 88)
+    print(f"Outputs written to: {output_dir}")
+    print("Review file       : manual_review.csv")
+    print("=" * 88)
     return 0
 
 
