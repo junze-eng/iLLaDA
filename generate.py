@@ -62,6 +62,7 @@ def resolve_steps_per_block_schedule(
             'all_4tps': [8, 8, 8, 8, 8, 8, 8, 8],
             'slow_to_fast_1_2_4': [32, 32, 16, 16, 16, 8, 8, 8],
             'fast_to_slow_4_2_1': [8, 8, 8, 16, 16, 16, 32, 32],
+            'slow_fast_slow_1_4_1': [32, 32, 8, 8, 8, 8, 32, 32],
         }
         if gen_length != 256 or block_length != 32 or num_blocks != 8:
             raise ValueError(

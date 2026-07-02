@@ -362,3 +362,4 @@ tasks:
             - all_4tps
             - slow_to_fast_1_2_4
             - fast_to_slow_4_2_1
+            - slow_fast_slow_1_4_1
