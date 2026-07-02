@@ -155,9 +155,12 @@ tasks:
 
   arness:
     description: "Task 3: two-sample detailed ARness trace case study."
+    output_path: outputs/arness
+
     experiments:
       - name: arness_trace_gsm8k_sample7
         benchmark: gsm8k
+        output_path: outputs/arness/arness_trace_gsm8k_sample7
         params:
           sample_indices: [7]
           gen_length: 256
@@ -167,17 +170,18 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
-          gen_steps: [256, 128, 64, 32, 16]
-          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
+          gen_steps: [64, 32, 16]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
 
       - name: arness_trace_mbpp_sample6
         benchmark: mbpp
+        output_path: outputs/arness/arness_trace_mbpp_sample6
         params:
           sample_indices: [6]
           gen_length: 512
           gen_blocksize: 16
           min_transfer_tokens: 1
-          return_trace: true 
+          return_trace: true
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
@@ -241,3 +245,6 @@ tasks:
           return_trace: false
           trace_token_snapshots: false
           trace_decode_snapshots: false
+
+    blocksize:
+

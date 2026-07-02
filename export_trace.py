@@ -1,41 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_arness_trace_csv_v5.py
+export_trace.py v6
 
-Post-process iLLaDA ARness trace runs.
+ARness output manager + trace exporter.
 
-This version uses GLOBAL generation time in generation_chain.csv:
-- Row -1 is the initial all-mask state.
-- Then one row per original trace step, e.g. 0..255 for a 256-step trace.
-- It does NOT output a separate global_timeline.csv.
-- sample_traces is written under EACH original task/run folder by default.
-- Each sample folder contains only:
-    generation_chain.csv
-    metrics.json
-    problem_groundtruth_prediction.txt
-- Each run folder also gets:
-    sample_traces/trace_metrics.jsonl
-    sample_traces/trace_metrics.csv
+What changed from the previous version
+--------------------------------------
+1. Output is organized by TASK/EXPERIMENT name, not run order.
+2. Each task/experiment owns its output_path:
+     outputs/arness/arness_trace_gsm8k_sample7/
+     outputs/arness/arness_trace_mbpp_sample6/
+3. Each condition folder is named by the actual config:
+     gsm8k_sample7_len256_block64_steps128_thr0p6
+4. Old numbered folders can be repaired into the new layout.
+5. Trace export is integrated, so repaired/new folders immediately get:
+     sample_traces/
+       trace_metrics.jsonl
+       trace_metrics.csv
+       sample_0007/
+         generation_chain.csv
+         metrics.json
+         problem_groundtruth_prediction.txt
 
-generation_chain.csv columns:
-    generation_step
-    active_block
-    block_local_round
-    selected_count
-    transfer_reason
-    block_00, block_00_complete
-    block_01, block_01_complete
-    ...
+Recommended usage
+-----------------
+Repair old outputs and export traces:
+  python export_trace.py \
+    --runs-root outputs/arness_all \
+    --task-output-root outputs/arness \
+    --canonicalize \
+    --mode copy \
+    --overwrite \
+    --write-task-index
 
-Where block_XX_complete is a compact visible/total string such as 16/64.
-64/64 means that block is complete.
+Export traces for already canonical outputs:
+  python export_trace.py \
+    --runs-root outputs/arness \
+    --overwrite \
+    --write-task-index
 
-Usage:
-  python export_arness_trace_csv.py --runs-root outputs/arness_all --overwrite
-
-Default mask rendering is full mask characters: □□□...
-Use --compress-masks to render □x64 instead.
+After this, visual scripts should read:
+  outputs/arness/
+not the old numbered folders.
 """
 
 from __future__ import annotations
@@ -48,14 +55,12 @@ import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-def safe_name(x: Any, max_len: int = 100) -> str:
-    s = "none" if x is None else str(x)
-    s = re.sub(r"[^A-Za-z0-9_.=-]+", "_", s).strip("_")
-    return (s or "none")[:max_len]
-
+# -----------------------------
+# Basic IO helpers
+# -----------------------------
 
 def to_int(x: Any, default: int = 0) -> int:
     try:
@@ -80,7 +85,10 @@ def to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         s = str(x).strip()
         if s == "" or s.lower() in {"none", "null", "nan"}:
             return default
-        return float(s)
+        v = float(s)
+        if not math.isfinite(v):
+            return default
+        return v
     except Exception:
         return default
 
@@ -91,9 +99,19 @@ def mean(values: Sequence[Any]) -> Optional[float]:
         f = to_float(v)
         if f is not None and math.isfinite(f):
             vals.append(f)
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
+    return sum(vals) / len(vals) if vals else None
+
+
+def safe_part(x: Any) -> str:
+    if x is None:
+        return "none"
+    s = str(x).strip()
+    if s == "" or s.lower() in {"none", "null", "nan"}:
+        return "none"
+    s = s.replace(".", "p")
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "none"
 
 
 def threshold_label(x: Any) -> str:
@@ -124,24 +142,6 @@ def write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-
-    fieldnames: List[str] = []
-    for row in rows:
-        for k in row.keys():
-            if k not in fieldnames:
-                fieldnames.append(k)
-
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -149,48 +149,20 @@ def write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def render_slots(slots: Sequence[Optional[str]], max_chars: int, compress_masks: bool) -> str:
-    if compress_masks:
-        parts: List[str] = []
-        run = 0
-        for tok in slots:
-            if tok is None:
-                run += 1
-            else:
-                if run:
-                    parts.append(f"□x{run}")
-                    run = 0
-                parts.append(str(tok))
-        if run:
-            parts.append(f"□x{run}")
-        s = "".join(parts)
-    else:
-        s = "".join("□" if tok is None else str(tok) for tok in slots)
-
-    s = s.replace("\r", "\\r").replace("\n", "\\n")
-    if max_chars > 0 and len(s) > max_chars:
-        return s[:max_chars] + "...<truncated>"
-    return s
-
-
-def infer_run_dirs(root: Path, sample_traces_name: str) -> List[Path]:
-    if (root / "trace.jsonl").exists():
-        return [root]
-
-    run_dirs = []
-    for p in sorted(root.rglob("trace.jsonl")):
-        if sample_traces_name in p.parts:
-            continue
-        run_dirs.append(p.parent)
-
-    seen = set()
-    out = []
-    for rd in run_dirs:
-        key = str(rd.resolve())
-        if key not in seen:
-            out.append(rd)
-            seen.add(key)
-    return out
+def write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fields: List[str] = []
+    for row in rows:
+        for k in row:
+            if k not in fields:
+                fields.append(k)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
 
 
 def get_field(record: Dict[str, Any], *names: str, default: Any = None) -> Any:
@@ -200,15 +172,17 @@ def get_field(record: Dict[str, Any], *names: str, default: Any = None) -> Any:
     return default
 
 
+# -----------------------------
+# Metadata / canonical naming
+# -----------------------------
+
 def infer_gen_length(record: Dict[str, Any], traces: List[Dict[str, Any]]) -> int:
-    gl = get_field(record, "gen_length", "generated_tokens", "max_new_tokens", default=None)
+    gl = get_field(record, "gen_length", "generated_tokens", "max_new_tokens", "param_gen_length", default=None)
     if gl is not None:
         return to_int(gl, 0)
-
     max_mask = max([to_int(t.get("mask_count_before"), 0) for t in traces] or [0])
     if max_mask > 0:
         return max_mask
-
     max_pos = -1
     for t in traces:
         for p in t.get("selected_positions") or []:
@@ -217,7 +191,14 @@ def infer_gen_length(record: Dict[str, Any], traces: List[Dict[str, Any]]) -> in
 
 
 def infer_block_length(record: Dict[str, Any], traces: List[Dict[str, Any]], gen_length: int) -> int:
-    bl = get_field(record, "block_length", "gen_blocksize", "param_gen_blocksize", "block_size", default=None)
+    bl = get_field(
+        record,
+        "block_length",
+        "gen_blocksize",
+        "param_gen_blocksize",
+        "block_size",
+        default=None,
+    )
     if bl is not None:
         return max(1, to_int(bl, gen_length or 1))
 
@@ -226,29 +207,6 @@ def infer_block_length(record: Dict[str, Any], traces: List[Dict[str, Any]], gen
     if len(block_ids) > 1 and gen_length:
         return max(1, math.ceil(gen_length / len(block_ids)))
     return gen_length or 1
-
-
-def selected_to_local(pos: int, block_idx: int, block_length: int) -> Optional[int]:
-    start = block_idx * block_length
-    if start <= pos < start + block_length:
-        return pos - start
-    if 0 <= pos < block_length:
-        return pos
-    return None
-
-
-def dedup_summary_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_id: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
-    for rec in rows:
-        sid = rec.get("sample_idx", rec.get("sample_id"))
-        if sid is None:
-            sid = len(order)
-        key = str(sid)
-        if key not in by_id:
-            order.append(key)
-        by_id[key] = rec
-    return [by_id[k] for k in order]
 
 
 def fallback_summaries_from_trace(trace_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -267,15 +225,28 @@ def fallback_summaries_from_trace(trace_rows: List[Dict[str, Any]]) -> List[Dict
         records.append({
             "sample_idx": sid,
             "benchmark": first.get("benchmark", "unknown"),
-            "decoding_config_name": first.get("decoding_config_name"),
             "gen_length": gen_length,
             "block_length": block_length,
-            "steps": max(to_int(r.get("step_idx"), 0) for r in rows) + 1,
+            "gen_steps": max(to_int(r.get("step_idx"), 0) for r in rows) + 1,
             "token_selection_confidence_threshold": first.get("token_selection_confidence_threshold"),
             "completion_rate": final.get("current_completion_rate"),
             "final_mask_count": final.get("mask_count_after"),
         })
     return records
+
+
+def dedup_summary_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_id: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for rec in rows:
+        sid = rec.get("sample_idx", rec.get("sample_id"))
+        if sid is None:
+            sid = len(order)
+        key = str(sid)
+        if key not in by_id:
+            order.append(key)
+        by_id[key] = rec
+    return [by_id[k] for k in order]
 
 
 def dedup_trace_rows(trace_rows: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
@@ -311,12 +282,220 @@ def metric_value(record: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def infer_benchmark_from_name(path: Path) -> str:
+    name = path.name.lower()
+    if "gsm8k" in name or "gsm_8k" in name:
+        return "gsm8k"
+    if "mbpp" in name:
+        return "mbpp"
+    if "ruler" in name:
+        return "ruler"
+    return "unknown"
+
+
+def infer_sample_from_name(path: Path) -> int:
+    m = re.search(r"sample[_-]?(\d+)", path.name.lower())
+    return int(m.group(1)) if m else 0
+
+
+def condition_metadata(run_dir: Path) -> Dict[str, Any]:
+    summary_rows = dedup_summary_rows(read_jsonl(run_dir / "summary.jsonl"))
+    trace_rows = read_jsonl(run_dir / "trace.jsonl")
+    trace_by_sample = dedup_trace_rows(trace_rows)
+
+    if summary_rows:
+        rec = summary_rows[-1]
+    elif trace_rows:
+        rec = fallback_summaries_from_trace(trace_rows)[-1]
+    else:
+        rec = {}
+
+    sid = to_int(get_field(rec, "sample_idx", "sample_id", default=infer_sample_from_name(run_dir)), 0)
+    traces = trace_by_sample.get(sid, trace_rows)
+
+    benchmark = get_field(rec, "benchmark", default=None) or infer_benchmark_from_name(run_dir)
+    gen_length = infer_gen_length(rec, traces)
+    block_length = infer_block_length(rec, traces, gen_length)
+    gen_steps = to_int(get_field(rec, "gen_steps", "steps", "param_gen_steps", default=None), 0)
+    if not gen_steps and traces:
+        gen_steps = max(to_int(r.get("step_idx"), -1) for r in traces) + 1
+
+    th = get_field(
+        rec,
+        "token_selection_confidence_threshold",
+        "param_token_selection_confidence_threshold",
+        "threshold",
+        default=None,
+    )
+
+    return {
+        "benchmark": str(benchmark),
+        "sample_idx": sid,
+        "gen_length": gen_length,
+        "block_length": block_length,
+        "gen_steps": gen_steps,
+        "threshold": th,
+        "threshold_label": threshold_label(th),
+        "raw_run_dir": str(run_dir),
+    }
+
+
+def experiment_name(meta: Dict[str, Any]) -> str:
+    return f"arness_trace_{safe_part(meta['benchmark']).lower()}_sample{to_int(meta['sample_idx'], 0)}"
+
+
+def condition_key(meta: Dict[str, Any]) -> str:
+    bench = safe_part(meta["benchmark"]).lower()
+    sid = to_int(meta["sample_idx"], 0)
+    return (
+        f"{bench}_sample{sid}"
+        f"_len{safe_part(meta['gen_length'])}"
+        f"_block{safe_part(meta['block_length'])}"
+        f"_steps{safe_part(meta['gen_steps'])}"
+        f"_thr{safe_part(meta['threshold_label'])}"
+    )
+
+
+def is_condition_dir(path: Path) -> bool:
+    return bool(re.search(r"_sample\d+_len\d+_block\d+_steps\d+_thr", path.name))
+
+
+def infer_run_dirs(root: Path, sample_traces_name: str) -> List[Path]:
+    if (root / "trace.jsonl").exists():
+        return [root]
+
+    run_dirs = []
+    for p in sorted(root.rglob("trace.jsonl")):
+        if sample_traces_name in p.parts:
+            continue
+        run_dirs.append(p.parent)
+
+    seen = set()
+    out = []
+    for rd in run_dirs:
+        key = str(rd.resolve())
+        if key not in seen:
+            out.append(rd)
+            seen.add(key)
+    return out
+
+
+def canonicalize_run_dirs(
+    run_dirs: Sequence[Path],
+    task_output_root: Path,
+    mode: str,
+    overwrite: bool,
+) -> Tuple[List[Path], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    task_output_root.mkdir(parents=True, exist_ok=True)
+    canonical_dirs: List[Path] = []
+    index_rows: List[Dict[str, Any]] = []
+    duplicate_rows: List[Dict[str, Any]] = []
+
+    seen: Dict[str, int] = defaultdict(int)
+
+    for rd in run_dirs:
+        meta = condition_metadata(rd)
+        exp = experiment_name(meta)
+        key = condition_key(meta)
+        canonical = task_output_root / exp / key
+
+        already_canonical = is_condition_dir(rd) and rd.parent.name == exp
+        if already_canonical:
+            canonical = rd
+
+        dup_id = f"{exp}/{key}"
+        seen[dup_id] += 1
+        duplicate_index = seen[dup_id]
+        if duplicate_index > 1 and not overwrite and not already_canonical:
+            canonical = task_output_root / exp / f"{key}_dup{duplicate_index}"
+            duplicate_rows.append({
+                **meta,
+                "experiment_name": exp,
+                "condition_key": key,
+                "duplicate_index": duplicate_index,
+                "raw_run_dir": str(rd),
+                "canonical_run_dir": str(canonical),
+            })
+
+        row = {
+            **meta,
+            "experiment_name": exp,
+            "condition_key": key,
+            "duplicate_index": duplicate_index,
+            "raw_run_dir": str(rd),
+            "canonical_run_dir": str(canonical),
+            "already_canonical": already_canonical,
+        }
+        index_rows.append(row)
+
+        if already_canonical:
+            canonical_dirs.append(canonical)
+            continue
+
+        if canonical.exists():
+            if overwrite:
+                shutil.rmtree(canonical)
+            else:
+                print(f"[SKIP] exists: {canonical}")
+                canonical_dirs.append(canonical)
+                continue
+
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "copy":
+            shutil.copytree(rd, canonical)
+        elif mode == "move":
+            shutil.move(str(rd), str(canonical))
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        canonical_dirs.append(canonical)
+        print(f"[OK] {rd} -> {canonical}")
+
+    return canonical_dirs, index_rows, duplicate_rows
+
+
+# -----------------------------
+# Trace export
+# -----------------------------
+
+def render_slots(slots: Sequence[Optional[str]], max_chars: int, compress_masks: bool) -> str:
+    if compress_masks:
+        parts: List[str] = []
+        run = 0
+        for tok in slots:
+            if tok is None:
+                run += 1
+            else:
+                if run:
+                    parts.append(f"□x{run}")
+                    run = 0
+                parts.append(str(tok))
+        if run:
+            parts.append(f"□x{run}")
+        s = "".join(parts)
+    else:
+        s = "".join("□" if tok is None else str(tok) for tok in slots)
+
+    s = s.replace("\r", "\\r").replace("\n", "\\n")
+    if max_chars > 0 and len(s) > max_chars:
+        return s[:max_chars] + "...<truncated>"
+    return s
+
+
+def selected_to_local(pos: int, block_idx: int, block_length: int) -> Optional[int]:
+    start = block_idx * block_length
+    if start <= pos < start + block_length:
+        return pos - start
+    if 0 <= pos < block_length:
+        return pos
+    return None
+
+
 def make_problem_text(record: Dict[str, Any]) -> str:
     question = get_field(record, "question", "prompt", "input", "problem", "query", default="")
     groundtruth = get_field(record, "answer", "groundtruth", "reference", "target", "gt", default="")
     prediction = get_field(record, "prediction", "decoded_prediction", "prediction_preview", "output", default="")
     score = metric_value(record)
-
     return (
         "QUESTION / PROMPT\n"
         "=================\n"
@@ -347,7 +526,12 @@ def add_block_columns(
         out[f"block_{b:02d}_complete"] = f"{visible}/{total}"
 
 
-def build_generation_chain(record: Dict[str, Any], traces: List[Dict[str, Any]], max_cell_chars: int, compress_masks: bool) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def build_generation_chain(
+    record: Dict[str, Any],
+    traces: List[Dict[str, Any]],
+    max_cell_chars: int,
+    compress_masks: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     gen_length = infer_gen_length(record, traces)
     block_length = infer_block_length(record, traces, gen_length)
     num_blocks = max(1, math.ceil(gen_length / block_length)) if gen_length else 1
@@ -360,13 +544,11 @@ def build_generation_chain(record: Dict[str, Any], traces: List[Dict[str, Any]],
 
     block_slots: Dict[int, List[Optional[str]]] = {b: [None] * block_length for b in range(num_blocks)}
     local_round_counter: Dict[int, int] = defaultdict(int)
-
     block_selected_counts: Dict[int, List[int]] = defaultdict(list)
     block_confidences: Dict[int, List[float]] = defaultdict(list)
     block_reasons: Dict[int, List[str]] = defaultdict(list)
 
     chain_rows: List[Dict[str, Any]] = []
-
     initial: Dict[str, Any] = {
         "generation_step": -1,
         "active_block": "",
@@ -431,17 +613,16 @@ def build_generation_chain(record: Dict[str, Any], traces: List[Dict[str, Any]],
             "threshold_pass_steps": sum(1 for x in block_reasons[b] if x == "threshold_pass"),
         })
 
+    th = get_field(record, "token_selection_confidence_threshold", "param_token_selection_confidence_threshold")
     metrics: Dict[str, Any] = {
         "sample_idx": record.get("sample_idx", record.get("sample_id")),
         "benchmark": record.get("benchmark"),
-        "run_name": record.get("run_name"),
-        "decoding_config_name": record.get("decoding_config_name"),
         "gen_length": gen_length,
         "block_length": block_length,
         "num_blocks": num_blocks,
         "gen_steps": get_field(record, "gen_steps", "steps", default=len(traces)),
-        "threshold": get_field(record, "token_selection_confidence_threshold", "param_token_selection_confidence_threshold"),
-        "threshold_label": threshold_label(get_field(record, "token_selection_confidence_threshold", "param_token_selection_confidence_threshold")),
+        "threshold": th,
+        "threshold_label": threshold_label(th),
         "min_transfer_tokens": get_field(record, "min_transfer_tokens", "param_min_transfer_tokens"),
         "metric_value": metric_value(record),
         "completion_rate": get_field(record, "completion_rate", default=None),
@@ -472,7 +653,13 @@ def build_generation_chain(record: Dict[str, Any], traces: List[Dict[str, Any]],
     return chain_rows, metrics
 
 
-def export_run_dir(run_dir: Path, sample_traces_name: str, overwrite: bool, max_cell_chars: int, compress_masks: bool) -> List[Dict[str, Any]]:
+def export_run_dir(
+    run_dir: Path,
+    sample_traces_name: str,
+    overwrite: bool,
+    max_cell_chars: int,
+    compress_masks: bool,
+) -> List[Dict[str, Any]]:
     summary_rows_raw = read_jsonl(run_dir / "summary.jsonl")
     trace_rows_raw = read_jsonl(run_dir / "trace.jsonl")
     if not trace_rows_raw:
@@ -489,6 +676,10 @@ def export_run_dir(run_dir: Path, sample_traces_name: str, overwrite: bool, max_
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    meta = condition_metadata(run_dir)
+    exp = experiment_name(meta)
+    key = condition_key(meta)
+
     all_metrics: List[Dict[str, Any]] = []
 
     for rec in summary_rows:
@@ -502,14 +693,23 @@ def export_run_dir(run_dir: Path, sample_traces_name: str, overwrite: bool, max_
         sample_dir = out_root / f"sample_{sid:04d}"
         sample_dir.mkdir(parents=True, exist_ok=True)
 
-        chain_rows, metrics = build_generation_chain(rec, traces, max_cell_chars=max_cell_chars, compress_masks=compress_masks)
+        chain_rows, metrics = build_generation_chain(
+            rec,
+            traces,
+            max_cell_chars=max_cell_chars,
+            compress_masks=compress_masks,
+        )
 
-        metrics["run_dir"] = str(run_dir)
-        metrics["sample_dir"] = str(sample_dir)
-        metrics["raw_summary_records_in_run"] = len(summary_rows_raw)
-        metrics["deduped_summary_records_in_run"] = len(summary_rows)
-        metrics["raw_trace_records_in_run"] = len(trace_rows_raw)
-        metrics["deduped_trace_records_for_sample"] = len(traces)
+        metrics.update({
+            "experiment_name": exp,
+            "condition_key": key,
+            "run_dir": str(run_dir),
+            "sample_dir": str(sample_dir),
+            "raw_summary_records_in_run": len(summary_rows_raw),
+            "deduped_summary_records_in_run": len(summary_rows),
+            "raw_trace_records_in_run": len(trace_rows_raw),
+            "deduped_trace_records_for_sample": len(traces),
+        })
 
         write_csv(sample_dir / "generation_chain.csv", chain_rows)
         write_json(sample_dir / "metrics.json", metrics)
@@ -524,21 +724,69 @@ def export_run_dir(run_dir: Path, sample_traces_name: str, overwrite: bool, max_
     return all_metrics
 
 
+def write_task_indexes(root: Path, metric_rows: Sequence[Dict[str, Any]], index_rows: Sequence[Dict[str, Any]], duplicate_rows: Sequence[Dict[str, Any]]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    write_jsonl(root / "trace_metrics_all.jsonl", metric_rows)
+    write_csv(root / "trace_metrics_all.csv", metric_rows)
+    write_jsonl(root / "trace_index.jsonl", index_rows)
+    write_csv(root / "trace_index.csv", index_rows)
+    write_csv(root / "duplicate_conditions.csv", duplicate_rows)
+
+    by_exp: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in metric_rows:
+        by_exp[str(r.get("experiment_name", "unknown"))].append(r)
+
+    for exp, rows in by_exp.items():
+        exp_dir = root / exp
+        write_jsonl(exp_dir / "trace_metrics_all.jsonl", rows)
+        write_csv(exp_dir / "trace_metrics_all.csv", rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs-root", default="outputs/arness_trace", help="Folder containing task/run condition folders.")
-    ap.add_argument("--sample-traces-name", default="sample_traces", help="Subfolder name written under each original run folder.")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing sample_traces under each run folder.")
-    ap.add_argument("--max-cell-chars", type=int, default=0, help="Max cell chars; 0 means no truncation.")
-    ap.add_argument("--compress-masks", action="store_true", help="Render masks as □xN instead of full □□□...")
+    ap.add_argument("--runs-root", default="outputs/arness", help="Old or canonical ARness output root.")
+    ap.add_argument("--task-output-root", default=None, help="Canonical task output root. Default: --runs-root.")
+    ap.add_argument("--canonicalize", action="store_true", help="Copy/move old numbered folders into task/condition layout before exporting traces.")
+    ap.add_argument("--mode", choices=["copy", "move"], default="copy", help="Canonicalization mode.")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite sample_traces and canonical duplicate destinations.")
+    ap.add_argument("--sample-traces-name", default="sample_traces")
+    ap.add_argument("--max-cell-chars", type=int, default=0)
+    ap.add_argument("--compress-masks", action="store_true")
+    ap.add_argument("--write-task-index", action="store_true", help="Write root/task-level trace_index and trace_metrics_all files.")
     args = ap.parse_args()
 
-    root = Path(args.runs_root)
-    run_dirs = infer_run_dirs(root, args.sample_traces_name)
-    if not run_dirs:
-        raise SystemExit(f"[ERROR] no trace.jsonl found under {root}")
+    runs_root = Path(args.runs_root)
+    task_output_root = Path(args.task_output_root) if args.task_output_root else runs_root
 
-    total = 0
+    discovered = infer_run_dirs(runs_root, args.sample_traces_name)
+    if not discovered:
+        raise SystemExit(f"[ERROR] no trace.jsonl found under {runs_root}")
+
+    index_rows: List[Dict[str, Any]] = []
+    duplicate_rows: List[Dict[str, Any]] = []
+
+    if args.canonicalize:
+        run_dirs, index_rows, duplicate_rows = canonicalize_run_dirs(
+            discovered,
+            task_output_root=task_output_root,
+            mode=args.mode,
+            overwrite=args.overwrite,
+        )
+    else:
+        run_dirs = discovered
+        for rd in run_dirs:
+            meta = condition_metadata(rd)
+            row = {
+                **meta,
+                "experiment_name": experiment_name(meta),
+                "condition_key": condition_key(meta),
+                "raw_run_dir": str(rd),
+                "canonical_run_dir": str(rd),
+                "already_canonical": is_condition_dir(rd),
+            }
+            index_rows.append(row)
+
+    all_metric_rows: List[Dict[str, Any]] = []
     for rd in run_dirs:
         rows = export_run_dir(
             rd,
@@ -547,10 +795,14 @@ def main() -> None:
             max_cell_chars=args.max_cell_chars,
             compress_masks=args.compress_masks,
         )
-        total += len(rows)
-        print(f"[OK] {rd}: wrote {len(rows)} sample trace folder(s) under {rd / args.sample_traces_name}")
+        all_metric_rows.extend(rows)
+        print(f"[OK] exported {len(rows)} sample trace(s): {rd / args.sample_traces_name}")
 
-    print(f"[DONE] total sample traces: {total}")
+    if args.write_task_index or args.canonicalize:
+        write_task_indexes(task_output_root, all_metric_rows, index_rows, duplicate_rows)
+        print(f"[OK] wrote task indexes under {task_output_root}")
+
+    print(f"[DONE] total sample traces: {len(all_metric_rows)}")
 
 
 if __name__ == "__main__":
