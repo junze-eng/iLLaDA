@@ -349,8 +349,7 @@ def render_opencompass_config(
         prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params)
         depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
         imports.append("for _dataset in datasets:")
-        if prepared_path.exists():
-            imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
+        imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
         if context_length is not None:
             imports.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
         if tokens_to_generate is not None:
