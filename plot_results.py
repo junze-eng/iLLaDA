@@ -92,26 +92,24 @@ def plot_parallel_capability(df, output_dir):
         print("[-] No parallel task data found. Skipping parallel capability plot.")
         return
 
-    # Check required columns
-    x_col = 'param_gen_blocksize'
+    # `param_gen_blocksize` doesn't vary within a benchmark in the task1_* configs (it's fixed
+    # per benchmark); `param_arness` (1/4/8) is the actual parallelism knob that varies across
+    # ar_like/mild_parallel/strong_parallel, so that's the meaningful x-axis. Fall back to
+    # blocksize for older configs that don't set `arness` as a param.
+    x_col = 'param_arness' if 'param_arness' in target_df.columns and target_df['param_arness'].notna().any() else 'param_gen_blocksize'
     y_col = 'primary_metric_value'
-    
+
     if x_col not in target_df.columns or y_col not in target_df.columns:
         print(f"[-] Missing columns for parallel plot ({x_col} or {y_col}). Skipping.")
         return
 
     sns.set_theme(style="whitegrid")
-    
-    # 1. Blocksize vs Accuracy Plot
+    x_label = "ARness (Steps per Token, Higher = More Parallel)" if x_col == 'param_arness' else "Block Size (Parallel Token Commitment)"
+
+    # 1. ARness vs Accuracy Plot
     plt.figure(figsize=(10, 6))
-    
-    # We group by benchmark and gen_steps if multiple exist
     hue_col = 'benchmark'
-    if 'param_gen_steps' in target_df.columns and target_df['param_gen_steps'].nunique() > 1:
-        # Create a combined category for hue
-        target_df['Config'] = target_df['benchmark'] + ' (Steps: ' + target_df['param_gen_steps'].astype(str) + ')'
-        hue_col = 'Config'
-        
+
     sns.lineplot(
         data=target_df,
         x=x_col,
@@ -121,21 +119,21 @@ def plot_parallel_capability(df, output_dir):
         linewidth=2,
         markersize=8
     )
-    
-    plt.title("Parallel Capability: Effect of Block Size on Performance", fontsize=14, fontweight='bold')
-    plt.xlabel("Block Size (Parallel Token Commitment)", fontsize=12)
+
+    plt.title("Parallel Capability: Effect of Parallelism on Performance", fontsize=14, fontweight='bold')
+    plt.xlabel(x_label, fontsize=12)
     plt.ylabel("Accuracy / Score", fontsize=12)
     plt.xscale('log', base=2)
     plt.xticks(sorted(target_df[x_col].dropna().unique()), labels=[str(int(x)) for x in sorted(target_df[x_col].dropna().unique())])
-    plt.legend(title="Benchmark / Config", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.legend(title="Benchmark", bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    
+
     save_path = output_dir / "parallel_performance.png"
     plt.savefig(save_path, dpi=300)
     plt.close()
     print(f"[+] Saved parallel performance chart to {save_path}")
 
-    # 2. Blocksize vs Generation Speed
+    # 2. ARness vs Generation Speed
     speed_col = 'tokens_per_second_mean'
     if speed_col in target_df.columns and not target_df[speed_col].isna().all():
         plt.figure(figsize=(10, 6))
@@ -149,14 +147,14 @@ def plot_parallel_capability(df, output_dir):
             markersize=8,
             palette="viridis"
         )
-        plt.title("Generation Speed: Effect of Block Size on Throughput", fontsize=14, fontweight='bold')
-        plt.xlabel("Block Size (Parallel Token Commitment)", fontsize=12)
+        plt.title("Generation Speed: Effect of Parallelism on Throughput", fontsize=14, fontweight='bold')
+        plt.xlabel(x_label, fontsize=12)
         plt.ylabel("Tokens Per Second", fontsize=12)
         plt.xscale('log', base=2)
         plt.xticks(sorted(target_df[x_col].dropna().unique()), labels=[str(int(x)) for x in sorted(target_df[x_col].dropna().unique())])
-        plt.legend(title="Benchmark / Config", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.legend(title="Benchmark", bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
-        
+
         save_path_speed = output_dir / "parallel_speed.png"
         plt.savefig(save_path_speed, dpi=300)
         plt.close()
