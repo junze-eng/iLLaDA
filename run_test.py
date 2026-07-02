@@ -29,6 +29,10 @@ BENCHMARKS = {
         "module": "opencompass.configs.datasets.ruler.ruler_niah_single_1",
         "var": "ruler_niah_single_1_datasets",
     },
+    "custom_math": {
+        "module": "opencompass.configs.datasets.custom_math.custom_math_gen",
+        "var": "custom_math_datasets",
+    },
 }
 
 CUSTOM_BENCHMARKS = set()
@@ -349,6 +353,10 @@ def render_opencompass_config(
         imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
     if "summary_var" in bench:
         imports.append(f"summarizer = dict(summary_groups={bench['summary_var']})")
+    if benchmark == "custom_math":
+        custom_math_path = ROOT / "data" / "custom_math"
+        imports.append("for _dataset in datasets:")
+        imports.append(f"    _dataset['path'] = {python_literal(str(custom_math_path))}")
     if benchmark == "ruler_niah_single_1":
         experiment_params = experiment_params or {}
         context_length = experiment_params.get("context_length")

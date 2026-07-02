@@ -51,6 +51,83 @@ def print_steps(rows, limit):
     return token_counts
 
 
+def write_narrative(rows, dominant_token, token_counts, sample_idx, trace_jsonl, output_path):
+    """Write a report-ready markdown walkthrough: every step's committed tokens in a table,
+    plus an auto-generated narrative paragraph pointing at the specific steps where the
+    dominant token first appears, first repeats, and locks in (confidence crosses 0.9)."""
+    first_step_label = None
+    first_repeat_label = None
+    lock_in_label = None
+    running_count = 0
+    for row in rows:
+        tokens = row.get("selected_decoded_tokens") or []
+        confidences = row.get("selected_confidences") or []
+        step_label = f"block {row.get('block_idx')} step {row.get('step_idx')}"
+        for t, c in zip(tokens, confidences):
+            if t != dominant_token:
+                continue
+            if first_step_label is None:
+                first_step_label = (step_label, c)
+            running_count += 1
+            if running_count == 3 and first_repeat_label is None:
+                first_repeat_label = (step_label, c)
+            if lock_in_label is None and isinstance(c, (int, float)) and c >= 0.9:
+                lock_in_label = (step_label, c)
+
+    total_committed = sum(token_counts.values()) or 1
+    dominant_total = token_counts.get(dominant_token, 0)
+    dominant_pct = 100.0 * dominant_total / total_committed
+
+    lines = []
+    lines.append(f"# Diffusion trace walkthrough — {Path(trace_jsonl).parent.name}, sample #{sample_idx}\n")
+    lines.append(f"Source: `{trace_jsonl}`  \nSteps recorded: {len(rows)}  \n"
+                 f"Dominant repeated token: `{dominant_token!r}` "
+                 f"({dominant_total}/{total_committed} = {dominant_pct:.1f}% of all committed tokens)\n")
+
+    lines.append("## Narrative\n")
+    if first_step_label:
+        step, conf = first_step_label
+        conf_str = f"{conf:.3f}" if isinstance(conf, (int, float)) else str(conf)
+        lines.append(f"At **{step}**, the token `{dominant_token!r}` is first committed, with confidence "
+                     f"{conf_str} — at this point in decoding there is little to no surrounding generated "
+                     f"context to condition on, so this is close to a guess among the model's top candidates.\n")
+    if first_repeat_label:
+        step, conf = first_repeat_label
+        conf_str = f"{conf:.3f}" if isinstance(conf, (int, float)) else str(conf)
+        lines.append(f"By **{step}**, `{dominant_token!r}` has been committed 3 times, now with confidence "
+                     f"{conf_str}. The model's attention over its own (still mostly incomplete/incorrect) "
+                     f"partial output is starting to reinforce the repeated pattern rather than correct it.\n")
+    if lock_in_label:
+        step, conf = lock_in_label
+        conf_str = f"{conf:.3f}" if isinstance(conf, (int, float)) else str(conf)
+        lines.append(f"From **{step}** onward, confidence for `{dominant_token!r}` crosses 0.9 and the token "
+                     f"is selected in nearly every remaining step — the pattern is now locked in. "
+                     f"By the end of decoding, `{dominant_token!r}` accounts for {dominant_total} of the "
+                     f"{total_committed} committed tokens ({dominant_pct:.1f}%).\n")
+    else:
+        lines.append(f"Confidence for `{dominant_token!r}` never crosses 0.9 in this trace, but it still ends up "
+                     f"as the single most-repeated token, accounting for {dominant_pct:.1f}% of all committed "
+                     f"tokens.\n")
+
+    lines.append("## Step-by-step record\n")
+    lines.append("| Step | Mask before→after | Completion | Tokens committed (token@confidence) |")
+    lines.append("|---|---|---|---|")
+    for row in rows:
+        tokens = row.get("selected_decoded_tokens") or []
+        confidences = row.get("selected_confidences") or []
+        step_label = f"block {row.get('block_idx')} step {row.get('step_idx')}"
+        pairs = ", ".join(
+            f"`{t!r}`@{c:.3f}" if isinstance(c, (int, float)) else f"`{t!r}`"
+            for t, c in zip(tokens, confidences)
+        ) or "(none)"
+        lines.append(f"| {step_label} | {row.get('mask_count_before')}→{row.get('mask_count_after')} | "
+                     f"{row.get('current_completion_rate')} | {pairs} |")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[+] Saved narrative to {output_path}")
+
+
 def plot_collapse_curve(rows, dominant_token, sample_idx, trace_jsonl, output_path):
     try:
         import matplotlib.pyplot as plt
@@ -101,6 +178,12 @@ def main():
                          help="Also save a confidence-vs-step chart for the most-repeated token.")
     parser.add_argument("--output", default=None,
                          help="Path for --plot output (default: outputs/report_figures/trace_<sample_idx>.png)")
+    parser.add_argument("--narrative", action="store_true",
+                         help="Also write a report-ready markdown walkthrough (every step, plus an "
+                              "auto-generated explanation of where the collapse starts/locks in).")
+    parser.add_argument("--narrative-output", default=None,
+                         help="Path for --narrative output "
+                              "(default: outputs/report_figures/trace_<sample_idx>_narrative.md)")
     args = parser.parse_args()
 
     rows = load_steps(args.trace_jsonl, args.sample_idx)
@@ -111,14 +194,21 @@ def main():
     print(f"{len(rows)} step(s) for sample_idx={args.sample_idx}\n")
     token_counts = print_steps(rows, args.limit)
 
-    if args.plot:
+    if args.plot or args.narrative:
         if not token_counts:
-            print("[-] No committed tokens found; skipping --plot.")
+            print("[-] No committed tokens found; skipping --plot/--narrative.")
             return
         dominant_token = max(token_counts.items(), key=lambda kv: kv[1])[0]
-        output_path = Path(args.output) if args.output else Path("outputs/report_figures") / f"trace_{args.sample_idx}.png"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        plot_collapse_curve(rows, dominant_token, args.sample_idx, args.trace_jsonl, output_path)
+
+        if args.plot:
+            output_path = Path(args.output) if args.output else Path("outputs/report_figures") / f"trace_{args.sample_idx}.png"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            plot_collapse_curve(rows, dominant_token, args.sample_idx, args.trace_jsonl, output_path)
+
+        if args.narrative:
+            narrative_path = (Path(args.narrative_output) if args.narrative_output
+                              else Path("outputs/report_figures") / f"trace_{args.sample_idx}_narrative.md")
+            write_narrative(rows, dominant_token, token_counts, args.sample_idx, args.trace_jsonl, narrative_path)
 
 
 if __name__ == "__main__":

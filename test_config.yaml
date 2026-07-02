@@ -184,6 +184,42 @@ tasks:
           gen_steps: [512, 256, 128, 64, 32, 16]
           token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
 
+  custom_benchmark:
+    description: "Task 5: same parallel-decoding sweep as Task 1, but on custom_math -- a fully self-authored word-problem set (data/custom_math), not covered by the LLaDA/iLLaDA paper's own eval benchmarks. Confirms whether the strong_parallel collapse (see Task 1/Task 3 sample7 case study) reproduces outside GSM8K/MBPP."
+    experiments:
+      - name: task5_custom_math_ar_like
+        benchmark: custom_math
+        params:
+          decoding_config_name: ar_like
+          arness: 1
+          sample_limit: null
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          min_transfer_tokens: 1
+
+      - name: task5_custom_math_mild_parallel
+        benchmark: custom_math
+        params:
+          decoding_config_name: mild_parallel
+          arness: 4
+          sample_limit: null
+          gen_length: 256
+          gen_steps: 64
+          gen_blocksize: 256
+          min_transfer_tokens: 4
+
+      - name: task5_custom_math_strong_parallel
+        benchmark: custom_math
+        params:
+          decoding_config_name: strong_parallel
+          arness: 8
+          sample_limit: null
+          gen_length: 256
+          gen_steps: 32
+          gen_blocksize: 256
+          min_transfer_tokens: 8
+
   temp_threshold_study:
     description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
     experiments:
