@@ -67,18 +67,51 @@ verifiable from the current file.
 **1 experiment × 18 combos (3×2×3) × 10 samples = 180 generations total.** Status: was running as
 of last update (~2hr estimate); check `outputs/arness_trace/summary_all.csv` for completion.
 
-## Task 5 -- `custom_benchmark`: same Task 1 sweep, on the self-authored `custom_math` benchmark
+## Task 5 -- `custom_benchmark`: parallel-decoding mechanism study on custom_math
 
-| experiment | benchmark | arness label | gen_length | gen_steps | block_length | sample_limit |
+| experiment | benchmark | gen_length | gen_steps | block_length | threshold | sample_limit |
 |---|---|---|---|---|---|---|
-| task5_custom_math_ar_like | custom_math | 1 | 256 | 256 | 256 | null (all 20) |
-| task5_custom_math_mild_parallel | custom_math | 4 | 256 | 64 | 256 | null (all 20) |
-| task5_custom_math_strong_parallel | custom_math | 8 | 256 | 32 | 256 | null (all 20) |
+| task5_custom_math_ar_like | custom_math | 256 | 256 | 256 | null | null (all 20) |
+| task5_custom_math_mild_parallel | custom_math | 256 | 64 | 256 | null | null (all 20) |
+| task5_custom_math_strong_parallel | custom_math | 256 | 32 | 256 | null | null (all 20) |
+| task5_custom_math_block_grid | custom_math | 256 | 256/64/32 (3) | 32/8 (2) | null | null (all 20) |
+| task5_custom_math_overprovisioned_steps | custom_math | 256 | 512 | 256 | null/0.8/0.9 (3) | 10 |
 
-**3 experiments × 20 samples = 60 generations total.** Added to work around the "no paper-internal
-benchmark" restriction (Task 1 uses GSM8K/MBPP, which the LLaDA/iLLaDA paper's own eval tables
-cover -- `custom_math` is fully original content). ~40% the compute of Task 1's GSM8K half (60 vs
-150 generations at the same gen_length), so noticeably cheaper. Status: not yet run.
+**Generations: 60 (ar_like/mild/strong) + 120 (block_grid, 6 combos x 20) +
+30 (overprovisioned_steps, 3 combos x 10) = 210 total.**
+
+Two purposes in one task group:
+1. `_ar_like/mild/strong` + `_block_grid`: does semi-AR block splitting (block_length << gen_length)
+   mitigate the strong_parallel collapse (Task 1/Task 3 sample7)? The `block_length=256` row is
+   already covered by `_ar_like/mild/strong`, so `_block_grid` only adds the `block_length=32/8`
+   rows -- full 3x3 (block_length x steps) without duplicating existing runs.
+2. `_overprovisioned_steps`: tests `gen_steps=512` (2x `gen_length=256`) crossed with threshold.
+   When `steps > block_length`, `generate.py`'s `get_num_transfer_tokens` schedules exactly 1
+   token/step per remaining masked position, which makes the `min_transfer_tokens` threshold-fallback
+   fire unconditionally -- so this isolates whether Task 3/4's completion_rate drop under
+   threshold=0.8/0.9 is a genuine filtering effect or just steps-budget exhaustion. temperature
+   fixed at 0.0 (temperature's effect is already covered by Task 4's sweep).
+
+`custom_math` is fully original content, so Task 5's results are safe to use as headline evaluation
+evidence under the "no paper-internal benchmark" restriction. Status: not yet run.
+
+## Task 6 -- `gsm8k_mechanism`: gsm8k mirror of Task 5, for parallel GPU execution
+
+| experiment | benchmark | gen_length | gen_steps | block_length | threshold | sample_limit |
+|---|---|---|---|---|---|---|
+| task6_gsm8k_block_grid | gsm8k | 256 | 256/64/32 (3) | 32/8 (2) | null | 30 |
+| task6_gsm8k_overprovisioned_steps | gsm8k | 256 | 512 | 256 | null/0.8/0.9 (3) | 10 |
+
+**Generations: 180 (block_grid, 6 combos x 30) + 30 (overprovisioned_steps, 3 combos x 10) = 210
+total.** Same two purposes as Task 5's `_block_grid` / `_overprovisioned_steps`, run as a separate
+task group specifically so it can go on a second GPU in parallel with Task 5 (`python run_test.py
+--only custom_benchmark` on one card, `python run_test.py --only gsm8k_mechanism` on the other).
+The `block_length=256` row is already covered by Task 1's `task1_gsm8k_ar_like/mild/strong_parallel`.
+
+`gsm8k` here is a paper benchmark (see comparison table below) -- used purely for cross-dataset
+mechanism confirmation (does the block-splitting / overprovisioned-steps effect generalize beyond
+custom_math?), not as headline evaluation evidence, to stay inside the "no paper-internal benchmark"
+restriction on the report's core results section. Status: not yet run.
 
 ## Scale comparison (total generations, roughly proportional to GPU cost at fixed gen_length)
 
@@ -88,7 +121,8 @@ cover -- `custom_math` is fully original content). ~40% the compute of Task 1's 
 | Task 2 (context) | 240 | Prep only, no GPU runs yet |
 | Task 3 (arness, current) | 55 | Not yet run |
 | Task 4 (temp/threshold) | 180 | Was running |
-| Task 5 (custom_math) | 60 | Not yet run |
+| Task 5 (custom_math) | 210 | Not yet run |
+| Task 6 (gsm8k mechanism) | 210 | Not yet run |
 
 ## Comparison against the paper's own settings
 
@@ -108,6 +142,7 @@ states directly -- flagged below wherever it applies.
 | Task3 arness_trace_gsm8k_sample7 | 256 | sweep [256,128,64,32,16] | 64 | LLaDA-Instruct GSM8K block-diffusion optimized setting | 256 | ≈ 8 (inferred, not stated) | **8** |
 | Task4 task4_gsm8k_temp_threshold_steps | 256 | sweep [256,64,32] | 256 | LLaDA-1.5 GSM8K | 256 | not disclosed | **16** |
 | Task5 task5_custom_math_* | 256 | 256/64/32 | 256 | no paper equivalent (original benchmark) -- GSM8K used only as a scale reference | 256 | — | — |
+| Task6 task6_gsm8k_block_grid | 256 | 256/64/32 | 32/8 | none -- paper never tests block_length < 32 at this gen_length | — | — | — |
 
 Key gap: every paper setting *tuned* for GSM8K uses `block_length << gen_length` (real semi-AR
 splitting: 8 or 16 vs. 256). Our Task 1/4/5 all hold `block_length == gen_length` (never split into
