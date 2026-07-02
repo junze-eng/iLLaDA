@@ -183,3 +183,19 @@ tasks:
         sweep:
           gen_steps: [512, 256, 128, 64, 32, 16]
           token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
+
+  temp_threshold_study:
+    description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
+    experiments:
+      - name: task4_gsm8k_temp_threshold_steps
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [64, 32]
+          temperature: [0.0, 0.3, 0.7]
+          token_selection_confidence_threshold: [null, 0.7, 0.8, 0.9]
