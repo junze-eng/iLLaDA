@@ -123,7 +123,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              confidence_eos_eot_inf=False, token_selection_confidence_threshold=None,
              min_transfer_tokens=1, return_trace=False, trace_token_snapshots=False,
              tokenizer=None, stop_token_ids=None, speed_schedule_name: Optional[str] = None,
-             steps_per_block_schedule: Optional[List[int]] = None):
+             steps_per_block_schedule: Optional[List[int]] = None,
+             token_selection_confidence_threshold_schedule: Optional[List[Optional[float]]] = None):
     '''
     Args:
         model: Mask predictor.
@@ -146,6 +147,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         trace_token_snapshots: If True, include generated-region token IDs after every diffusion step.
         speed_schedule_name: Optional named per-block speed schedule.
         steps_per_block_schedule: Optional explicit denoising-step count for each block.
+        token_selection_confidence_threshold_schedule: Optional per-block confidence threshold schedule.
     '''
     stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
 
@@ -175,6 +177,25 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         )
     num_blocks = gen_length // block_length
     uniform_steps_per_block = block_steps_schedule[0] if len(set(block_steps_schedule)) == 1 else None
+    threshold_schedule = None
+    if token_selection_confidence_threshold_schedule is not None:
+        if len(token_selection_confidence_threshold_schedule) != num_blocks:
+            raise ValueError(
+                "token_selection_confidence_threshold_schedule must have "
+                f"{num_blocks} entries, got {len(token_selection_confidence_threshold_schedule)}."
+            )
+        threshold_schedule = [
+            None if threshold is None else float(threshold)
+            for threshold in token_selection_confidence_threshold_schedule
+        ]
+    schedule_overrides_scalar_threshold = (
+        threshold_schedule is not None and token_selection_confidence_threshold is not None
+    )
+    if schedule_overrides_scalar_threshold:
+        print(
+            "token_selection_confidence_threshold_schedule overrides "
+            f"token_selection_confidence_threshold={token_selection_confidence_threshold}"
+        )
 
     trace = {
         'prompt_tokens': int(prompt.shape[1]),
@@ -191,6 +212,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'mask_id': int(mask_id),
         'stop_token_ids': stop_token_ids,
         'token_selection_confidence_threshold': token_selection_confidence_threshold,
+        'token_selection_confidence_threshold_schedule': threshold_schedule,
+        'schedule_overrides_scalar_threshold': bool(schedule_overrides_scalar_threshold),
+        'block_thresholds': threshold_schedule if threshold_schedule is not None else [token_selection_confidence_threshold] * num_blocks,
         'min_transfer_tokens': int(min_transfer_tokens),
         'scheduled_transfer_count': 0,
         'threshold_passed_count': 0,
@@ -203,6 +227,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
     global_step_offset = 0
     for num_block in range(num_blocks):
         block_steps = block_steps_schedule[num_block]
+        block_threshold = threshold_schedule[num_block] if threshold_schedule is not None else token_selection_confidence_threshold
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, block_steps)
         for i in range(block_steps):
@@ -264,8 +289,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 passed_count = scheduled_count
                 forced_count = 0
                 transfer_reason = 'scheduled'
-                if token_selection_confidence_threshold is not None:
-                    keep = select_confidence >= token_selection_confidence_threshold
+                if block_threshold is not None:
+                    keep = select_confidence >= block_threshold
                     passed_count = int(keep.sum().item())
                     if keep.sum().item() == 0 and min_transfer_tokens > 0:
                         keep[:min(min_transfer_tokens, scheduled_count)] = True
@@ -302,6 +327,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                         'block_idx': int(num_block),
                         'block_steps': int(block_steps),
                         'block_planned_parallelism': float(block_length / block_steps) if block_steps else None,
+                        'block_threshold': block_threshold,
                         'step_idx': int(step_idx),
                         'global_step_idx': int(step_idx),
                         'step_idx_in_block': int(i),
@@ -338,6 +364,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                         'block_idx': int(num_block),
                         'block_steps': int(block_steps),
                         'block_planned_parallelism': float(block_length / block_steps) if block_steps else None,
+                        'block_threshold': block_threshold,
                         'step_idx': int(step_idx),
                         'global_step_idx': int(step_idx),
                         'step_idx_in_block': int(i),
@@ -355,11 +382,18 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 for step_record in step_records:
                     item_idx = int(step_record.get('batch_item_idx', 0))
                     item_region = generated_region[item_idx:item_idx + 1]
+                    block_start = num_block * block_length
+                    block_end = (num_block + 1) * block_length
+                    item_block = item_region[:, block_start:block_end]
+                    block_masks_after = int((item_block == mask_id).sum().item())
+                    block_visible_tokens = int(item_block.numel() - block_masks_after)
                     item_mask_after = int((item_region == mask_id).sum().item())
                     item_total = int(item_region.numel())
                     step_record['mask_count_before'] = mask_count_before
                     step_record['mask_count_after'] = item_mask_after
                     step_record['remaining_masks'] = item_mask_after
+                    step_record['block_visible_tokens'] = block_visible_tokens
+                    step_record['block_completion_rate'] = block_visible_tokens / max(int(item_block.numel()), 1)
                     step_record['cumulative_transferred_tokens'] = int(trace['actual_transfer_count'])
                     step_record['current_completion_rate'] = (item_total - item_mask_after) / max(item_total, 1)
                     step_record['mean_confidence'] = (
@@ -380,6 +414,22 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         generated_region = x[:, prompt.shape[1]:]
         final_mask_count = int((generated_region == mask_id).sum().item())
         total_gen_tokens = int(generated_region.numel())
+        visible_tokens_by_block = []
+        completion_rate_by_block = []
+        for batch_idx in range(generated_region.shape[0]):
+            sample_visible = []
+            sample_completion = []
+            for block_idx in range(num_blocks):
+                block_start = block_idx * block_length
+                block_end = (block_idx + 1) * block_length
+                block_region = generated_region[batch_idx, block_start:block_end]
+                visible = int((block_region != mask_id).sum().item())
+                sample_visible.append(visible)
+                sample_completion.append(visible / max(int(block_region.numel()), 1))
+            visible_tokens_by_block.append(sample_visible)
+            completion_rate_by_block.append(sample_completion)
+        trace['visible_tokens_by_block'] = visible_tokens_by_block
+        trace['completion_rate_by_block'] = completion_rate_by_block
         trace['final_mask_count'] = final_mask_count
         trace['completion_rate'] = (total_gen_tokens - final_mask_count) / max(total_gen_tokens, 1)
         trace['actual_parallelism'] = trace['actual_transfer_count'] / max(trace['forward_passes'], 1)
