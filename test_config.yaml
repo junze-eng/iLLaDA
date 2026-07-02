@@ -136,6 +136,7 @@ tasks:
     experiments:
       - name: task2_ruler_niah_1_2_4_8k
         benchmark: ruler_niah_single_1
+        output_path: outputs/context_all
         params:
           decoding_config_name: ar_like
           arness: 1
@@ -150,7 +151,7 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
-          context_length: [1024, 2048, 4096, 8192]
+          context_length: [2048, 4096, 8192]
           needle_position: [front, middle, back]
 
   arness:
