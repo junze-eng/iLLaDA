@@ -326,7 +326,16 @@ def render_opencompass_config(
     imports.append(f"datasets = {bench['var']}")
     if sample_indices is not None:
         indices = [int(item) for item in as_list(sample_indices)]
-        test_range = "indices:" + ",".join(str(item) for item in indices)
+        if not indices:
+            raise SystemExit("sample_indices cannot be empty.")
+        sorted_indices = sorted(indices)
+        expected = list(range(sorted_indices[0], sorted_indices[-1] + 1))
+        if sorted_indices != expected:
+            raise SystemExit(
+                "OpenCompass partitioners require contiguous sample_indices. "
+                f"Got: {indices}"
+            )
+        test_range = f"[{sorted_indices[0]}:{sorted_indices[-1] + 1}]"
         imports.append(f"_sample_test_range = {python_literal(test_range)}")
         imports.append("for _dataset in datasets:")
         imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
