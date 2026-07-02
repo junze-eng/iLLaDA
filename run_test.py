@@ -276,6 +276,13 @@ def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
     )
 
 
+def schedule_label(value: Any) -> str:
+    items = as_list(value)
+    if not items:
+        return ""
+    return "schedule" + "_".join(str(item) for item in items)
+
+
 def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], idx: int) -> str:
     """Name a run by the actual config values, with idx only as a fallback."""
     parts = [exp_name, benchmark]
@@ -297,6 +304,8 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
             parts.append(f"{label}{params.get(key)}")
     if params.get("speed_schedule_name") is not None:
         parts.append(f"speed{params.get('speed_schedule_name')}")
+    if params.get("steps_per_block_schedule") is not None:
+        parts.append(schedule_label(params.get("steps_per_block_schedule")))
     if "token_selection_confidence_threshold" in params:
         threshold = params.get("token_selection_confidence_threshold")
         threshold_label = "none" if threshold is None else str(threshold).replace(".", "p")
@@ -767,6 +776,7 @@ def write_run_summary(
     completion_rates = numeric_values(samples, "completion_rate")
     actual_parallelism = numeric_values(samples, "actual_parallelism")
     actual_arness = numeric_values(samples, "actual_arness")
+    planned_steps = numeric_values(samples, "planned_steps")
     planned_parallelism = numeric_values(samples, "planned_parallelism")
     threshold_pass_rates = numeric_values(samples, "threshold_pass_rate")
     fallback_rates = numeric_values(samples, "fallback_rate")
@@ -806,7 +816,10 @@ def write_run_summary(
         "completion_rate": mean(completion_rates),
         "actual_parallelism": mean(actual_parallelism),
         "actual_arness_mean": mean(actual_arness),
+        "planned_steps": mean(planned_steps),
         "planned_parallelism_mean": mean(planned_parallelism),
+        "steps_per_block_schedule": samples[0].get("steps_per_block_schedule") if samples else None,
+        "speed_schedule_name": samples[0].get("speed_schedule_name") if samples else params.get("speed_schedule_name"),
         "threshold_pass_rate_mean": mean(threshold_pass_rates),
         "fallback_rate_mean": mean(fallback_rates),
         "effective_parallelism_mean": mean(effective_parallelism),
@@ -838,8 +851,13 @@ def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "gen_length": row.get("param_gen_length"),
         "gen_steps": row.get("param_gen_steps"),
         "gen_blocksize": row.get("param_gen_blocksize"),
-        "speed_schedule_name": row.get("param_speed_schedule_name"),
+        "speed_schedule_name": row.get("speed_schedule_name") or row.get("param_speed_schedule_name"),
+        "steps_per_block_schedule": row.get("steps_per_block_schedule") or row.get("param_steps_per_block_schedule"),
+        "planned_steps": row.get("planned_steps"),
         "planned_parallelism": row.get("planned_parallelism_mean"),
+        "effective_parallelism": row.get("effective_parallelism_mean"),
+        "arness_mean": row.get("arness_mean"),
+        "actual_arness_mean": row.get("actual_arness_mean"),
         "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
         "min_transfer_tokens": row.get("param_min_transfer_tokens"),
         "context_length": row.get("param_context_length"),
