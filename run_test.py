@@ -37,7 +37,7 @@ BENCHMARKS = {
 
 CUSTOM_BENCHMARKS = set()
 DATASET_PARAM_KEYS = {"context_length", "needle_position", "num_samples", "depth_percents"}
-EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "seed"} | DATASET_PARAM_KEYS
+EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "seed", "speed_schedule_label"} | DATASET_PARAM_KEYS
 
 MODEL_TYPES = {
     "instruct": "LLaDAModel",
@@ -304,7 +304,9 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
             parts.append(f"{label}{params.get(key)}")
     if params.get("speed_schedule_name") is not None:
         parts.append(f"speed{params.get('speed_schedule_name')}")
-    if params.get("steps_per_block_schedule") is not None:
+    if params.get("speed_schedule_label") is not None:
+        parts.append(f"speed{params.get('speed_schedule_label')}")
+    if params.get("steps_per_block_schedule") is not None and params.get("speed_schedule_label") is None:
         parts.append(schedule_label(params.get("steps_per_block_schedule")))
     if "token_selection_confidence_threshold" in params:
         threshold = params.get("token_selection_confidence_threshold")
@@ -851,6 +853,7 @@ def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "gen_length": row.get("param_gen_length"),
         "gen_steps": row.get("param_gen_steps"),
         "gen_blocksize": row.get("param_gen_blocksize"),
+        "speed_schedule_label": row.get("param_speed_schedule_label"),
         "speed_schedule_name": row.get("speed_schedule_name") or row.get("param_speed_schedule_name"),
         "steps_per_block_schedule": row.get("steps_per_block_schedule") or row.get("param_steps_per_block_schedule"),
         "planned_steps": row.get("planned_steps"),

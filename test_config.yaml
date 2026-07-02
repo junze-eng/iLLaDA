@@ -341,13 +341,21 @@ tasks:
   dynamic_speed_gsm8k:
     description: "Exploratory GSM8K dynamic decoding speed schedule with paper-style block size."
     output_path: outputs/dynamic_speed_gsm8k
+    # steps_per_block_schedule stores per-block denoising steps directly:
+    # all_1tps: [32, 32, 32, 32, 32, 32, 32, 32]
+    # all_2tps: [16, 16, 16, 16, 16, 16, 16, 16]
+    # all_4tps: [8, 8, 8, 8, 8, 8, 8, 8]
+    # slow_to_fast_1_2_4: [32, 32, 16, 16, 16, 8, 8, 8]
+    # fast_to_slow_4_2_1: [8, 8, 8, 16, 16, 16, 32, 32]
     experiments:
-      - name: dynspeed_gsm8k_sample7_block32
+      - name: dynspeed_gsm8k_sample7_block32_all_1tps
         benchmark: gsm8k
         params:
+          speed_schedule_label: all_1tps
           sample_indices: [7]
           gen_length: 256
           gen_blocksize: 32
+          steps_per_block_schedule: [32, 32, 32, 32, 32, 32, 32, 32]
           min_transfer_tokens: 1
           token_selection_confidence_threshold: null
           temperature: 0.0
@@ -355,11 +363,67 @@ tasks:
           return_trace: true
           trace_token_snapshots: false
           trace_decode_snapshots: false
-        sweep:
-          speed_schedule_name:
-            - all_1tps
-            - all_2tps
-            - all_4tps
-            - slow_to_fast_1_2_4
-            - fast_to_slow_4_2_1
-            - slow_fast_slow_1_4_1
+
+      - name: dynspeed_gsm8k_sample7_block32_all_2tps
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: all_2tps
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [16, 16, 16, 16, 16, 16, 16, 16]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynspeed_gsm8k_sample7_block32_all_4tps
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: all_4tps
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [8, 8, 8, 8, 8, 8, 8, 8]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynspeed_gsm8k_sample7_block32_slow_to_fast_1_2_4
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: slow_to_fast_1_2_4
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [32, 32, 16, 16, 16, 8, 8, 8]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynspeed_gsm8k_sample7_block32_fast_to_slow_4_2_1
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: fast_to_slow_4_2_1
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [8, 8, 8, 16, 16, 16, 32, 32]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
