@@ -136,7 +136,7 @@ tasks:
     experiments:
       - name: task2_ruler_niah_1_2_4_8k
         benchmark: ruler_niah_single_1
-        output_path: outputs/context_all
+        output_path: outputs/context
         params:
           decoding_config_name: ar_like
           arness: 1
@@ -144,7 +144,7 @@ tasks:
           num_samples: 20
           gen_length: 128
           gen_steps: 128
-          gen_blocksize: 128
+          gen_blocksize: 32
           max_seq_len: 8192
           min_transfer_tokens: 1
           return_trace: true
