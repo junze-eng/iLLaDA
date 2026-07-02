@@ -188,7 +188,7 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
-          gen_steps: [512, 256, 128, 64, 32]
+          gen_steps: [512, 256, 128]
           token_selection_confidence_threshold: [null, 0.6, 0.8]
 
   temp_threshold_study:
