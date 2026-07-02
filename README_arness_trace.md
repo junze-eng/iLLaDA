@@ -22,10 +22,15 @@ generation order and include `active_block_idx` plus `block_local_round`.
 Columns `block_00`, `block_01`, ... show each block's current visible state.
 Unrevealed spans are compressed as `□xN`.
 
-Run the 24-condition trace sweep:
+Run the detailed two-sample trace sweep from the unified config. It currently
+plans 55 conditions:
+
+- GSM8K sample 7: `gen_steps=[256,128,64,32,16]`
+- MBPP sample 6: `gen_steps=[512,256,128,64,32,16]`
+- both: `token_selection_confidence_threshold=[null,0.6,0.7,0.8,0.9]`
 
 ```bash
-python run_test.py --config test_config_arness_trace.yaml
+python run_test.py --config test_config.yaml
 ```
 
 Create a compact plotting table after the run:

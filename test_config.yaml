@@ -1,9 +1,9 @@
 run:
-  tasks: [parallel, context, arness]
+  tasks: [arness]
   experiments: []
 
 execution:
-  output_dir: outputs/task2_context_full
+  output_dir: outputs/arness_trace
   dry_run: false
   stop_on_error: true
   collect_metrics: true
@@ -20,7 +20,7 @@ model:
   type: instruct
   path: GSAI-ML/iLLaDA-8B-Instruct
   abbr: illada-8b-instruct
-  max_out_len: 128
+  max_out_len: 512
   max_seq_len: 8192
   batch_size: 1
   batch_size_: 1
@@ -28,6 +28,7 @@ model:
   cfg: 0.0
   temperature: 0.0
   remasking: low_confidence
+  arness_trace_output: outputs/arness_trace/sample_traces
   model_kwargs:
     device_map: auto
     torch_dtype: torch.bfloat16
@@ -38,7 +39,7 @@ runner:
   partitioner:
     num_worker: 1
     num_split: null
-    min_task_size: 16
+    min_task_size: 1
   runner:
     max_num_workers: 1
     retry: 1
@@ -153,28 +154,32 @@ tasks:
           needle_position: [front, middle, back]
 
   arness:
-    description: "Task 3: small counterfactual threshold runs on Task 1 benchmarks."
+    description: "Task 3: two-sample detailed ARness trace case study."
     experiments:
-      - name: task3_gsm8k_threshold_counterfactual
+      - name: arness_trace_gsm8k_sample7
         benchmark: gsm8k
         params:
-          sample_limit: 10
+          sample_indices: [7]
           gen_length: 256
-          gen_blocksize: 256
+          gen_blocksize: 64
+          min_transfer_tokens: 1
           return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
         sweep:
-          gen_steps: [256, 128, 64, 32]
-          token_selection_confidence_threshold: [0.8, 0.9]
-          min_transfer_tokens: [1]
+          gen_steps: [256, 128, 64, 32, 16]
+          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
 
-      - name: task3_mbpp_threshold_counterfactual
+      - name: arness_trace_mbpp_sample6
         benchmark: mbpp
         params:
-          sample_limit: 10
+          sample_indices: [6]
           gen_length: 512
-          gen_blocksize: 512
+          gen_blocksize: 128
+          min_transfer_tokens: 1
           return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
         sweep:
-          gen_steps: [512, 256, 128, 64]
-          token_selection_confidence_threshold: [0.8, 0.9]
-          min_transfer_tokens: [1]
+          gen_steps: [512, 256, 128, 64, 32, 16]
+          token_selection_confidence_threshold: [null, 0.6, 0.7, 0.8, 0.9]
