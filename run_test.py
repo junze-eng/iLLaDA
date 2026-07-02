@@ -310,7 +310,8 @@ def experiment_output_dir(base_output_dir: Path, experiment: Dict[str, Any]) -> 
     if raw is None and experiment.get("_task_output_path") is not None:
         raw = Path(str(experiment.get("_task_output_path"))) / str(experiment.get("name"))
     if raw is None:
-        return base_output_dir
+        task = safe_name(str(experiment.get("task") or "runs"))
+        return base_output_dir / task
     path = Path(raw)
     return path if path.is_absolute() else ROOT / path
 

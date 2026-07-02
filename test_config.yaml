@@ -3,7 +3,7 @@ run:
   experiments: []
 
 execution:
-  output_dir: outputs/arness_trace
+  output_dir: outputs
   dry_run: false
   stop_on_error: true
   collect_metrics: true
@@ -64,6 +64,7 @@ defaults:
 tasks:
   parallel:
     description: "Task 1: GSM8K/MBPP parallel token restoration sweep."
+    output_path: outputs/parallel
     experiments:
       - name: task1_gsm8k_ar_like
         benchmark: gsm8k
@@ -133,6 +134,7 @@ tasks:
 
   context:
     description: "Task 2: pure RULER NIAH single_1 context-length sweep."
+    output_path: outputs/context
     experiments:
       - name: task2_ruler_niah_1_2_4_8k
         benchmark: ruler_niah_single_1
@@ -191,6 +193,7 @@ tasks:
 
   temp_threshold_study:
     description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
+    output_path: outputs/temp_threshold_study
     experiments:
       - name: task4_gsm8k_temp_threshold_steps
         benchmark: gsm8k
@@ -206,6 +209,7 @@ tasks:
           token_selection_confidence_threshold: [null, 0.8, 0.9]
   baseline:
     description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
+    output_path: outputs/baseline
     experiments:
       - name: paper_baseline_gsm8k_instruct
         benchmark: gsm8k

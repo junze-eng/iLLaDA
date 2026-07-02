@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 export_trace.py v6
@@ -56,6 +56,8 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from tools.arness_trace_writer import build_block_artifacts
 
 
 # -----------------------------
@@ -467,21 +469,19 @@ def render_slots(slots: Sequence[Optional[str]], max_chars: int, compress_masks:
                 run += 1
             else:
                 if run:
-                    parts.append(f"□x{run}")
+                    parts.append(f"[MASK]x{run}")
                     run = 0
                 parts.append(str(tok))
         if run:
-            parts.append(f"□x{run}")
+            parts.append(f"[MASK]x{run}")
         s = "".join(parts)
     else:
-        s = "".join("□" if tok is None else str(tok) for tok in slots)
+        s = "".join("[MASK]" if tok is None else str(tok) for tok in slots)
 
     s = s.replace("\r", "\\r").replace("\n", "\\n")
     if max_chars > 0 and len(s) > max_chars:
         return s[:max_chars] + "...<truncated>"
     return s
-
-
 def selected_to_local(pos: int, block_idx: int, block_length: int) -> Optional[int]:
     start = block_idx * block_length
     if start <= pos < start + block_length:
@@ -715,6 +715,21 @@ def export_run_dir(
         write_json(sample_dir / "metrics.json", metrics)
         (sample_dir / "problem_groundtruth_prediction.txt").write_text(make_problem_text(rec), encoding="utf-8")
 
+        # Research trace format used by the ARness case study.
+        step_events, block_metrics, block_timeline = build_block_artifacts(
+            rec,
+            {"step_stats": traces},
+            batch_item_idx=to_int(rec.get("batch_item_idx"), 0),
+        )
+        write_csv(sample_dir / "step_events.csv", step_events)
+        write_csv(sample_dir / "block_metrics.csv", block_metrics)
+        write_csv(sample_dir / "block_timeline.csv", block_timeline)
+        write_json(sample_dir / "sample_metrics.json", metrics)
+        (sample_dir / "final_prediction.txt").write_text(
+            str(get_field(rec, "prediction", "decoded_prediction", "prediction_preview", "output", default="")),
+            encoding="utf-8",
+        )
+
         flat = dict(metrics)
         flat.pop("block_stats", None)
         all_metrics.append(flat)
@@ -807,3 +822,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

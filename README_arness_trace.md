@@ -1,12 +1,15 @@
 # ARness Trace Case Study
 
-This setup writes one folder per sample/condition under:
+Current runs are organized by task, experiment, and condition:
 
 ```text
-outputs/arness_trace/sample_traces/<benchmark>/sample_XXXX/<condition>/
+outputs/arness/<experiment>/<condition>/
+  summary.jsonl
+  trace.jsonl
+  sample_traces/
 ```
 
-Each folder contains:
+Each exported sample trace contains:
 
 ```text
 block_timeline.csv
@@ -17,31 +20,25 @@ plot_rows.csv
 final_prediction.txt
 ```
 
-`block_timeline.csv` is the main table. Rows follow the real autoregressive
-generation order and include `active_block_idx` plus `block_local_round`.
-Columns `block_00`, `block_01`, ... show each block's current visible state.
-Unrevealed spans are compressed as `□xN`.
+`block_timeline.csv` is the main table. Rows follow real generation order and
+include `active_block_idx` plus `block_local_round`. Columns `block_00`,
+`block_01`, ... show the current visible state of each autoregressive block.
+Unrevealed spans are compressed as `[MASK]xN`.
 
-Run the detailed two-sample trace sweep from the unified config. It currently
-plans 55 conditions:
-
-- GSM8K sample 7: `gen_steps=[256,128,64,32,16]`
-- MBPP sample 6: `gen_steps=[512,256,128,64,32,16]`
-- both: `token_selection_confidence_threshold=[null,0.6,0.7,0.8,0.9]`
+Run the configured two-sample sweep:
 
 ```bash
-python run_test.py --config test_config.yaml
+python run_test.py --config test_config.yaml --only arness
 ```
 
-Create a compact plotting table after the run:
+Repair or export completed runs:
 
 ```bash
-python tools/summarize_arness_trace.py
+python trace.py --runs-root outputs/arness --overwrite --compress-masks --write-task-index
 ```
 
-If you already have old `summary.jsonl` and `trace.jsonl` run directories, export
-them into the same per-sample layout:
+Repair old numbered runs into the new layout:
 
 ```bash
-python tools/export_arness_trace.py --runs-root outputs/arness_trace --out outputs/arness_trace/sample_traces
+python trace.py --runs-root outputs/arness_trace --task-output-root outputs/arness --canonicalize --mode copy --overwrite --compress-masks --write-task-index
 ```
