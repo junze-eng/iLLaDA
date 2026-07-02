@@ -251,6 +251,8 @@ def collect_experiments(config: Dict[str, Any], selected: set) -> List[Dict[str,
                 continue
             item = deepcopy(experiment)
             item.setdefault("task", task_name)
+            if task_def.get("output_path") is not None:
+                item.setdefault("_task_output_path", task_def.get("output_path"))
             active.append(item)
     return active
 
@@ -272,6 +274,45 @@ def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
         f"samples{params.get('num_samples', 20)}_"
         f"seed{seed}"
     )
+
+
+def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], idx: int) -> str:
+    """Name a run by the actual config values, with idx only as a fallback."""
+    parts = [exp_name, benchmark]
+    if params.get("sample_indices") is not None:
+        sample_label = "_".join(str(item) for item in as_list(params.get("sample_indices")))
+        parts.append(f"sample{sample_label}")
+    elif params.get("sample_limit") is not None:
+        parts.append(f"n{params.get('sample_limit')}")
+    if params.get("context_length") is not None:
+        parts.append(f"ctx{params.get('context_length')}")
+    if params.get("needle_position") is not None:
+        parts.append(f"pos{params.get('needle_position')}")
+    for key, label in (
+        ("gen_length", "len"),
+        ("gen_blocksize", "block"),
+        ("gen_steps", "steps"),
+    ):
+        if params.get(key) is not None:
+            parts.append(f"{label}{params.get(key)}")
+    if "token_selection_confidence_threshold" in params:
+        threshold = params.get("token_selection_confidence_threshold")
+        threshold_label = "none" if threshold is None else str(threshold).replace(".", "p")
+        parts.append(f"thr{threshold_label}")
+    if len(parts) <= 2:
+        parts.append(str(idx))
+    return safe_name("_".join(str(part) for part in parts))
+
+
+def experiment_output_dir(base_output_dir: Path, experiment: Dict[str, Any]) -> Path:
+    """Resolve root output dir for an experiment from exp/task/base config."""
+    raw = experiment.get("output_path")
+    if raw is None and experiment.get("_task_output_path") is not None:
+        raw = Path(str(experiment.get("_task_output_path"))) / str(experiment.get("name"))
+    if raw is None:
+        return base_output_dir
+    path = Path(raw)
+    return path if path.is_absolute() else ROOT / path
 
 
 def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any]) -> Path:
@@ -844,11 +885,9 @@ def main() -> int:
     config = load_yaml(config_path)
 
     execution_cfg = config.get("execution", {}) or {}
-    output_dir = Path(execution_cfg.get("output_dir", "outputs/illada_runs"))
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
-    generated_dir = output_dir / "generated_configs"
-    generated_dir.mkdir(parents=True, exist_ok=True)
+    base_output_dir = Path(execution_cfg.get("output_dir", "outputs/illada_runs"))
+    if not base_output_dir.is_absolute():
+        base_output_dir = ROOT / base_output_dir
 
     dry_run = args.dry_run or bool(execution_cfg.get("dry_run", False))
     telemetry_enabled = bool(execution_cfg.get("gpu_telemetry", {}).get("enabled", True))
@@ -864,13 +903,18 @@ def main() -> int:
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(OPENCOMPASS_DIR) + os.pathsep + env.get("PYTHONPATH", "")
-    manifest_path = output_dir / "run_manifest.jsonl"
+    manifest_paths = set()
     planned = 0
 
     for experiment in experiments:
         exp_name = experiment.get("name")
         if not exp_name:
             raise SystemExit("Every experiment needs a `name`.")
+        output_dir = experiment_output_dir(base_output_dir, experiment)
+        generated_dir = output_dir / "generated_configs"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "run_manifest.jsonl"
+        manifest_paths.add(str(manifest_path))
 
         for benchmark in as_list(experiment.get("benchmark")):
             if not benchmark:
@@ -878,10 +922,12 @@ def main() -> int:
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 planned += 1
                 merged_params = deep_merge(default_params, params)
-                run_name = safe_name(f"{exp_name}_{benchmark}_{idx}")
+                run_name = condition_run_name(exp_name, benchmark, merged_params, idx)
                 work_dir = output_dir / run_name
                 model_cfg = build_model_cfg(global_model, merged_params, benchmark, run_name)
                 model_cfg["task_id"] = experiment.get("task")
+                if model_cfg.get("arness_trace_output"):
+                    model_cfg["arness_trace_output"] = str(work_dir / "sample_traces")
                 if execution_cfg.get("collect_metrics", True) and not model_cfg.get("metrics_output"):
                     model_cfg["per_sample_output"] = str(work_dir / "summary.jsonl")
                     if model_cfg.get("return_trace") or model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
@@ -994,7 +1040,8 @@ def main() -> int:
 
     if planned == 0:
         raise SystemExit("No enabled experiments matched the selection.")
-    print(f"Planned {planned} run(s). Manifest: {manifest_path}")
+    manifests = ", ".join(sorted(manifest_paths))
+    print(f"Planned {planned} run(s). Manifest(s): {manifests}")
     return 0
 
 
