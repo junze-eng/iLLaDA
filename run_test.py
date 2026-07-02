@@ -326,7 +326,16 @@ def render_opencompass_config(
     imports.append(f"datasets = {bench['var']}")
     if sample_indices is not None:
         indices = [int(item) for item in as_list(sample_indices)]
-        test_range = "indices:" + ",".join(str(item) for item in indices)
+        if not indices:
+            raise SystemExit("sample_indices cannot be empty.")
+        sorted_indices = sorted(indices)
+        expected = list(range(sorted_indices[0], sorted_indices[-1] + 1))
+        if sorted_indices != expected:
+            raise SystemExit(
+                "OpenCompass partitioners require contiguous sample_indices. "
+                f"Got: {indices}"
+            )
+        test_range = f"[{sorted_indices[0]}:{sorted_indices[-1] + 1}]"
         imports.append(f"_sample_test_range = {python_literal(test_range)}")
         imports.append("for _dataset in datasets:")
         imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
@@ -349,8 +358,7 @@ def render_opencompass_config(
         prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params)
         depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
         imports.append("for _dataset in datasets:")
-        if prepared_path.exists():
-            imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
+        imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
         if context_length is not None:
             imports.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
         if tokens_to_generate is not None:
