@@ -127,13 +127,22 @@ class NumWorkerPartitioner(BasePartitioner):
             cfg = copy.deepcopy(dataset_cfg)
             cfg['abbr'] = abbr + f'_{part}'
             test_range = cfg['reader_cfg'].get('test_range', '')
-            cfg['reader_cfg']['test_range'] = f'{test_range}[{i}:{i+step}]'
+            if isinstance(test_range, str) and test_range.startswith('indices:'):
+                selected_indices = _parse_indices_test_range(test_range)
+                part_indices = selected_indices[i:i + step]
+                cfg['reader_cfg']['test_range'] = (
+                    'indices:' + ','.join(str(index) for index in part_indices)
+                )
+            else:
+                cfg['reader_cfg']['test_range'] = f'{test_range}[{i}:{i+step}]'
             split_configs.append(cfg)
         return split_configs
 
     def get_size(self, dataset: ConfigDict) -> int:
         dataset_abbr = dataset_abbr_from_cfg(dataset)
         test_range = dataset.reader_cfg.get('test_range', '')
+        if isinstance(test_range, str) and test_range.startswith('indices:'):
+            return len(_parse_indices_test_range(test_range))
 
         # If not forcing rebuild and data exists in cache, use the cache
         if not self.force_rebuild and dataset_abbr in self.dataset_size:
@@ -156,3 +165,10 @@ class NumWorkerPartitioner(BasePartitioner):
         actual_size = eval('len(range(self.dataset_size[dataset_abbr])'
                            f'{test_range})')
         return actual_size
+
+
+def _parse_indices_test_range(test_range: str) -> List[int]:
+    return [
+        int(item.strip()) for item in test_range[len('indices:'):].split(',')
+        if item.strip()
+    ]
