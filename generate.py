@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+from typing import List, Optional
 
 from transformers import AutoTokenizer, AutoModel
 
@@ -40,6 +41,57 @@ def get_num_transfer_tokens(mask_index, steps):
     return num_transfer_tokens
 
 
+def resolve_steps_per_block_schedule(
+        *,
+        speed_schedule_name: Optional[str] = None,
+        steps_per_block_schedule: Optional[List[int]] = None,
+        steps: int,
+        gen_length: int,
+        block_length: int):
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    if speed_schedule_name is not None and steps_per_block_schedule is not None:
+        raise ValueError("Pass either speed_schedule_name or steps_per_block_schedule, not both.")
+
+    schedule_overrides_gen_steps = speed_schedule_name is not None or steps_per_block_schedule is not None
+    if speed_schedule_name is not None:
+        gsm8k_pilot_schedules = {
+            'all_1tps': [32, 32, 32, 32, 32, 32, 32, 32],
+            'all_2tps': [16, 16, 16, 16, 16, 16, 16, 16],
+            'all_4tps': [8, 8, 8, 8, 8, 8, 8, 8],
+            'slow_to_fast_1_2_4': [32, 32, 16, 16, 16, 8, 8, 8],
+            'fast_to_slow_4_2_1': [8, 8, 8, 16, 16, 16, 32, 32],
+        }
+        if gen_length != 256 or block_length != 32 or num_blocks != 8:
+            raise ValueError(
+                "speed_schedule_name currently supports only the GSM8K pilot "
+                f"(gen_length=256, block_length=32, num_blocks=8); got "
+                f"gen_length={gen_length}, block_length={block_length}, num_blocks={num_blocks}."
+            )
+        if speed_schedule_name not in gsm8k_pilot_schedules:
+            raise ValueError(
+                f"Unknown speed_schedule_name `{speed_schedule_name}`. "
+                f"Available: {', '.join(sorted(gsm8k_pilot_schedules))}"
+            )
+        steps_per_block_schedule = gsm8k_pilot_schedules[speed_schedule_name]
+    elif steps_per_block_schedule is None:
+        assert steps % num_blocks == 0
+        uniform_steps_per_block = steps // num_blocks
+        steps_per_block_schedule = [uniform_steps_per_block] * num_blocks
+
+    block_steps_schedule = [int(block_steps) for block_steps in steps_per_block_schedule]
+    if len(block_steps_schedule) != num_blocks:
+        raise ValueError(
+            f"steps_per_block_schedule must have {num_blocks} entries, got {len(block_steps_schedule)}."
+        )
+    if any(block_steps <= 0 for block_steps in block_steps_schedule):
+        raise ValueError(f"steps_per_block_schedule values must be positive integers: {block_steps_schedule}")
+
+    planned_steps = sum(block_steps_schedule)
+    return block_steps_schedule, planned_steps, schedule_overrides_gen_steps
+
+
 @ torch.no_grad()
 def _dynamic_stop_token_ids(tokenizer=None, stop_token_ids=None):
     ids = []
@@ -69,7 +121,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              cfg_scale=0., remasking='low_confidence', mask_id=126336, logits_eos_inf=False,
              confidence_eos_eot_inf=False, token_selection_confidence_threshold=None,
              min_transfer_tokens=1, return_trace=False, trace_token_snapshots=False,
-             tokenizer=None, stop_token_ids=None):
+             tokenizer=None, stop_token_ids=None, speed_schedule_name: Optional[str] = None,
+             steps_per_block_schedule: Optional[List[int]] = None):
     '''
     Args:
         model: Mask predictor.
@@ -90,8 +143,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             positive. This prevents high confidence thresholds from stalling with residual mask tokens.
         return_trace: If True, return (tokens, trace) with per-step transfer statistics.
         trace_token_snapshots: If True, include generated-region token IDs after every diffusion step.
+        speed_schedule_name: Optional named per-block speed schedule.
+        steps_per_block_schedule: Optional explicit denoising-step count for each block.
     '''
-    planned_steps = int(steps)
     stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
 
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
@@ -102,20 +156,37 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
     prompt_index = (x != mask_id)
 
-    assert gen_length % block_length == 0
+    block_steps_schedule, planned_steps, schedule_overrides_gen_steps = resolve_steps_per_block_schedule(
+        speed_schedule_name=speed_schedule_name,
+        steps_per_block_schedule=steps_per_block_schedule,
+        steps=int(steps),
+        gen_length=int(gen_length),
+        block_length=int(block_length),
+    )
+    if schedule_overrides_gen_steps:
+        print(
+            'speed_schedule:',
+            speed_schedule_name,
+            'schedule:',
+            block_steps_schedule,
+            'planned_steps:',
+            planned_steps,
+        )
     num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps = steps // num_blocks
+    uniform_steps_per_block = block_steps_schedule[0] if len(set(block_steps_schedule)) == 1 else None
 
     trace = {
         'prompt_tokens': int(prompt.shape[1]),
         'gen_length': int(gen_length),
         'block_length': int(block_length),
-        'steps_per_block': int(steps),
+        'steps_per_block': int(uniform_steps_per_block) if uniform_steps_per_block is not None else None,
+        'steps_per_block_schedule': list(block_steps_schedule),
+        'speed_schedule_name': speed_schedule_name,
+        'planned_steps': int(planned_steps),
         'forward_passes': int(planned_steps),
         'num_blocks': int(num_blocks),
         'planned_parallelism': float(gen_length / planned_steps) if planned_steps else None,
+        'schedule_overrides_gen_steps': bool(schedule_overrides_gen_steps),
         'mask_id': int(mask_id),
         'stop_token_ids': stop_token_ids,
         'token_selection_confidence_threshold': token_selection_confidence_threshold,
@@ -128,10 +199,13 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'token_snapshots': [] if trace_token_snapshots else None,
     } if return_trace else None
 
+    global_step_offset = 0
     for num_block in range(num_blocks):
+        block_steps = block_steps_schedule[num_block]
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-        for i in range(steps):
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, block_steps)
+        for i in range(block_steps):
+            step_idx = global_step_offset + i
             mask_index = (x == mask_id)
             if cfg_scale > 0.:
                 un_x = x.clone()
@@ -225,8 +299,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     step_records.append({
                         'batch_item_idx': int(j),
                         'block_idx': int(num_block),
-                        'step_idx': int(num_block * steps + i),
+                        'block_steps': int(block_steps),
+                        'block_planned_parallelism': float(block_length / block_steps) if block_steps else None,
+                        'step_idx': int(step_idx),
+                        'global_step_idx': int(step_idx),
                         'step_idx_in_block': int(i),
+                        'local_step_idx': int(i),
                         'mask_count_before': None,
                         'selected_positions': selected_positions,
                         'selected_token_ids': selected_token_ids,
@@ -257,8 +335,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     step_records.append({
                         'batch_item_idx': 0,
                         'block_idx': int(num_block),
-                        'step_idx': int(num_block * steps + i),
+                        'block_steps': int(block_steps),
+                        'block_planned_parallelism': float(block_length / block_steps) if block_steps else None,
+                        'step_idx': int(step_idx),
+                        'global_step_idx': int(step_idx),
                         'step_idx_in_block': int(i),
+                        'local_step_idx': int(i),
                         'mask_count_before': mask_count_before,
                         'selected_positions': [],
                         'selected_token_ids': [],
@@ -288,8 +370,10 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                     trace['token_snapshots'].append({
                         'block_id': int(num_block),
                         'step_id': int(i),
+                        'global_step_id': int(step_idx),
                         'generated_token_ids': x[:, prompt.shape[1]:].detach().cpu().tolist(),
                     })
+        global_step_offset += block_steps
 
     if trace is not None:
         generated_region = x[:, prompt.shape[1]:]

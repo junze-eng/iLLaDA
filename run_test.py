@@ -295,6 +295,8 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
     ):
         if params.get(key) is not None:
             parts.append(f"{label}{params.get(key)}")
+    if params.get("speed_schedule_name") is not None:
+        parts.append(f"speed{params.get('speed_schedule_name')}")
     if "token_selection_confidence_threshold" in params:
         threshold = params.get("token_selection_confidence_threshold")
         threshold_label = "none" if threshold is None else str(threshold).replace(".", "p")
@@ -765,6 +767,7 @@ def write_run_summary(
     completion_rates = numeric_values(samples, "completion_rate")
     actual_parallelism = numeric_values(samples, "actual_parallelism")
     actual_arness = numeric_values(samples, "actual_arness")
+    planned_parallelism = numeric_values(samples, "planned_parallelism")
     threshold_pass_rates = numeric_values(samples, "threshold_pass_rate")
     fallback_rates = numeric_values(samples, "fallback_rate")
     effective_parallelism = numeric_values(samples, "effective_parallelism")
@@ -803,6 +806,7 @@ def write_run_summary(
         "completion_rate": mean(completion_rates),
         "actual_parallelism": mean(actual_parallelism),
         "actual_arness_mean": mean(actual_arness),
+        "planned_parallelism_mean": mean(planned_parallelism),
         "threshold_pass_rate_mean": mean(threshold_pass_rates),
         "fallback_rate_mean": mean(fallback_rates),
         "effective_parallelism_mean": mean(effective_parallelism),
@@ -834,6 +838,8 @@ def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "gen_length": row.get("param_gen_length"),
         "gen_steps": row.get("param_gen_steps"),
         "gen_blocksize": row.get("param_gen_blocksize"),
+        "speed_schedule_name": row.get("param_speed_schedule_name"),
+        "planned_parallelism": row.get("planned_parallelism_mean"),
         "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
         "min_transfer_tokens": row.get("param_min_transfer_tokens"),
         "context_length": row.get("param_context_length"),

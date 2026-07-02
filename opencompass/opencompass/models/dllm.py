@@ -142,6 +142,8 @@ class LLaDAModel(BaseModel):
                  gen_steps = 512,
                  gen_length = 512,
                  gen_blocksize = 512,
+                 speed_schedule_name = None,
+                 steps_per_block_schedule = None,
                  batch_size_ = 1,
                  diff_confidence_eos_eot_inf = False,
                  diff_logits_eos_inf = False,
@@ -196,6 +198,8 @@ class LLaDAModel(BaseModel):
         self.gen_steps = gen_steps
         self.gen_length = gen_length
         self.gen_blocksize = gen_blocksize
+        self.speed_schedule_name = speed_schedule_name
+        self.steps_per_block_schedule = steps_per_block_schedule
         self.temperature = temperature
         self.remasking = remasking
         self.padding_id = padding_id
@@ -491,12 +495,17 @@ class LLaDAModel(BaseModel):
                 'gen_length': int(self.gen_length),
                 'block_length': int(self.gen_blocksize),
                 'gen_blocksize': int(self.gen_blocksize),
+                'speed_schedule_name': self.speed_schedule_name,
+                'steps_per_block_schedule': trace.get('steps_per_block_schedule') if trace else self.steps_per_block_schedule,
+                'planned_steps': trace.get('planned_steps') if trace else None,
+                'planned_parallelism': trace.get('planned_parallelism') if trace else None,
+                'schedule_overrides_gen_steps': trace.get('schedule_overrides_gen_steps') if trace else None,
                 'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
                 'min_transfer_tokens': self.min_transfer_tokens,
                 'context_length': self.context_length,
                 'needle_position': self.needle_position,
-                'effective_parallelism': float(self.gen_length / self.gen_steps) if self.gen_steps else None,
-                'arness': float(self.gen_steps / self.gen_length) if self.gen_length else None,
+                'effective_parallelism': trace.get('planned_parallelism') if trace else (float(self.gen_length / self.gen_steps) if self.gen_steps else None),
+                'arness': float((trace.get('planned_steps') if trace else self.gen_steps) / self.gen_length) if self.gen_length else None,
                 'completion_rate': trace.get('completion_rate') if trace else None,
                 'actual_parallelism': trace.get('actual_parallelism') if trace else None,
                 'actual_arness': trace.get('actual_arness') if trace else None,
@@ -531,7 +540,11 @@ class LLaDAModel(BaseModel):
                         'decoding_config_name': self.decoding_config_name,
                         'batch_item_idx': int(i),
                         'step_idx': step.get('step_idx'),
+                        'global_step_idx': step.get('global_step_idx'),
+                        'local_step_idx': step.get('local_step_idx'),
                         'block_idx': step.get('block_idx'),
+                        'block_steps': step.get('block_steps'),
+                        'block_planned_parallelism': step.get('block_planned_parallelism'),
                         'mask_count_before': step.get('mask_count_before'),
                         'mask_count_after': step.get('mask_count_after'),
                         'selected_positions': step.get('selected_positions') or [],
@@ -583,6 +596,7 @@ class LLaDAModel(BaseModel):
                         break
         prompt = [self.tokenizer.apply_chat_template(m_i, add_generation_prompt=True, tokenize=False) for m_i in messages]
         print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
+        print('speed_schedule_name:', self.speed_schedule_name, 'steps_per_block_schedule:', self.steps_per_block_schedule)
         print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
@@ -617,6 +631,8 @@ class LLaDAModel(BaseModel):
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
             tokenizer = self.tokenizer,
+            speed_schedule_name = self.speed_schedule_name,
+            steps_per_block_schedule = self.steps_per_block_schedule,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()
@@ -753,6 +769,7 @@ class LLaDABaseModel(LLaDAModel):
         context_prefix = self._context_prefix()
         prompt = [context_prefix + message for message in messages]
         print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
+        print('speed_schedule_name:', self.speed_schedule_name, 'steps_per_block_schedule:', self.steps_per_block_schedule)
         print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
@@ -787,6 +804,8 @@ class LLaDABaseModel(LLaDAModel):
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
             tokenizer = self.tokenizer,
+            speed_schedule_name = self.speed_schedule_name,
+            steps_per_block_schedule = self.steps_per_block_schedule,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()

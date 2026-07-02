@@ -251,5 +251,27 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
 
-    blocksize:
-
+  dynamic_speed_gsm8k:
+    description: "Exploratory GSM8K dynamic decoding speed schedule with paper-style block size."
+    output_path: outputs/dynamic_speed_gsm8k
+    experiments:
+      - name: dynspeed_gsm8k_sample7_block32
+        benchmark: gsm8k
+        params:
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          speed_schedule_name:
+            - all_1tps
+            - all_2tps
+            - all_4tps
+            - slow_to_fast_1_2_4
+            - fast_to_slow_4_2_1
