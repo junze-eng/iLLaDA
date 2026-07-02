@@ -196,6 +196,6 @@ tasks:
           min_transfer_tokens: 1
           return_trace: true
         sweep:
-          gen_steps: [64, 32]
-          temperature: [0.0, 0.3, 0.7]
-          token_selection_confidence_threshold: [null, 0.7, 0.8, 0.9]
+          gen_steps: [256, 64, 32]
+          temperature: [0.0, 0.3]
+          token_selection_confidence_threshold: [null, 0.8, 0.9]
