@@ -155,6 +155,51 @@ def write_csv(rows, sample_idx, output_path):
     print(f"[+] Saved CSV to {output_path}")
 
 
+def write_continuous(rows, sample_idx, trace_jsonl, output_path):
+    """Reassemble the final generation in true left-to-right position order (not step-commit
+    order -- diffusion fills positions out of order, so the raw step log reads jumbled even when
+    the finished text is coherent). Uses each token's recorded position + which step produced it."""
+    by_position = {}
+    missing_positions = False
+    for row in rows:
+        positions = row.get("selected_positions") or []
+        tokens = row.get("selected_decoded_tokens") or []
+        confidences = row.get("selected_confidences") or []
+        step_label = f"b{row.get('block_idx')}s{row.get('step_idx')}"
+        if tokens and not positions:
+            missing_positions = True
+            continue
+        for pos, tok, conf in zip(positions, tokens, confidences):
+            by_position[pos] = (tok, step_label, conf)
+
+    if not by_position:
+        print("[-] No 'selected_positions' found in this trace.jsonl -- can't reconstruct "
+              "continuous order (older trace file?). Falling back is not possible; use "
+              "summary.jsonl's 'prediction' field for the final text instead.")
+        return
+
+    ordered_positions = sorted(by_position)
+    plain_text = "".join(by_position[p][0] for p in ordered_positions)
+    annotated = "".join(f"{by_position[p][0]}[{by_position[p][1]}]" for p in ordered_positions)
+
+    lines = [
+        f"# Continuous generation (position order) — {Path(trace_jsonl).parent.name}, sample #{sample_idx}\n",
+        f"Reassembled from {len(ordered_positions)} committed positions"
+        + (" (some steps had no position data and were skipped)" if missing_positions else "") + ".\n",
+        "## Final text (plain, left-to-right)\n",
+        "```",
+        plain_text,
+        "```\n",
+        "## Same text, each token tagged with the step that produced it (`[b<block>s<step>]`)\n",
+        "```",
+        annotated,
+        "```\n",
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[+] Saved continuous reconstruction to {output_path}")
+
+
 def plot_collapse_curve(rows, dominant_token, sample_idx, trace_jsonl, output_path):
     try:
         import matplotlib.pyplot as plt
@@ -216,6 +261,12 @@ def main():
                               "rate, and every token+confidence committed that step.")
     parser.add_argument("--csv-output", default=None,
                          help="Path for --csv output (default: outputs/report_figures/trace_<sample_idx>.csv)")
+    parser.add_argument("--continuous", action="store_true",
+                         help="Also write the final generation reassembled in true left-to-right "
+                              "position order (not step-commit order), plus a step-tagged version.")
+    parser.add_argument("--continuous-output", default=None,
+                         help="Path for --continuous output "
+                              "(default: outputs/report_figures/trace_<sample_idx>_continuous.md)")
     args = parser.parse_args()
 
     rows = load_steps(args.trace_jsonl, args.sample_idx)
@@ -230,6 +281,11 @@ def main():
         csv_path = (Path(args.csv_output) if args.csv_output
                     else Path("outputs/report_figures") / f"trace_{args.sample_idx}.csv")
         write_csv(rows, args.sample_idx, csv_path)
+
+    if args.continuous:
+        continuous_path = (Path(args.continuous_output) if args.continuous_output
+                           else Path("outputs/report_figures") / f"trace_{args.sample_idx}_continuous.md")
+        write_continuous(rows, args.sample_idx, args.trace_jsonl, continuous_path)
 
     if args.plot or args.narrative:
         if not token_counts:
