@@ -207,6 +207,19 @@ tasks:
           gen_steps: [256, 64, 32]
           temperature: [0.0, 0.3]
           token_selection_confidence_threshold: [null, 0.8, 0.9]
+
+      - name: task4_gsm8k_resume_temp03
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          temperature: 0.3
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [256, 64, 32]
+          token_selection_confidence_threshold: [null, 0.8, 0.9]
   custom_benchmark:
     description: "Task 5: parallel-decoding mechanism study on custom_math (self-authored, paper-clean -- fine to use as headline evaluation evidence). task5_custom_math_ar_like/mild/strong_parallel mirror Task 1's steps-only sweep (block_length held at gen_length). task5_custom_math_block_grid extends this to the block_length=32/8 rows of a full gen_steps x block_length grid (block_length=256 row already covered by the ar_like/mild/strong experiments above) to test whether semi-autoregressive block splitting changes the strong_parallel collapse (see Task 1/Task 3 sample7 case study). task5_custom_math_overprovisioned_steps tests gen_steps > gen_length (2x) crossed with confidence threshold, to isolate whether threshold's completion_rate drop (seen in Task 3/4) is a real filtering effect or just a steps-budget artifact -- see generate.py's get_num_transfer_tokens: when steps > block_length, each masked position gets scheduled exactly once, so the threshold fallback (min_transfer_tokens) becomes unconditional and every position should eventually get force-committed. Mirrored on gsm8k as Task 6 (gsm8k_mechanism) so the two can run on separate GPUs in parallel."
     output_path: outputs/custom_benchmark
@@ -420,6 +433,22 @@ tasks:
           gen_length: 256
           gen_blocksize: 32
           steps_per_block_schedule: [8, 8, 8, 16, 16, 16, 32, 32]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynspeed_gsm8k_sample7_block32_slow_fast_slow_1_4_1
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: slow_fast_slow_1_4_1
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [32, 32, 8, 8, 8, 8, 32, 32]
           min_transfer_tokens: 1
           token_selection_confidence_threshold: null
           temperature: 0.0
