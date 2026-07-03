@@ -14,8 +14,10 @@ def add_gumbel_noise(logits, temperature):
     '''
     if temperature == 0:
         return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
+    # float64 here reliably OOMs on 24GB cards at this vocab size (155136) once the
+    # base model + activations already use ~22GB -- float32 halves that overhead.
+    logits = logits.to(torch.float32)
+    noise = torch.rand_like(logits, dtype=torch.float32)
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
