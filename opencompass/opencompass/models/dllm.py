@@ -158,6 +158,7 @@ class LLaDAModel(BaseModel):
                  trace_token_snapshots = False,
                  trace_decode_snapshots = False,
                  trace_step0_full_confidence = False,
+                 decode_order = 'confidence',
                  arness_trace_output = None,
                  context_prefix_tokens = 0,
                  context_prefix_text = 'Context padding sentence. ',
@@ -220,6 +221,7 @@ class LLaDAModel(BaseModel):
         self.trace_token_snapshots = bool(trace_token_snapshots)
         self.trace_decode_snapshots = bool(trace_decode_snapshots)
         self.trace_step0_full_confidence = bool(trace_step0_full_confidence)
+        self.decode_order = decode_order
         self.arness_trace_output = arness_trace_output or os.environ.get('ILLADA_ARNESS_TRACE_DIR')
         self.context_prefix_tokens = int(context_prefix_tokens)
         self.context_prefix_text = context_prefix_text
@@ -665,6 +667,7 @@ class LLaDAModel(BaseModel):
             speed_schedule_name = self.speed_schedule_name,
             steps_per_block_schedule = self.steps_per_block_schedule,
             trace_step0_full_confidence = self.trace_step0_full_confidence,
+            decode_order = self.decode_order,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()
@@ -841,6 +844,7 @@ class LLaDABaseModel(LLaDAModel):
             speed_schedule_name = self.speed_schedule_name,
             steps_per_block_schedule = self.steps_per_block_schedule,
             trace_step0_full_confidence = self.trace_step0_full_confidence,
+            decode_order = self.decode_order,
         )
         elapsed = time.perf_counter() - started
         cuda_stats = self._cuda_stats_after()

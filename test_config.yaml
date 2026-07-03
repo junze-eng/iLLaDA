@@ -548,3 +548,55 @@ tasks:
           trace_step0_full_confidence: true
           trace_token_snapshots: false
           trace_decode_snapshots: false
+
+  decode_order_probe:
+    description: "Does iLLaDA's free (confidence-based) decoding order carry real value over a forced order? Compares accuracy at matched gen_length/steps across three decode_order settings: 'confidence' (current default -- pick highest-confidence masked positions each step), 'left_to_right' (force the leftmost masked positions, ignoring confidence), 'random' (force a random subset). If confidence ~= left_to_right >> random, iLLaDA's capability is essentially autoregressive under the hood and the parallel/free-order aspect of diffusion decoding is not doing much work. If confidence is clearly better than left_to_right, the free ordering has real value. GSM8K, n=20, steps=gen_length=256 (ar_like pace, block_length=256) so the only variable is which positions get committed each step, not how many."
+    output_path: outputs/decode_order_probe
+    experiments:
+      - name: decode_order_gsm8k_confidence
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: confidence
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: decode_order_gsm8k_left_to_right
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: left_to_right
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: decode_order_gsm8k_random
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: random
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false

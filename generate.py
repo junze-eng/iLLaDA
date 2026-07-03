@@ -127,7 +127,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              tokenizer=None, stop_token_ids=None, speed_schedule_name: Optional[str] = None,
              steps_per_block_schedule: Optional[List[int]] = None,
              token_selection_confidence_threshold_schedule: Optional[List[Optional[float]]] = None,
-             trace_step0_full_confidence: bool = False):
+             trace_step0_full_confidence: bool = False,
+             decode_order: str = 'confidence'):
     '''
     Args:
         model: Mask predictor.
@@ -154,6 +155,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         trace_step0_full_confidence: If True (and return_trace=True), record the model's confidence for
             every generation-region position (not just selected ones) at the very first diffusion step,
             to study how initial confidence decays with distance from the prompt.
+        decode_order: Which positions get committed each step. 'confidence' (default) picks the
+            highest-confidence masked positions, as usual. 'left_to_right' forces the leftmost masked
+            positions to be committed regardless of confidence (still using the model's own predicted
+            token for that position). 'random' picks a random subset of masked positions. The latter two
+            exist to measure whether iLLaDA's free (confidence-based) decoding order carries real value
+            over a forced order, by comparing accuracy across all three at matched steps/gen_length.
     '''
     stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
 
@@ -294,7 +301,19 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 if scheduled_count <= 0:
                     continue
                 step_scheduled_count += scheduled_count
-                select_confidence, select_index = torch.topk(confidence[j], k=scheduled_count)
+                if decode_order == 'confidence':
+                    select_confidence, select_index = torch.topk(confidence[j], k=scheduled_count)
+                elif decode_order == 'left_to_right':
+                    candidate_positions = torch.isfinite(confidence[j]).nonzero(as_tuple=True)[0]
+                    select_index = candidate_positions[:scheduled_count]
+                    select_confidence = confidence[j][select_index]
+                elif decode_order == 'random':
+                    candidate_positions = torch.isfinite(confidence[j]).nonzero(as_tuple=True)[0]
+                    perm = candidate_positions[torch.randperm(candidate_positions.numel(), device=candidate_positions.device)]
+                    select_index = perm[:scheduled_count]
+                    select_confidence = confidence[j][select_index]
+                else:
+                    raise ValueError(f"Unknown decode_order `{decode_order}`. Expected 'confidence', 'left_to_right', or 'random'.")
                 original_select_confidence = select_confidence
                 original_select_index = select_index
                 passed_count = scheduled_count
