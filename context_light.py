@@ -1,156 +1,124 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-context_light_clean.py
+fix_context_light_progress_inplace.py
 
-A clean-output wrapper for context_light.py.
+In-place patch for context_light.py v4.
 
-Why this exists
----------------
-Some versions of context_light.py update the progress bar using carriage return
-("\\r"). In some terminals / nohup logs, the previous line is not cleared, so
-the log looks like:
-  ... total_elapsed=4.1s | e/ [----...]
+It replaces only the LiveSpinner class with a clean version:
+- TTY: uses "\r\033[K" to clear the line before each update.
+- Non-TTY / nohup log: does not use "\r"; prints at most once every 10 seconds.
+- On exit: clears the spinner line cleanly.
 
-This wrapper runs the original context_light.py unchanged, but filters its
-stdout/stderr stream so the progress output is readable.
+Usage:
+  cd /workspace/iLLaDA
+  cp /mnt/data/fix_context_light_progress_inplace.py .
+  python fix_context_light_progress_inplace.py context_light.py
 
-Usage is the same as context_light.py:
-  python context_light_clean.py \
-    --output-dir outputs/context_light \
-    --context-lengths 1024 2048 4096 8192 \
-    --needle-positions front middle back \
-    --num-samples-per-condition 20 \
-    --sample-selection first \
-    --gen-length 128 \
-    --gen-steps 128 \
-    --gen-blocksize 32
-
-Background:
-  nohup python context_light_clean.py ... > context_light.log 2>&1 &
-
-It forwards all arguments to context_light.py.
+Backup:
+  context_light.py.bak_spinner
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
+import re
 import sys
-import time
 from pathlib import Path
 
+NEW_CLASS = """class LiveSpinner:
+    \"""Tiny dependency-free spinner used while one long model generation is running.
 
-PROGRESS_MARKERS = (
-    "sample_elapsed=",
-    "total_elapsed=",
-    "running ctx=",
-    "eta ",
-    "match=",
-    "[----------------",
-    "[################",
-)
+    Cleaned version:
+    - In an interactive terminal, refresh one line and clear leftovers with ANSI K.
+    - In redirected logs / nohup, avoid carriage-return spam and print at most
+      one running-status line every 10 seconds.
+    \"""
 
+    def __init__(self, message_fn, interval: float = 0.5, log_interval: float = 10.0):
+        self.message_fn = message_fn
+        self.interval = interval
+        self.log_interval = log_interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._is_tty = sys.stdout.isatty()
+        self._last_log_time = 0.0
 
-def is_progress_line(s: str) -> bool:
-    return any(m in s for m in PROGRESS_MARKERS)
+    def __enter__(self):
+        def _run() -> None:
+            frames = "|/-\\\\"
+            i = 0
+            while not self._stop.is_set():
+                msg = self.message_fn()
+                now = time.perf_counter()
 
+                if self._is_tty:
+                    # Clear whole line first. This prevents stale characters like "e"
+                    # from the previous longer progress line.
+                    sys.stdout.write("\\r\\033[K" + frames[i % len(frames)] + " " + msg)
+                    sys.stdout.flush()
+                else:
+                    # In logs, carriage returns are unreadable. Print a throttled line.
+                    if now - self._last_log_time >= self.log_interval:
+                        sys.stdout.write(frames[i % len(frames)] + " " + msg + "\\n")
+                        sys.stdout.flush()
+                        self._last_log_time = now
 
-def clean_line(s: str) -> str:
-    # Keep only the last carriage-return segment and remove common terminal clear codes.
-    s = s.split("\r")[-1]
-    s = s.replace("\x1b[K", "").replace("\x1b[2K", "")
-    return s.rstrip("\n")
+                i += 1
+                self._stop.wait(self.interval)
 
+            if self._is_tty:
+                sys.stdout.write("\\r\\033[K")
+                sys.stdout.flush()
 
-def emit(s: str, final: bool = False) -> None:
-    if not s:
-        return
-    if sys.stdout.isatty() and is_progress_line(s):
-        sys.stdout.write("\r\033[K" + s)
-        if final:
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-    else:
-        sys.stdout.write(s + "\n")
-        sys.stdout.flush()
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._is_tty:
+            sys.stdout.write("\\r\\033[K")
+            sys.stdout.flush()
+"""
 
 
 def main() -> int:
-    here = Path(__file__).resolve().parent
-    target = here / "context_light.py"
-    if not target.exists():
-        print(f"[ERROR] cannot find original context_light.py next to {Path(__file__).name}: {target}", file=sys.stderr)
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("context_light.py")
+    if not path.exists():
+        print(f"[ERROR] not found: {path}", file=sys.stderr)
         return 2
 
-    cmd = [sys.executable, str(target)] + sys.argv[1:]
-    print("[RUN]", " ".join(cmd), flush=True)
+    text = path.read_text(encoding="utf-8")
 
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    if "class LiveSpinner:" not in text:
+        print("[ERROR] class LiveSpinner not found.", file=sys.stderr)
+        return 2
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
+    pattern = re.compile(
+        r'class LiveSpinner:\n'
+        r'(?:    .*\n)*?'
+        r'\n'
+        r'def make_running_message\(',
+        re.DOTALL,
     )
 
-    assert proc.stdout is not None
+    replacement = NEW_CLASS + "\n\ndef make_running_message("
+    new_text, n = pattern.subn(replacement, text, count=1)
 
-    buf = ""
-    last_progress = ""
-    last_emit_ts = 0.0
-    progress_interval = 10.0 if not sys.stdout.isatty() else 0.0
+    if n != 1:
+        print("[ERROR] failed to replace LiveSpinner block safely.", file=sys.stderr)
+        return 2
 
-    while True:
-        ch = proc.stdout.read(1)
-        if ch == "":
-            break
+    bak = path.with_suffix(path.suffix + ".bak_spinner")
+    if not bak.exists():
+        bak.write_text(text, encoding="utf-8")
 
-        if ch == "\r":
-            line = clean_line(buf)
-            buf = ""
-            if line:
-                if is_progress_line(line):
-                    last_progress = line
-                    now = time.time()
-                    if sys.stdout.isatty() or (now - last_emit_ts >= progress_interval):
-                        emit(line, final=False)
-                        last_emit_ts = now
-                else:
-                    emit(line)
-            continue
-
-        if ch == "\n":
-            line = clean_line(buf)
-            buf = ""
-            if line:
-                # Print final progress/completion lines; also move to next line after TTY progress.
-                if is_progress_line(line):
-                    emit(line, final=True)
-                else:
-                    if sys.stdout.isatty() and last_progress:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        last_progress = ""
-                    emit(line)
-            continue
-
-        buf += ch
-
-    if buf.strip():
-        line = clean_line(buf)
-        if line:
-            emit(line, final=True)
-
-    rc = proc.wait()
-    if sys.stdout.isatty() and last_progress:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-    return rc
+    path.write_text(new_text, encoding="utf-8")
+    print(f"[OK] patched LiveSpinner in {path}")
+    print(f"[OK] backup saved to {bak}")
+    return 0
 
 
 if __name__ == "__main__":
