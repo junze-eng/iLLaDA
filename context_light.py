@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "context_light_ui_v3_rawprompt_128"
+SCRIPT_VERSION = "context_light_v4_oc_aligned"
 
 def find_repo_root(start: Path) -> Path:
     """Find repo root so this file can live either in repo root or tools/."""
@@ -85,11 +85,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--return-trace", action="store_true")
     parser.add_argument("--trace-token-snapshots", action="store_true")
     parser.add_argument("--remasking", choices=["low_confidence", "random"], default="low_confidence")
+    parser.add_argument("--diff-confidence-eos-eot-inf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--diff-logits-eos-inf", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
-    # Correct iLLaDA/LLaDA [MASK] token id. Do not use 5 here.
-    parser.add_argument("--mask-id", type=int, default=126336)
+    # Match the project OpenCompass iLLaDA config. The working context runs use mask_id=5.
+    parser.add_argument("--mask-id", type=int, default=5)
     parser.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--add-special-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -349,7 +351,8 @@ def print_run_header(args: argparse.Namespace, selected: List[Dict[str, Any]], p
     print(f"Positions    : {' / '.join(args.needle_positions)}")
     print(f"Samples      : selected={len(selected)} pending={len(pending)} already_done={len(selected) - len(pending)}")
     print(f"Generation   : len={args.gen_length}, steps={args.gen_steps}, block={args.gen_blocksize}, temp={args.temperature}, cfg={args.cfg}")
-    print(f"Mask ID      : {args.mask_id}")
+    print(f"EOS/EOT cfg  : diff_confidence_eos_eot_inf={args.diff_confidence_eos_eot_inf}, diff_logits_eos_inf={args.diff_logits_eos_inf}")
+    print(f"Mask ID      : {args.mask_id}  (aligned with project OpenCompass context config)")
     print("=" * 88 + "\n")
 
 
@@ -665,6 +668,8 @@ def main() -> int:
                         remasking=args.remasking,
                         mask_id=args.mask_id,
                         token_selection_confidence_threshold=args.token_selection_confidence_threshold,
+                        diff_confidence_eos_eot_inf=args.diff_confidence_eos_eot_inf,
+                        diff_logits_eos_inf=args.diff_logits_eos_inf,
                         return_trace=args.return_trace,
                         trace_token_snapshots=args.trace_token_snapshots,
                         tokenizer=tokenizer,
@@ -703,6 +708,8 @@ def main() -> int:
                 "gen_steps": args.gen_steps,
                 "gen_blocksize": args.gen_blocksize,
                 "mask_id": args.mask_id,
+                "diff_confidence_eos_eot_inf": args.diff_confidence_eos_eot_inf,
+                "diff_logits_eos_inf": args.diff_logits_eos_inf,
                 "latency_sec": round(latency, 6),
                 "tokens_per_second": round(args.gen_length / latency, 6) if latency > 0 else None,
                 "max_memory_gb": round(max_memory_gb, 6) if max_memory_gb is not None else None,
