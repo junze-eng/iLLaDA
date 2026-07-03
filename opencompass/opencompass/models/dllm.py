@@ -148,6 +148,8 @@ class LLaDAModel(BaseModel):
                  diff_confidence_eos_eot_inf = False,
                  diff_logits_eos_inf = False,
                  token_selection_confidence_threshold = None,
+                 token_selection_confidence_threshold_schedule = None,
+                 threshold_schedule_label = None,
                  min_transfer_tokens = 1,
                  metrics_output = None,
                  per_sample_output = None,
@@ -207,6 +209,8 @@ class LLaDAModel(BaseModel):
         self.diff_confidence_eos_eot_inf = diff_confidence_eos_eot_inf
         self.diff_logits_eos_inf = diff_logits_eos_inf
         self.token_selection_confidence_threshold = token_selection_confidence_threshold
+        self.token_selection_confidence_threshold_schedule = token_selection_confidence_threshold_schedule
+        self.threshold_schedule_label = threshold_schedule_label
         self.min_transfer_tokens = int(min_transfer_tokens)
         self.per_sample_output = per_sample_output or metrics_output
         self.step_trace_output = step_trace_output
@@ -477,6 +481,15 @@ class LLaDAModel(BaseModel):
         per_sample_records = []
         step_trace_records = []
         for i in range(batch_size):
+            visible_tokens_by_block = None
+            completion_rate_by_block = None
+            if trace:
+                all_visible = trace.get('visible_tokens_by_block') or []
+                all_completion = trace.get('completion_rate_by_block') or []
+                if i < len(all_visible):
+                    visible_tokens_by_block = all_visible[i]
+                if i < len(all_completion):
+                    completion_rate_by_block = all_completion[i]
             if self._profile_sample_idx < len(self.profile_sample_indices):
                 sample_idx = int(self.profile_sample_indices[self._profile_sample_idx])
             else:
@@ -501,6 +514,12 @@ class LLaDAModel(BaseModel):
                 'planned_parallelism': trace.get('planned_parallelism') if trace else None,
                 'schedule_overrides_gen_steps': trace.get('schedule_overrides_gen_steps') if trace else None,
                 'token_selection_confidence_threshold': self.token_selection_confidence_threshold,
+                'threshold_schedule_label': self.threshold_schedule_label,
+                'token_selection_confidence_threshold_schedule': trace.get('token_selection_confidence_threshold_schedule') if trace else self.token_selection_confidence_threshold_schedule,
+                'schedule_overrides_scalar_threshold': trace.get('schedule_overrides_scalar_threshold') if trace else None,
+                'block_thresholds': trace.get('block_thresholds') if trace else self.token_selection_confidence_threshold_schedule,
+                'visible_tokens_by_block': visible_tokens_by_block,
+                'completion_rate_by_block': completion_rate_by_block,
                 'min_transfer_tokens': self.min_transfer_tokens,
                 'context_length': self.context_length,
                 'needle_position': self.needle_position,
@@ -545,6 +564,9 @@ class LLaDAModel(BaseModel):
                         'block_idx': step.get('block_idx'),
                         'block_steps': step.get('block_steps'),
                         'block_planned_parallelism': step.get('block_planned_parallelism'),
+                        'block_threshold': step.get('block_threshold'),
+                        'block_visible_tokens': step.get('block_visible_tokens'),
+                        'block_completion_rate': step.get('block_completion_rate'),
                         'mask_count_before': step.get('mask_count_before'),
                         'mask_count_after': step.get('mask_count_after'),
                         'selected_positions': step.get('selected_positions') or [],
@@ -601,6 +623,7 @@ class LLaDAModel(BaseModel):
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
         print('token_selection_confidence_threshold:', self.token_selection_confidence_threshold)
+        print('threshold_schedule_label:', self.threshold_schedule_label, 'token_selection_confidence_threshold_schedule:', self.token_selection_confidence_threshold_schedule)
         print('min_transfer_tokens:', self.min_transfer_tokens, 'per_sample_output:', self.per_sample_output, 'step_trace_output:', self.step_trace_output, 'return_trace:', self.return_trace)
         print('trace_token_snapshots:', self.trace_token_snapshots, 'trace_decode_snapshots:', self.trace_decode_snapshots)
         print('final prompt:', prompt)
@@ -627,6 +650,7 @@ class LLaDAModel(BaseModel):
             confidence_eos_eot_inf = self.diff_confidence_eos_eot_inf,
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
+            token_selection_confidence_threshold_schedule = self.token_selection_confidence_threshold_schedule,
             min_transfer_tokens = self.min_transfer_tokens,
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
@@ -774,6 +798,7 @@ class LLaDABaseModel(LLaDAModel):
         print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
         print('token_selection_confidence_threshold:', self.token_selection_confidence_threshold)
+        print('threshold_schedule_label:', self.threshold_schedule_label, 'token_selection_confidence_threshold_schedule:', self.token_selection_confidence_threshold_schedule)
         print('min_transfer_tokens:', self.min_transfer_tokens, 'per_sample_output:', self.per_sample_output, 'step_trace_output:', self.step_trace_output, 'return_trace:', self.return_trace)
         print('trace_token_snapshots:', self.trace_token_snapshots, 'trace_decode_snapshots:', self.trace_decode_snapshots)
         print('final prompt:', prompt)
@@ -800,6 +825,7 @@ class LLaDABaseModel(LLaDAModel):
             confidence_eos_eot_inf = self.diff_confidence_eos_eot_inf,
             logits_eos_inf = self.diff_logits_eos_inf,
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
+            token_selection_confidence_threshold_schedule = self.token_selection_confidence_threshold_schedule,
             min_transfer_tokens = self.min_transfer_tokens,
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,

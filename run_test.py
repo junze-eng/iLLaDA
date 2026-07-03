@@ -283,6 +283,19 @@ def schedule_label(value: Any) -> str:
     return "schedule" + "_".join(str(item) for item in items)
 
 
+def threshold_schedule_label(value: Any) -> str:
+    items = as_list(value)
+    if not items:
+        return ""
+    labels = []
+    for item in items:
+        if item is None:
+            labels.append("none")
+        else:
+            labels.append(str(item).replace(".", "p"))
+    return "thrsch" + "_".join(labels)
+
+
 def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], idx: int) -> str:
     """Name a run by the actual config values, with idx only as a fallback."""
     parts = [exp_name, benchmark]
@@ -308,10 +321,15 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
         parts.append(f"speed{params.get('speed_schedule_label')}")
     if params.get("steps_per_block_schedule") is not None and params.get("speed_schedule_label") is None:
         parts.append(schedule_label(params.get("steps_per_block_schedule")))
+    if params.get("threshold_schedule_label") is not None:
+        parts.append(f"thr{params.get('threshold_schedule_label')}")
+    elif params.get("token_selection_confidence_threshold_schedule") is not None:
+        parts.append(threshold_schedule_label(params.get("token_selection_confidence_threshold_schedule")))
     if "token_selection_confidence_threshold" in params:
         threshold = params.get("token_selection_confidence_threshold")
         threshold_label = "none" if threshold is None else str(threshold).replace(".", "p")
-        parts.append(f"thr{threshold_label}")
+        if params.get("threshold_schedule_label") is None and params.get("token_selection_confidence_threshold_schedule") is None:
+            parts.append(f"thr{threshold_label}")
     if len(parts) <= 2:
         parts.append(str(idx))
     return safe_name("_".join(str(part) for part in parts))
@@ -389,12 +407,10 @@ def render_opencompass_config(
             raise SystemExit("sample_indices cannot be empty.")
         sorted_indices = sorted(indices)
         expected = list(range(sorted_indices[0], sorted_indices[-1] + 1))
-        if sorted_indices != expected:
-            raise SystemExit(
-                "OpenCompass partitioners require contiguous sample_indices. "
-                f"Got: {indices}"
-            )
-        test_range = f"[{sorted_indices[0]}:{sorted_indices[-1] + 1}]"
+        if sorted_indices == expected:
+            test_range = f"[{sorted_indices[0]}:{sorted_indices[-1] + 1}]"
+        else:
+            test_range = "indices:" + ",".join(str(index) for index in indices)
         imports.append(f"_sample_test_range = {python_literal(test_range)}")
         imports.append("for _dataset in datasets:")
         imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
@@ -822,6 +838,10 @@ def write_run_summary(
         "planned_parallelism_mean": mean(planned_parallelism),
         "steps_per_block_schedule": samples[0].get("steps_per_block_schedule") if samples else None,
         "speed_schedule_name": samples[0].get("speed_schedule_name") if samples else params.get("speed_schedule_name"),
+        "threshold_schedule_label": samples[0].get("threshold_schedule_label") if samples else params.get("threshold_schedule_label"),
+        "token_selection_confidence_threshold_schedule": samples[0].get("token_selection_confidence_threshold_schedule") if samples else params.get("token_selection_confidence_threshold_schedule"),
+        "visible_tokens_by_block": samples[0].get("visible_tokens_by_block") if samples else None,
+        "completion_rate_by_block": samples[0].get("completion_rate_by_block") if samples else None,
         "threshold_pass_rate_mean": mean(threshold_pass_rates),
         "fallback_rate_mean": mean(fallback_rates),
         "effective_parallelism_mean": mean(effective_parallelism),
@@ -862,6 +882,10 @@ def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "arness_mean": row.get("arness_mean"),
         "actual_arness_mean": row.get("actual_arness_mean"),
         "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
+        "threshold_schedule_label": row.get("threshold_schedule_label") or row.get("param_threshold_schedule_label"),
+        "token_selection_confidence_threshold_schedule": row.get("token_selection_confidence_threshold_schedule") or row.get("param_token_selection_confidence_threshold_schedule"),
+        "visible_tokens_by_block": row.get("visible_tokens_by_block"),
+        "completion_rate_by_block": row.get("completion_rate_by_block"),
         "min_transfer_tokens": row.get("param_min_transfer_tokens"),
         "context_length": row.get("param_context_length"),
         "needle_position": row.get("param_needle_position"),

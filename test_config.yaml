@@ -188,7 +188,7 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
         sweep:
-          gen_steps: [512, 256, 128, 64, 32]
+          gen_steps: [512, 256, 128]
           token_selection_confidence_threshold: [null, 0.6, 0.8]
 
   temp_threshold_study:
@@ -422,6 +422,78 @@ tasks:
           steps_per_block_schedule: [8, 8, 8, 16, 16, 16, 32, 32]
           min_transfer_tokens: 1
           token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+  dynamic_threshold_gsm8k:
+    description: "Exploratory GSM8K per-block confidence-threshold schedule study."
+    output_path: outputs/dynamic_threshold_gsm8k
+    experiments:
+      - name: dynthr_gsm8k_sample7_13_21_34_55_steps128_static_mid
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 32
+          gen_steps: 128
+          threshold_schedule_label: static_mid
+          token_selection_confidence_threshold_schedule: [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynthr_gsm8k_sample7_13_21_34_55_steps128_high_to_low
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 32
+          gen_steps: 128
+          threshold_schedule_label: high_to_low
+          token_selection_confidence_threshold_schedule: [0.8, 0.8, 0.6, 0.6, 0.6, 0.6, null, null]
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynthr_gsm8k_sample7_13_21_34_55_steps64_static_mid
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 32
+          gen_steps: 64
+          threshold_schedule_label: static_mid
+          token_selection_confidence_threshold_schedule: [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: dynthr_gsm8k_sample7_13_21_34_55_steps64_high_to_low
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 32
+          gen_steps: 64
+          threshold_schedule_label: high_to_low
+          token_selection_confidence_threshold_schedule: [0.8, 0.8, 0.6, 0.6, 0.6, 0.6, null, null]
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
           temperature: 0.0
           cfg: 0.0
           return_trace: true
