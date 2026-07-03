@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "context_light_ui_v2"
+SCRIPT_VERSION = "context_light_ui_v3_rawprompt_128"
 
 def find_repo_root(start: Path) -> Path:
     """Find repo root so this file can live either in repo root or tools/."""
@@ -76,8 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--gen-length", type=int, default=64)
-    parser.add_argument("--gen-steps", type=int, default=64)
+    parser.add_argument("--gen-length", type=int, default=128)
+    parser.add_argument("--gen-steps", type=int, default=128)
     parser.add_argument("--gen-blocksize", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cfg", type=float, default=0.0)
@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     # Correct iLLaDA/LLaDA [MASK] token id. Do not use 5 here.
     parser.add_argument("--mask-id", type=int, default=126336)
-    parser.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--add-special-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only list selected samples; do not load model.")
