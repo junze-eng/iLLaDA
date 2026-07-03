@@ -528,3 +528,23 @@ tasks:
           return_trace: true
           trace_token_snapshots: false
           trace_decode_snapshots: false
+
+  step0_confidence_probe:
+    description: "Cheap ARness probe: record the model's confidence for every generation-region position (not just committed ones) at the very first diffusion step, to see how initial confidence decays with distance from the prompt. Same 5 samples as dynamic_threshold_gsm8k for consistency. Single block (block_length=gen_length) so step 0 covers the whole generation region."
+    output_path: outputs/step0_confidence_probe
+    experiments:
+      - name: step0_confidence_gsm8k_sample7_13_21_34_55
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 256
+          gen_steps: 256
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_step0_full_confidence: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false

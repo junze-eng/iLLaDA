@@ -126,7 +126,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              min_transfer_tokens=1, return_trace=False, trace_token_snapshots=False,
              tokenizer=None, stop_token_ids=None, speed_schedule_name: Optional[str] = None,
              steps_per_block_schedule: Optional[List[int]] = None,
-             token_selection_confidence_threshold_schedule: Optional[List[Optional[float]]] = None):
+             token_selection_confidence_threshold_schedule: Optional[List[Optional[float]]] = None,
+             trace_step0_full_confidence: bool = False):
     '''
     Args:
         model: Mask predictor.
@@ -150,6 +151,9 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         speed_schedule_name: Optional named per-block speed schedule.
         steps_per_block_schedule: Optional explicit denoising-step count for each block.
         token_selection_confidence_threshold_schedule: Optional per-block confidence threshold schedule.
+        trace_step0_full_confidence: If True (and return_trace=True), record the model's confidence for
+            every generation-region position (not just selected ones) at the very first diffusion step,
+            to study how initial confidence decays with distance from the prompt.
     '''
     stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
 
@@ -224,6 +228,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'actual_transfer_count': 0,
         'step_stats': [],
         'token_snapshots': [] if trace_token_snapshots else None,
+        'step0_confidence_by_position': [] if trace_step0_full_confidence else None,
     } if return_trace else None
 
     global_step_offset = 0
@@ -271,6 +276,10 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 for token_id in stop_token_ids:
                     stop_predictions |= x0 == token_id
                 confidence = torch.where(stop_predictions, torch.full_like(confidence, -torch.inf), confidence)
+
+            if trace_step0_full_confidence and trace is not None and step_idx == 0:
+                gen_region_confidence = confidence[:, prompt.shape[1]:]
+                trace['step0_confidence_by_position'] = gen_region_confidence.detach().cpu().tolist()
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             step_scheduled_count = 0
