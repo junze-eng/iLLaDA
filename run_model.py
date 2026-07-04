@@ -18,6 +18,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -30,7 +31,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 from run_test import (  # reuse the existing repo config/rendering logic
     OPENCOMPASS_DIR,
     ROOT,
-    arness_visual_condition_label,
     as_list,
     build_model_cfg,
     compact_experiment_name,
@@ -167,6 +167,38 @@ def model_alias(model_cfg: Dict[str, Any], override: Optional[str] = None) -> st
 
 
 
+
+def arness_visual_condition_label(benchmark: str, params: Dict[str, Any]) -> Optional[str]:
+    """Compact trace-friendly condition label used by run_model outputs.
+
+    Older run_test.py files do not define this helper.  Keep it local here so
+    run_model.py can run against the existing repo while preserving readable
+    ARness folders such as ``s6_l1024_b32_st1024_thr0p6``.
+    """
+    if not (
+        params.get("return_trace")
+        or params.get("trace_token_snapshots")
+        or params.get("trace_decode_snapshots")
+    ):
+        return None
+    pieces: List[str] = []
+    sample_indices = params.get("sample_indices")
+    if isinstance(sample_indices, (list, tuple)) and len(sample_indices) == 1:
+        pieces.append(f"s{sample_indices[0]}")
+    elif sample_indices not in (None, ""):
+        pieces.append("samples" + safe_name(str(sample_indices)))
+    if params.get("gen_length") is not None:
+        pieces.append(f"l{params.get('gen_length')}")
+    if params.get("gen_blocksize") is not None:
+        pieces.append(f"b{params.get('gen_blocksize')}")
+    if params.get("gen_steps") is not None:
+        pieces.append(f"st{params.get('gen_steps')}")
+    threshold = params.get("token_selection_confidence_threshold")
+    if threshold is not None:
+        pieces.append("thr" + safe_name(str(threshold).replace(".", "p")))
+    return "_".join(pieces) if pieces else None
+
+
 def localize_opencompass_config_text(text: str) -> str:
     """Keep run_test-style OpenCompass config imports unchanged.
 
@@ -238,6 +270,177 @@ def run_command(command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
 
 
 
+
+
+
+def _to_number(value: str) -> Any:
+    value = str(value).strip()
+    if value == "" or value.lower() in {"n/a", "nan", "none", "[not supported]"}:
+        return None
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _query_nvidia_smi() -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Return one row per GPU from nvidia-smi, or an error string.
+
+    This helper is intentionally best-effort: telemetry must never break model
+    inference.  It is used both for one-shot before/after snapshots and for the
+    optional gpu.csv sampler.
+    """
+    query = "index,name,memory.used,memory.total,utilization.gpu,power.draw"
+    command = [
+        "nvidia-smi",
+        f"--query-gpu={query}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        output = subprocess.check_output(
+            command,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=8,
+        )
+    except FileNotFoundError:
+        return [], "nvidia-smi not found"
+    except subprocess.TimeoutExpired:
+        return [], "nvidia-smi timed out"
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.output or "").strip() or repr(exc)
+        return [], msg
+    except Exception as exc:
+        return [], repr(exc)
+
+    rows: List[Dict[str, Any]] = []
+    for parts in csv.reader(output.splitlines()):
+        if len(parts) < 6:
+            continue
+        rows.append(
+            {
+                "gpu_index": _to_number(parts[0]),
+                "name": parts[1].strip(),
+                "memory_used_mib": _to_number(parts[2]),
+                "memory_total_mib": _to_number(parts[3]),
+                "utilization_gpu_pct": _to_number(parts[4]),
+                "power_draw_w": _to_number(parts[5]),
+            }
+        )
+    return rows, None
+
+
+def current_gpu_snapshot() -> Dict[str, Any]:
+    """Best-effort GPU snapshot for infer_manifest.jsonl.
+
+    The previous run_model.py wrote gpu_before/gpu_after but did not define this
+    function, causing NameError before OpenCompass was even launched.  Keep the
+    field, but make failure non-fatal on machines without nvidia-smi.
+    """
+    rows, error = _query_nvidia_smi()
+    snapshot: Dict[str, Any] = {
+        "timestamp": utc_now(),
+        "available": bool(rows),
+        "gpus": rows,
+    }
+    if error:
+        snapshot["error"] = error
+    return snapshot
+
+
+class GpuTelemetry:
+    """Background nvidia-smi sampler that writes work_dir/gpu.csv.
+
+    Telemetry is deliberately non-blocking and best-effort.  Any nvidia-smi
+    failure is recorded as a row in gpu.csv and inference continues.
+    """
+
+    FIELDNAMES = [
+        "timestamp",
+        "gpu_index",
+        "name",
+        "memory_used_mib",
+        "memory_total_mib",
+        "utilization_gpu_pct",
+        "power_draw_w",
+        "status",
+        "error",
+    ]
+
+    def __init__(self, path: Path, interval_seconds: float = 1.0) -> None:
+        self.path = Path(path)
+        self.interval_seconds = max(float(interval_seconds), 0.2)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval_seconds * 2, 1.0))
+
+    def _append_rows(self, rows: List[Dict[str, Any]]) -> None:
+        exists = self.path.exists() and self.path.stat().st_size > 0
+        with self.path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES, extrasaction="ignore")
+            if not exists:
+                writer.writeheader()
+            writer.writerows(rows)
+
+    def _sample_once(self) -> None:
+        timestamp = utc_now()
+        rows, error = _query_nvidia_smi()
+        if rows:
+            out_rows = [
+                {"timestamp": timestamp, "status": "ok", "error": "", **row}
+                for row in rows
+            ]
+        else:
+            out_rows = [
+                {
+                    "timestamp": timestamp,
+                    "gpu_index": "",
+                    "name": "",
+                    "memory_used_mib": "",
+                    "memory_total_mib": "",
+                    "utilization_gpu_pct": "",
+                    "power_draw_w": "",
+                    "status": "error",
+                    "error": error or "no gpu rows returned",
+                }
+            ]
+        self._append_rows(out_rows)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._sample_once()
+            except Exception as exc:
+                try:
+                    self._append_rows(
+                        [
+                            {
+                                "timestamp": utc_now(),
+                                "gpu_index": "",
+                                "name": "",
+                                "memory_used_mib": "",
+                                "memory_total_mib": "",
+                                "utilization_gpu_pct": "",
+                                "power_draw_w": "",
+                                "status": "error",
+                                "error": repr(exc),
+                            }
+                        ]
+                    )
+                except Exception:
+                    pass
+            self._stop.wait(self.interval_seconds)
 
 
 def _find_opencompass_configs_dir() -> Optional[Path]:
