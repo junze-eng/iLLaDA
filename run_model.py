@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""
-Run model inference only for the YAML experiment config.
+"""Run model inference only for the YAML experiment config.
 
 This is the GPU-side half of the split workflow:
-  test_config.yaml -> generated OpenCompass config -> OpenCompass -m infer
+    test_config.yaml -> generated OpenCompass config -> OpenCompass -m infer
 
-Outputs are written under the same condition layout as run_test.py, rooted at
-model_outputs/ by default:
-  model_outputs/<task_name>/<compact_experiment>/<visual_condition>/
+Raw model outputs are written under model_outputs/<model>/<task>/... by default,
+so a GPU run can be copied back and evaluated later without mixing models:
+    model_outputs/iLLaDA/arness/...
 
-It intentionally does not run OpenCompass evaluation. Use run_outputs.py later
-on the saved model_outputs directory to evaluate/reuse the inference outputs.
+Use run_outputs.py later on the saved model_outputs tree to run OpenCompass
+reuse/eval and materialize the scored final artifacts under outputs/<task>/...
 """
-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -67,8 +66,58 @@ def utc_now() -> str:
 
 
 def resolve_under_root(path_like: str | Path) -> Path:
-    path = Path(path_like)
-    return path if path.is_absolute() else ROOT / path
+    """Resolve a CLI/config path robustly across repo and parent dirs.
+
+    Common Windows usage in this project is mixed: sometimes commands are run
+    from inside the repo (``model_outputs/...``), sometimes from the parent
+    directory (``iLLaDA/model_outputs/...``).  Prefer an existing path from
+    cwd first, then repo ROOT, and specially handle paths prefixed by ROOT.name.
+    """
+    path = Path(os.path.expanduser(str(path_like)))
+    if path.is_absolute():
+        return path
+
+    candidates: List[Path] = []
+    if path.parts and path.parts[0] == ROOT.name:
+        candidates.append(ROOT.parent / path)
+    candidates.extend([Path.cwd() / path, ROOT / path])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else ROOT / path
+
+
+def configured_model_output_root(execution_cfg: Dict[str, Any], cli_value: Optional[str]) -> Path:
+    """Return the raw model_outputs root before appending the model alias."""
+    value = (
+        cli_value
+        or execution_cfg.get("model_output_dir")
+        or execution_cfg.get("model_outputs_dir")
+        or execution_cfg.get("model_output_root")
+        or "model_outputs"
+    )
+    return resolve_under_root(str(value))
+
+
+def contains_model_outputs_alias(path: Path, model_name: str) -> bool:
+    """Whether path already contains model_outputs/<model_name> as a segment pair."""
+    parts = tuple(path.parts)
+    for i in range(len(parts) - 1):
+        if parts[i] == "model_outputs" and parts[i + 1] == model_name:
+            return True
+    return False
+
+
+def append_model_alias_once(raw_root: Path, model_name: str) -> Path:
+    """Append model alias only when raw_root is a generic model_outputs root.
+
+    The current project often uses fully resolved roots such as:
+        model_outputs/iLLaDA/arness/mbpp_s6
+    In that case we must not append another iLLaDA segment.
+    """
+    if raw_root.name == model_name or contains_model_outputs_alias(raw_root, model_name):
+        return raw_root
+    return raw_root / model_name
 
 
 def rel_to(path: Path, base: Path) -> str:
@@ -76,6 +125,45 @@ def rel_to(path: Path, base: Path) -> str:
         return str(path.relative_to(base))
     except ValueError:
         return str(path)
+
+
+def safe_path_segment(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^0-9A-Za-z._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or "model"
+
+
+def model_alias(model_cfg: Dict[str, Any], override: Optional[str] = None) -> str:
+    """Return the folder name used under model_outputs/.
+
+    Prefer an explicit CLI/config alias, otherwise use a compact canonical name
+    for common project models.  This keeps paths like model_outputs/iLLaDA/...
+    instead of a long HuggingFace repo name.
+    """
+    if override:
+        return safe_path_segment(override)
+
+    for key in ("output_name", "output_alias", "model_alias", "name"):
+        value = model_cfg.get(key)
+        if value:
+            return safe_path_segment(value)
+
+    raw = str(
+        model_cfg.get("abbr")
+        or model_cfg.get("path")
+        or model_cfg.get("model_path")
+        or model_cfg.get("backend")
+        or "model"
+    )
+    lowered = raw.lower()
+    if "w1-4b" in lowered or "w1_4b" in lowered:
+        return "W1-4B"
+    if "illada" in lowered:
+        return "iLLaDA"
+    if "llada" in lowered:
+        return "LLaDA"
+    return safe_path_segment(Path(raw).name if "/" in raw else raw)
 
 
 def strip_opencompass_control_args(args: Sequence[Any] | None) -> List[str]:
@@ -146,14 +234,16 @@ def current_gpu_snapshot() -> Dict[str, Any]:
     ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=10
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"available": False}
-
     if result.returncode != 0:
         return {"available": False, "error": result.stderr.strip()}
-
     rows: List[Dict[str, Any]] = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
@@ -211,7 +301,11 @@ class GpuTelemetry:
                 timestamp = utc_now()
                 try:
                     result = subprocess.run(
-                        query, capture_output=True, text=True, check=False, timeout=10
+                        query,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10,
                     )
                     if result.returncode == 0:
                         for line in result.stdout.splitlines():
@@ -254,8 +348,34 @@ def latest_opencompass_timestamp(work_dir: Path) -> Optional[str]:
 
 
 def experiment_root(output_root: Path, experiment: Dict[str, Any], compact_exp_name: str) -> Path:
+    """Return the experiment folder without duplicating task/experiment suffixes.
+
+    Supported config/CLI styles:
+      - model_outputs                  -> model_outputs/<model>/<task>/<exp>
+      - model_outputs/iLLaDA           -> model_outputs/iLLaDA/<task>/<exp>
+      - model_outputs/iLLaDA/arness    -> model_outputs/iLLaDA/arness/<exp>
+      - model_outputs/iLLaDA/arness/mbpp_s6 -> unchanged
+    The same logic also keeps outputs/arness/mbpp_s6 from becoming
+    outputs/arness/mbpp_s6/arness/mbpp_s6 during eval materialization.
+    """
     task = safe_name(str(experiment.get("task") or "runs"))
-    return output_root / task / compact_exp_name
+    compact = safe_name(str(compact_exp_name))
+
+    # Already points to the concrete experiment directory.  This is the
+    # user's current layout, e.g. iLLaDA/model_outputs/iLLaDA/arness/mbpp_s6.
+    if output_root.name == compact:
+        return output_root
+
+    # Already points to the task directory.
+    if output_root.name == task:
+        return output_root / compact
+
+    # Already ends in <task>/<compact>, even if path separators were resolved
+    # from a copied Windows tree.
+    if len(output_root.parts) >= 2 and output_root.parts[-2:] == (task, compact):
+        return output_root
+
+    return output_root / task / compact
 
 
 def read_jsonl_count(path: Path) -> int:
@@ -291,15 +411,27 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-root",
-        default="model_outputs",
-        help="Root for saved inference outputs. Default: model_outputs",
+        default=None,
+        help=(
+            "Root for saved raw model outputs. Default: config execution.model_output_dir "
+            "or model_outputs. The model alias is appended unless --flat-output-root is set."
+        ),
+    )
+    parser.add_argument(
+        "--model-alias",
+        default=None,
+        help="Folder name under model_outputs/. Default is inferred from model config, e.g. iLLaDA.",
+    )
+    parser.add_argument(
+        "--flat-output-root",
+        action="store_true",
+        help="Do not insert the model alias under --output-root. Kept only for old copied trees.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print commands only.")
     args = parser.parse_args()
 
     config_path = resolve_under_root(args.config)
     config = load_yaml(config_path)
-
     execution_cfg = config.get("execution", {}) or {}
     data_cfg = config.get("data", {}) or {}
     global_model = config.get("model", {}) or {}
@@ -311,36 +443,37 @@ def main() -> int:
     if not experiments:
         raise SystemExit("No experiments matched.")
 
-    output_root = resolve_under_root(args.output_root)
+    raw_output_root = configured_model_output_root(execution_cfg, args.output_root)
+    model_name = model_alias(global_model, args.model_alias)
+    output_root = raw_output_root if args.flat_output_root else append_model_alias_once(raw_output_root, model_name)
+    final_output_root = resolve_under_root(str(execution_cfg.get("output_dir") or "outputs"))
     dry_run = args.dry_run or bool(execution_cfg.get("dry_run", False))
     extra_opencompass_args = strip_opencompass_control_args(
         execution_cfg.get("opencompass_args", []) or []
     )
-
     telemetry_cfg = execution_cfg.get("gpu_telemetry", {}) or {}
     telemetry_enabled = bool(telemetry_cfg.get("enabled", True))
     telemetry_interval = float(telemetry_cfg.get("interval_seconds", 1.0))
 
     env = build_env()
     planned = 0
-
     for experiment in experiments:
         exp_name = experiment.get("name")
         if not exp_name:
             raise SystemExit("Every experiment needs a `name`.")
-
         benchmark_list = as_list(experiment.get("benchmark"))
         first_benchmark = str(benchmark_list[0]) if benchmark_list else None
         compact_exp_dir = compact_experiment_name(experiment, first_benchmark)
         exp_root = experiment_root(output_root, experiment, compact_exp_dir)
+        final_exp_root = experiment_root(final_output_root, experiment, compact_exp_dir)
         generated_dir = exp_root / "generated_configs"
         generated_dir.mkdir(parents=True, exist_ok=True)
         infer_manifest = exp_root / "infer_manifest.jsonl"
         infer_csv = exp_root / "infer_runs.csv"
+
         expanded_params = [deep_merge(default_params, p) for p in expand_matrix(experiment)]
         include_keys = varying_param_keys(expanded_params)
         used_labels: Set[str] = set()
-
         for benchmark in benchmark_list:
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 planned += 1
@@ -348,20 +481,23 @@ def main() -> int:
                 run_name = condition_run_name(exp_name, benchmark, merged_params, idx)
                 visual_label = arness_visual_condition_label(benchmark, merged_params)
                 run_label = unique_label(
-                    visual_label or compact_run_label(merged_params, include_keys, compact_exp_dir, idx),
+                    visual_label
+                    or compact_run_label(merged_params, include_keys, compact_exp_dir, idx),
                     used_labels,
                     idx,
                 )
                 work_dir = exp_root / run_label
+                final_work_dir = final_exp_root / run_label
                 work_dir.mkdir(parents=True, exist_ok=True)
 
                 model_cfg = build_model_cfg(
                     deepcopy(global_model), merged_params, benchmark, run_label
                 )
                 model_cfg["task_id"] = experiment.get("task")
+                model_cfg.setdefault("model_output_alias", model_name)
 
                 # Keep raw model output and optional trace outside OpenCompass timestamp
-                # folders, so they are easy to find and copy back locally.
+                # folders, so they are easy to find/copy back from the GPU machine.
                 outputs_jsonl = work_dir / "outputs.jsonl"
                 summary_jsonl = work_dir / "summary.jsonl"
                 trace_jsonl = work_dir / "trace.jsonl"
@@ -391,6 +527,10 @@ def main() -> int:
                     "mode": "infer",
                     "created_at": utc_now(),
                     "source_config": str(config_path),
+                    "model_name": model_name,
+                    "raw_output_root": str(raw_output_root),
+                    "model_output_root": str(output_root),
+                    "final_output_root": str(final_output_root),
                     "task": experiment.get("task"),
                     "experiment": exp_name,
                     "compact_experiment": compact_exp_dir,
@@ -403,6 +543,7 @@ def main() -> int:
                     "runner": runner_cfg,
                     "generated_opencompass_config": str(generated_config),
                     "work_dir": str(work_dir),
+                    "final_work_dir": str(final_work_dir),
                     "output_files": {
                         "outputs_jsonl": str(outputs_jsonl),
                         "summary_jsonl": str(summary_jsonl),
@@ -429,6 +570,10 @@ def main() -> int:
                     "created_at": utc_now(),
                     "mode": "infer",
                     "dry_run": dry_run,
+                    "model_name": model_name,
+                    "raw_output_root": str(raw_output_root),
+                    "model_output_root": str(output_root),
+                    "final_output_root": str(final_output_root),
                     "task": experiment.get("task"),
                     "experiment": exp_name,
                     "benchmark": benchmark,
@@ -442,6 +587,8 @@ def main() -> int:
                     "config_rel": rel_to(generated_config, exp_root),
                     "work_dir": str(work_dir),
                     "work_dir_rel": rel_to(work_dir, exp_root),
+                    "final_work_dir": str(final_work_dir),
+                    "final_work_dir_rel": rel_to(final_work_dir, final_output_root),
                     "outputs_jsonl": str(outputs_jsonl),
                     "outputs_jsonl_rel": rel_to(outputs_jsonl, exp_root),
                     "summary_jsonl": str(summary_jsonl),
@@ -453,8 +600,10 @@ def main() -> int:
                     "gpu_before": current_gpu_snapshot(),
                 }
 
-                print(f"\n[infer:{run_name}] config: {generated_config}")
+                print(f"\n[infer:{run_name}] model: {model_name}")
+                print(f"[infer:{run_name}] config: {generated_config}")
                 print(f"[infer:{run_name}] work_dir: {work_dir}")
+                print(f"[infer:{run_name}] final after eval: {final_work_dir}")
 
                 if dry_run:
                     print("[dry-run] " + " ".join(command))
@@ -473,14 +622,12 @@ def main() -> int:
                             interval_seconds=telemetry_interval,
                         )
                         telemetry.start()
-
                     started = time.perf_counter()
                     try:
                         returncode = run_command(command, OPENCOMPASS_DIR, env)
                     finally:
                         if telemetry is not None:
                             telemetry.stop()
-
                     elapsed = round(time.perf_counter() - started, 3)
                     copy_aliases_for_visualizer(outputs_jsonl, summary_jsonl)
                     after_timestamps = opencompass_timestamp_dirs(work_dir)
@@ -490,7 +637,6 @@ def main() -> int:
                         if new_timestamps
                         else latest_opencompass_timestamp(work_dir)
                     )
-
                     manifest_record.update(
                         {
                             "returncode": returncode,
@@ -502,11 +648,11 @@ def main() -> int:
                             "trace_exists": trace_jsonl.exists(),
                         }
                     )
-
                     append_csv(
                         infer_csv,
                         {
                             "created_at": manifest_record["created_at"],
+                            "model_name": model_name,
                             "run_label": run_label,
                             "run_name": run_name,
                             "benchmark": benchmark,
@@ -516,10 +662,10 @@ def main() -> int:
                             "output_records": manifest_record["num_output_records"],
                             "summary_records": manifest_record["num_summary_records"],
                             "work_dir": str(work_dir),
+                            "final_work_dir": str(final_work_dir),
                             "visual_command": manifest_record["visual_command"],
                         },
                     )
-
                     if returncode != 0 and execution_cfg.get("stop_on_error", True):
                         append_jsonl(infer_manifest, manifest_record)
                         return returncode
@@ -527,7 +673,8 @@ def main() -> int:
                 append_jsonl(infer_manifest, manifest_record)
 
     print(f"\nPlanned {planned} inference run(s).")
-    print(f"Outputs root: {output_root}")
+    print(f"Raw outputs root: {output_root}")
+    print(f"Final eval root: {final_output_root}")
     return 0
 
 

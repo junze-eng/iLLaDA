@@ -2,9 +2,9 @@
 #
 # Workflow:
 #   1) python prepare_data.py --config test_config_native.yaml --only <task-or-experiment> --force
-#   2) CUDA_VISIBLE_DEVICES=0 python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b] --auto-prepare
-#   3) python native_eval.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b]
-#   4) python native_plot_traces.py --root native_outputs --all
+#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b] --auto-prepare
+#   3) python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b]
+#   4) python native_visual.py --root native_outputs --all
 #
 # Paths:
 #   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl; GSM8K/MBPP/custom_math use original sources
@@ -13,7 +13,7 @@
 #   comparisons:     native_outputs/_compare/<task>/<benchmark>/<condition>/compare.csv
 #
 # Key idea: prepare_data.py is the single config-driven data source;
-# native_output.py loads each selected model ONCE and then runs all selected
+# native_model.py loads each selected model ONCE and then runs all selected
 # sweep conditions continuously. No OpenCompass CLI is used on this native path.
 
 run:
@@ -131,7 +131,7 @@ tasks:
           w1_steps: [64, 32, 16]
 
       - name: native_w1_trace_context_order2_sample0
-        benchmark: ruler_niah_order_2
+        benchmark: ruler_niah_double_2
         models: [w1_4b]
         params:
           num_samples: 1
@@ -175,7 +175,7 @@ tasks:
           w1_steps: [64, 32]
 
       - name: native_w1_score_context_order2_10
-        benchmark: ruler_niah_order_2
+        benchmark: ruler_niah_double_2
         models: [w1_4b]
         params:
           num_samples: 10
@@ -220,7 +220,7 @@ tasks:
           w1_steps: [64, 32, 16]
 
       - name: native_context_order2_smoke_compare
-        benchmark: ruler_niah_order_2
+        benchmark: ruler_niah_double_2
         models: [illada, w1_4b]
         params:
           num_samples: 3
@@ -289,7 +289,7 @@ tasks:
     description: "Two-needle long-context ordered retrieval for iLLaDA up to 8k."
     experiments:
       - name: native_context_order2_illada_2_4_8k
-        benchmark: ruler_niah_order_2
+        benchmark: ruler_niah_double_2
         models: [illada]
         params:
           num_samples: 20
@@ -309,7 +309,7 @@ tasks:
     description: "Two-needle ordered retrieval for W1-4B within its 4096-token limit."
     experiments:
       - name: native_context_order2_w1_2_4k
-        benchmark: ruler_niah_order_2
+        benchmark: ruler_niah_double_2
         models: [w1_4b]
         params:
           num_samples: 20

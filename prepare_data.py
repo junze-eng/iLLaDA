@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """Config-driven native data preparation.
 
-This file prepares the shared input jsonl used by the native side-channel.  The
-model runner never decides which samples belong to an experiment; it only reads
-the inputs selected here by `test_config_native.yaml`.
+This file keeps the original LLaDA data-preparation layout.
 
-Output schema:
+Only local RULER-style context data is materialized under:
 
-    data/prepared/<task>/<benchmark_alias>/<condition>/inputs.jsonl
+    data/prepared/<ruler_benchmark>/<condition_id>.jsonl
 
-Each row contains at least:
+GSM8K / MBPP / custom_math continue to use their original data sources
+(HuggingFace dataset cache or data/custom_math) and are not duplicated here.
 
-    {"prompt": "...", "answer": "...", "metadata": {...}}
+The only added context variant is:
 
-Standard datasets such as GSM8K and MBPP are exported into the same prepared
-layout as the new RULER-style tasks.  The only genuinely new benchmark added
-for the context extension is:
+    ruler_niah_double_2
 
-    ruler_niah_order_2
-
-which inserts two needle records and evaluates ordered retrieval.
+It sits next to ruler_niah_single_1 and inserts two needle records, requiring
+ordered retrieval of the two values.  `ruler_niah_order_2` is accepted as a
+backward-compatible alias.
 """
 
 from __future__ import annotations
@@ -94,7 +91,8 @@ BENCH_ALIASES = {
     "mbpp": "mbpp",
     "custom_math": "cmath",
     "ruler_niah_single_1": "niah1",
-    "ruler_niah_order_2": "niah2ord",
+    "ruler_niah_order_2": "niah2",
+    "ruler_niah_double_2": "niah2",
 }
 
 DEPTH_BY_POSITION = {"front": [15], "middle": [50], "back": [85], "end": [95]}
@@ -270,9 +268,9 @@ def ruler_prepared_condition_id(benchmark: str, params: Dict[str, Any]) -> str:
             f"samples{num_samples}_"
             f"seed{seed}"
         )
-    if benchmark == "ruler_niah_order_2":
+    if benchmark in {"ruler_niah_order_2", "ruler_niah_double_2"}:
         return safe_name(
-            "ruler_niah_order_2_"
+            f"{benchmark}_"
             f"ctx{params.get('context_length')}_"
             f"pair{params.get('needle_pair')}_"
             f"gen{gen_length}_"
@@ -283,13 +281,13 @@ def ruler_prepared_condition_id(benchmark: str, params: Dict[str, Any]) -> str:
 
 
 def prepared_file_for(root: Path, benchmark: str, params: Dict[str, Any]) -> Path:
-    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2", "ruler_niah_double_2"}:
         return root / benchmark / f"{ruler_prepared_condition_id(benchmark, params)}.jsonl"
     return root / benchmark / f"{condition_name(params)}.jsonl"
 
 
 def prepared_dir_for(root: Path, task: str, benchmark: str, params: Dict[str, Any]) -> Path:
-    # Backward-compatible helper retained for older native_output imports.
+    # Backward-compatible helper retained for older native_model imports.
     # New RULER data is stored as data/prepared/<benchmark>/<file>.jsonl, not
     # under task/native subdirectories.
     return root / benchmark / condition_name(params)
@@ -446,6 +444,98 @@ def prepare_custom_math(condition: Dict[str, Any], data_root: Path) -> List[Dict
             "metadata": {k: v for k, v in item.items() if k not in {"prompt", "question", "input", "answer", "target", "reference"}},
         })
     return rows
+
+
+def source_check(condition: Dict[str, Any], data_root: Path) -> Dict[str, Any]:
+    """Validate non-prepared data sources without materializing them.
+
+    GSM8K and MBPP stay in HuggingFace datasets cache.  This function only
+    tries to load the split and select the requested sample ids.  It writes no
+    per-sample data under data/prepared.  custom_math stays under data/custom_math.
+    """
+    benchmark = str(condition.get("benchmark"))
+    params = condition.get("params", {}) or {}
+    base = {
+        "task": condition.get("task"),
+        "experiment": condition.get("experiment"),
+        "benchmark": benchmark,
+        "condition": condition.get("condition"),
+        "params": params,
+    }
+
+    try:
+        if benchmark == "gsm8k":
+            ds = load_hf_dataset_any([
+                ("gsm8k", "main", "test"),
+                ("openai/gsm8k", "main", "test"),
+            ])
+            ids = selected_sample_ids(params, total=len(ds))
+            # Touch selected rows to catch index/schema/cache problems early.
+            for sid in ids:
+                _ = ds[int(sid)]
+            return {
+                **base,
+                "status": "ok",
+                "source_type": "huggingface_cache",
+                "source": "gsm8k/main/test",
+                "total_size": len(ds),
+                "selected_samples": len(ids),
+                "selected_indices": json.dumps(ids, ensure_ascii=False),
+                "prepared_file": "",
+            }
+
+        if benchmark == "mbpp":
+            ds = load_hf_dataset_any([
+                ("google-research-datasets/mbpp", "sanitized", "test"),
+                ("mbpp", "sanitized", "test"),
+                ("google-research-datasets/mbpp", None, "test"),
+                ("mbpp", None, "test"),
+            ])
+            ids = selected_sample_ids(params, total=len(ds))
+            for sid in ids:
+                _ = ds[int(sid)]
+            return {
+                **base,
+                "status": "ok",
+                "source_type": "huggingface_cache",
+                "source": "mbpp/test",
+                "total_size": len(ds),
+                "selected_samples": len(ids),
+                "selected_indices": json.dumps(ids, ensure_ascii=False),
+                "prepared_file": "",
+            }
+
+        if benchmark == "custom_math":
+            custom_root = data_root / "custom_math"
+            files = []
+            if custom_root.is_dir():
+                files.extend(sorted(custom_root.glob("*.jsonl")))
+                files.extend(sorted(custom_root.glob("*.json")))
+            if not files:
+                raise FileNotFoundError(f"custom_math data not found under {custom_root}")
+            # Reuse loader for index validation but do not write data/prepared.
+            rows = prepare_custom_math(condition, data_root)
+            return {
+                **base,
+                "status": "ok",
+                "source_type": "local_original",
+                "source": str(custom_root),
+                "total_size": "",
+                "selected_samples": len(rows),
+                "selected_indices": json.dumps([r.get("sample_id") for r in rows], ensure_ascii=False),
+                "prepared_file": "",
+            }
+
+        return {**base, "status": "skipped", "source_type": "unknown", "source": "", "prepared_file": ""}
+    except Exception as exc:
+        return {
+            **base,
+            "status": "failed",
+            "source_type": "huggingface_cache" if benchmark in {"gsm8k", "mbpp"} else "local_original",
+            "source": benchmark,
+            "error": repr(exc),
+            "prepared_file": "",
+        }
 
 
 # -------------------------- RULER-style generators -------------------------
@@ -638,7 +728,7 @@ def prepare_ruler_order2(condition: Dict[str, Any], haystack_path: Path) -> List
         rows.append({
             "task": condition["task"],
             "experiment": condition["experiment"],
-            "benchmark": "ruler_niah_order_2",
+            "benchmark": "ruler_niah_double_2",
             "sample_id": i,
             "prompt": prompt,
             "answer": [value1, value2],
@@ -659,7 +749,7 @@ def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: P
     """Prepare only synthetic RULER data.
 
     GSM8K / MBPP / custom_math already have existing data loaders and should
-    not be duplicated into data/prepared.  native_output.py will read those
+    not be duplicated into data/prepared.  native_model.py will read those
     original sources directly and only copy the exact selected inputs into
     model_outputs/<model>/... for provenance.
     """
@@ -669,7 +759,7 @@ def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: P
     if benchmark in {"gsm8k", "mbpp", "custom_math"}:
         return None
 
-    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2", "ruler_niah_double_2"}:
         haystack = Path(data_cfg.get("ruler_haystack_path", "data/ruler/paul_graham_essay.jsonl"))
         if not haystack.is_absolute():
             haystack = ROOT / haystack
@@ -716,8 +806,10 @@ def main() -> int:
                 f"- {condition['experiment']} / {condition['benchmark']} / {condition['condition']} "
                 "-> original dataset source, no prepared file needed"
             )
-            if not args.dry_run:
-                manifest_rows.append({
+            if args.dry_run:
+                continue
+            if args.skip_source_check:
+                check = {
                     "task": condition["task"],
                     "experiment": condition["experiment"],
                     "benchmark": condition["benchmark"],
@@ -725,8 +817,19 @@ def main() -> int:
                     "params": condition["params"],
                     "input_path": "original_source",
                     "num_samples": None,
-                    "status": "skipped_original_source",
-                })
+                    "status": "skipped_source_check",
+                    "source_type": "original",
+                    "prepared_file": "",
+                }
+            else:
+                check = source_check(condition, data_root)
+                check["input_path"] = "original_source"
+                check["num_samples"] = check.get("selected_samples")
+            if check.get("status") == "ok":
+                log(f"  [OK] {check.get('source_type')}: {check.get('source')} selected={check.get('selected_samples')}")
+            elif check.get("status") == "failed":
+                log(f"  [FAILED] {condition['benchmark']}: {check.get('error')}")
+            manifest_rows.append(check)
             continue
 
         exists = input_path.exists()
@@ -756,6 +859,10 @@ def main() -> int:
         write_jsonl(base_prepared / "prepared_manifest.jsonl", manifest_rows)
         write_csv(base_prepared / "prepared_manifest.csv", manifest_rows)
         log(f"Wrote manifest: {base_prepared / 'prepared_manifest.jsonl'}")
+        failed = [row for row in manifest_rows if row.get("status") == "failed"]
+        if failed:
+            log(f"Data source check failed for {len(failed)} condition(s).")
+            return 4
     return 0
 
 
