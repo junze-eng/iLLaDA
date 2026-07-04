@@ -2,8 +2,7 @@
 """Native GPU generation runner for iLLaDA / W1 experiments.
 
 This replaces the OpenCompass inference path for mechanism-oriented tests.  It
-reads the same `test_config.yaml`, reuses prepared `inputs.jsonl` files produced
-by `prepare_data.py`, and writes model outputs under:
+reads the same `test_config.yaml`, reuses shared RULER prepared files and original benchmark data sources, and writes model outputs under:
 
     model_outputs/<model_alias>/<task>/<benchmark_alias>/<condition>/
 
@@ -14,6 +13,7 @@ old repeated load cost across gen_steps/threshold/config sweeps.
 Supported backends:
   - illada: native masked-diffusion generation via generate.py
   - hf_causal / hf: HuggingFace AutoModelForCausalLM.generate
+  - w1_4b / whale4b: local WhaleTech W1-4B dLLM release via SamplingRunner
   - openai_compatible / api: POST /chat/completions style local/API model
 
 If the config has no top-level `models:` block, the legacy top-level `model:`
@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover
     ROOT = Path(__file__).resolve().parent
     from prepare_data import as_list, deep_merge, load_yaml, safe_name, collect_experiments, expand_matrix  # type: ignore
 
-from prepare_data import bench_alias, condition_name, prepared_dir_for, read_jsonl, write_jsonl, json_default
+from prepare_data import bench_alias, condition_name, prepared_dir_for, prepared_file_for, read_jsonl, write_jsonl, json_default
 
 
 def utc_now() -> str:
@@ -135,11 +135,61 @@ def output_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Pa
 
 
 def prepared_input_path(config: Dict[str, Any], condition: Dict[str, Any]) -> Path:
+    """Return shared prepared path.
+
+    RULER synthetic data follows the original LLaDA/OpenCompass layout:
+      data/prepared/<ruler_benchmark>/<condition>.jsonl
+    Standard datasets (GSM8K/MBPP/custom_math) are not materialized here;
+    the returned path is only a readable placeholder for dry-run messages.
+    """
     data_cfg = config.get("data", {}) or {}
-    base = Path(data_cfg.get("prepared_dir", "data/prepared")) / "native"
+    base = Path(data_cfg.get("prepared_dir", "data/prepared"))
     if not base.is_absolute():
         base = ROOT / base
-    return prepared_dir_for(base, condition["task"], condition["benchmark"], condition["params"]) / "inputs.jsonl"
+    benchmark = str(condition["benchmark"])
+    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+        return prepared_file_for(base, benchmark, condition["params"])
+    return base / benchmark / "original_source"
+
+
+def load_existing_or_prepared_inputs(config: Dict[str, Any], condition: Dict[str, Any], input_path: Path) -> Tuple[List[Dict[str, Any]], Optional[Path], str]:
+    """Load inputs for one condition.
+
+    RULER variants are read from shared data/prepared/<benchmark>/<file>.jsonl.
+    GSM8K / MBPP / custom_math reuse the original dataset sources rather than
+    duplicating data into prepared directories.
+    """
+    benchmark = str(condition.get("benchmark"))
+
+    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+        if input_path.exists():
+            return read_jsonl(input_path), input_path, str(input_path)
+        try:
+            import prepare_data as prep
+        except Exception as exc:
+            raise SystemExit(f"Missing prepared RULER file {input_path} and failed to import prepare_data: {exc}") from exc
+        data_cfg = config.get("data", {}) or {}
+        haystack = Path(data_cfg.get("ruler_haystack_path", "data/ruler/paul_graham_essay.jsonl"))
+        if not haystack.is_absolute():
+            haystack = ROOT / haystack
+        if benchmark == "ruler_niah_single_1":
+            return prep.prepare_ruler_single(condition, haystack), None, "fallback:ruler_niah_single_1"
+        return prep.prepare_ruler_order2(condition, haystack), None, "fallback:ruler_niah_order_2"
+
+    # Standard datasets: keep using the original source/caches.
+    try:
+        import prepare_data as prep
+    except Exception as exc:
+        raise SystemExit(f"Failed to import dataset loaders from prepare_data.py: {exc}") from exc
+
+    if benchmark == "gsm8k":
+        return prep.prepare_gsm8k(condition), None, "original:gsm8k/test"
+    if benchmark == "mbpp":
+        return prep.prepare_mbpp(condition), None, "original:mbpp/test"
+    if benchmark == "custom_math":
+        return prep.prepare_custom_math(condition, ROOT / "data"), None, "original:data/custom_math"
+
+    raise SystemExit(f"Unsupported benchmark `{benchmark}` in native_output.py")
 
 
 class GpuTelemetry:
@@ -378,21 +428,324 @@ class HFCausalAdapter(BaseAdapter):
         return GenerationResult(text=answer, elapsed=elapsed, tokens_generated=int(out.shape[1] - encoded["input_ids"].shape[1]))
 
 
+
+class W14BLocalAdapter(BaseAdapter):
+    """Local WhaleTech W1-4B dLLM backend.
+
+    This adapter uses the public W1-4B release package directly, not an
+    OpenAI-compatible server.  It instantiates ``SamplingRunner`` once and then
+    mutates ``runner.cfg`` per condition so the 7.48GB checkpoint is not
+    reloaded for every steps/sampler/context sweep.
+
+    Expected config keys:
+      repo_path: local clone path of WhaletechAI/W1-4B-dLLM-Base
+      checkpoint: optional; defaults to repo_path/whale3.7Bdiffusion.safetensors
+      config: optional; defaults to repo_path/configs/whale3b.yaml
+      tokenizer_path: optional; defaults to repo_path/whale-tokenizer
+      sampler: standard | gidd | jump
+      dtype: bf16 | fp16 | fp32
+      device: cuda | cpu
+    """
+    supports_trace = True
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        import importlib
+        import importlib.util
+        import torch
+
+        self.torch = torch
+        repo_value = str(cfg.get("repo_path") or cfg.get("path") or os.getenv("W1_4B_REPO", "W1-4B-dLLM-Base"))
+        repo_value = self._expand_env_default(repo_value)
+        self.repo_path = Path(repo_value).expanduser().resolve()
+        if not self.repo_path.exists():
+            raise SystemExit(
+                f"W1 repo_path not found: {self.repo_path}\n"
+                "Clone it first, for example:\n"
+                "  git clone https://huggingface.co/WhaletechAI/W1-4B-dLLM-Base\n"
+                "Then set models.w1_4b.repo_path in test_config_native.yaml."
+            )
+        self._ensure_whale4b_import(importlib, importlib.util)
+        from whale4b.core.runner import RunConfig, SamplingRunner
+
+        ckpt = Path(str(cfg.get("checkpoint") or self.repo_path / "whale3.7Bdiffusion.safetensors")).expanduser()
+        config_path = Path(str(cfg.get("config") or self.repo_path / "configs" / "whale3b.yaml")).expanduser()
+        tokenizer_path = Path(str(cfg.get("tokenizer_path") or self.repo_path / "whale-tokenizer")).expanduser()
+        if not ckpt.is_absolute():
+            ckpt = (self.repo_path / ckpt).resolve()
+        if not config_path.is_absolute():
+            config_path = (self.repo_path / config_path).resolve()
+        if not tokenizer_path.is_absolute():
+            tokenizer_path = (self.repo_path / tokenizer_path).resolve()
+        missing = [str(x) for x in [ckpt, config_path, tokenizer_path] if not x.exists()]
+        if missing:
+            raise SystemExit("W1 local backend is missing required file(s):\n" + "\n".join(missing))
+
+        self.device = str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+        self.dtype = str(cfg.get("dtype", "bf16"))
+        self.max_seq_len = int(cfg.get("max_seq_len", 4096))
+        run_cfg = RunConfig(
+            ckpt_path=str(ckpt),
+            config_path=str(config_path),
+            tokenizer_path=str(tokenizer_path),
+            sampler=str(cfg.get("sampler", "gidd")),
+            steps=int(cfg.get("steps", 64)),
+            max_new_tokens=int(cfg.get("max_new_tokens", 256)),
+            temperature=float(cfg.get("temperature", 0.0) or 0.0),
+            top_k=int(cfg.get("top_k", 0) or 0),
+            device=self.device,
+            dtype=self.dtype,
+            seed=cfg.get("seed", 1234),
+            use_ema=bool(cfg.get("use_ema", True)),
+            strict=bool(cfg.get("strict", False)),
+        )
+        # Optional W1 sampler-specific defaults.
+        for key in [
+            "p", "jump_last_steps", "jump_frac", "jump_min_tokens", "no_mask_jump",
+            "gidd_eps", "gidd_min_p", "posterior_temperature", "suppress_mask_clean",
+            "rho_mode", "gidd_exact_mode", "fail_on_negative_mass",
+        ]:
+            if key in cfg:
+                setattr(run_cfg, key, cfg[key])
+        self.runner = SamplingRunner(run_cfg)
+        # Expose W1 tokenizer so trace artifacts can decode token ids instead of
+        # writing raw ids or mask tokens into token timelines.
+        self.tokenizer = getattr(self.runner, "tokenizer", None)
+        self.path = str(self.repo_path)
+
+    def _expand_env_default(self, value: str) -> str:
+        # Supports simple shell-like forms used in YAML, e.g.
+        # ${W1_4B_REPO:-W1-4B-dLLM-Base} and ${W1_4B_REPO}.
+        m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}", value.strip())
+        if m:
+            env_value = os.getenv(m.group(1))
+            if env_value:
+                return env_value
+            return m.group(2) or ""
+        return os.path.expandvars(value)
+
+    def _ensure_whale4b_import(self, importlib, importlib_util) -> None:
+        """Import the HF repo even when the local folder is not named whale4b."""
+        try:
+            importlib.import_module("whale4b")
+            return
+        except Exception:
+            pass
+        # Common case after `git clone ... W1-4B-dLLM-Base`: the repo root is the
+        # package content but not named whale4b.  Load it under the whale4b name.
+        init_py = self.repo_path / "__init__.py"
+        if not init_py.exists():
+            raise SystemExit(f"Cannot import whale4b and {init_py} does not exist.")
+        parent = str(self.repo_path.parent)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+        spec = importlib_util.spec_from_file_location(
+            "whale4b", str(init_py), submodule_search_locations=[str(self.repo_path)]
+        )
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Could not create import spec for W1 repo: {self.repo_path}")
+        module = importlib_util.module_from_spec(spec)
+        sys.modules["whale4b"] = module
+        spec.loader.exec_module(module)
+
+    def _update_runner_cfg(self, params: Dict[str, Any]) -> None:
+        cfg = self.runner.cfg
+        cfg.sampler = str(params.get("w1_sampler", params.get("sampler", self.cfg.get("sampler", cfg.sampler))))
+        cfg.steps = int(params.get("w1_steps", params.get("gen_steps", params.get("steps", cfg.steps))))
+        cfg.max_new_tokens = int(params.get("max_new_tokens", params.get("gen_length", cfg.max_new_tokens)))
+        cfg.temperature = float(params.get("temperature", self.cfg.get("temperature", cfg.temperature)) or 0.0)
+        cfg.top_k = int(params.get("top_k", self.cfg.get("top_k", cfg.top_k)) or 0)
+        for key in [
+            "p", "jump_last_steps", "jump_frac", "jump_min_tokens", "no_mask_jump",
+            "gidd_eps", "gidd_min_p", "posterior_temperature", "suppress_mask_clean",
+            "rho_mode", "gidd_exact_mode", "fail_on_negative_mass",
+        ]:
+            if key in params and params[key] is not None:
+                setattr(cfg, key, params[key])
+
+    def _decode_token_id(self, token_id: int) -> str:
+        tok = getattr(self, "tokenizer", None)
+        if tok is not None:
+            try:
+                return tok.decode([int(token_id)], skip_special_tokens=False)
+            except TypeError:
+                try:
+                    return tok.decode([int(token_id)])
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return str(token_id)
+
+    def _make_trace_callback(self):
+        torch = self.torch
+        rows: List[Dict[str, Any]] = []
+        prev_x = {"value": None}
+
+        def callback(state):
+            x = state.x_t
+            prefix_len = int(state.prefix_len)
+            mask_id = int(state.mask_token_id)
+            editable = torch.ones_like(x, dtype=torch.bool)
+            editable[:, :prefix_len] = False
+
+            if prev_x["value"] is None:
+                # First callback: count positions that are already visible in the
+                # generated span, but do not treat still-masked positions as
+                # committed tokens.
+                changed = x.ne(mask_id) & editable
+                changed_any = x.ne(mask_id) & editable
+            else:
+                changed_any = x.ne(prev_x["value"]) & editable
+                # For the token timeline, keep only non-mask updates.  W1 can
+                # revise/remask positions; if we record mask updates as selected
+                # tokens, the visualizer shows literal [MASK] instead of the old
+                # box/commit-style view.
+                changed = changed_any & x.ne(mask_id)
+
+            abs_nonmask = torch.where(changed[0])[0].tolist() if changed.numel() else []
+            abs_any = torch.where(changed_any[0])[0].tolist() if changed_any.numel() else []
+            abs_mask = [int(p) for p in abs_any if int(p) >= prefix_len and int(x[0, int(p)].item()) == mask_id]
+
+            selected_positions = [int(p - prefix_len) for p in abs_nonmask if int(p) >= prefix_len]
+            selected_token_ids = [int(x[0, p].item()) for p in abs_nonmask if int(p) >= prefix_len]
+            changed_positions = [int(p - prefix_len) for p in abs_any if int(p) >= prefix_len]
+            mask_positions = [int(p - prefix_len) for p in abs_mask]
+
+            # Full generated-span state for compact visual inspection.  Masks are
+            # represented as boxes rather than literal [MASK] strings:
+            #   ■ = currently visible token, □ = still masked position.
+            try:
+                generated_span_ids = [int(t) for t in x[0, prefix_len:].detach().cpu().tolist()]
+            except Exception:
+                generated_span_ids = []
+            state_boxes = _boxes_from_token_ids(generated_span_ids, mask_id)
+            visible_positions = [i for i, tid in enumerate(generated_span_ids) if int(tid) != mask_id]
+
+            rows.append({
+                "step_idx": int(state.step),
+                "block_idx": 0,
+                "t": float(state.t),
+                "mask_count_before": int(state.remain_before),
+                "mask_count_after": int(state.remain_after),
+                "selected_positions": selected_positions,
+                "selected_token_ids": selected_token_ids,
+                "selected_decoded_tokens": [self._decode_token_id(t) for t in selected_token_ids],
+                "selected_confidences": [],
+                "changed_positions": changed_positions,
+                "changed_count": len(changed_positions),
+                "mask_positions": mask_positions,
+                "mask_update_count": len(mask_positions),
+                "visible_positions": visible_positions,
+                "visible_count": len(visible_positions),
+                "state_boxes": state_boxes,
+                "state_boxes_compact": _compact_boxes(state_boxes),
+                "mask_boxes": _compact_boxes(_mask_boxes(state.remain_after)),
+                "transfer_reason": "w1_sampler",
+                "cumulative_transferred_tokens": None,
+                "current_completion_rate": None,
+                "w1_selected_count": int(state.selected),
+                "w1_metadata": dict(state.metadata or {}),
+            })
+            prev_x["value"] = x.clone()
+
+        return rows, callback
+
+    def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
+        self._update_runner_cfg(params)
+        # W1 config has max_seq_len=4096.  We do not truncate here; failing loudly
+        # is preferable to silently changing context-test difficulty.
+        want_trace = bool(params.get("return_trace", False))
+        trace_rows, callback = self._make_trace_callback() if want_trace else ([], None)
+        result = self.runner.run(prompt=prompt, callback=callback)
+        trace = None
+        if want_trace:
+            total_selected = sum(len(r.get("selected_positions") or []) for r in trace_rows)
+            steps = max(1, len(trace_rows))
+            gen_tokens = int(getattr(result, "generated_tokens", params.get("max_new_tokens", params.get("gen_length", 0))) or 0)
+            trace = {
+                "backend": "w1_4b",
+                "sampler": getattr(result, "sampler", self.runner.cfg.sampler),
+                "steps_run": int(getattr(result, "steps_run", self.runner.cfg.steps)),
+                "generated_tokens": gen_tokens,
+                "step_stats": trace_rows,
+                "completion_rate": 1.0,
+                "actual_parallelism": float(total_selected / steps) if steps else None,
+                "actual_arness": None,
+                "threshold_pass_rate": None,
+                "fallback_rate": None,
+            }
+        return GenerationResult(
+            text=str(getattr(result, "new_text", "")).strip(),
+            elapsed=float(getattr(result, "elapsed_s", 0.0)),
+            tokens_generated=int(getattr(result, "generated_tokens", params.get("max_new_tokens", params.get("gen_length", 0))) or 0),
+            trace=trace,
+        )
+
+
 class OpenAICompatibleAdapter(BaseAdapter):
+    """OpenAI-compatible chat backend, including WhaleTech W1-style local APIs.
+
+    The base OpenAI schema is deliberately kept simple, while model-specific
+    decoding knobs can be forwarded through config-driven mappings.  This lets
+    the same native pipeline test W1-style parallel decoding without changing
+    this file again.
+
+    Config keys supported:
+      generation_params: static fields merged into every request payload.
+      extra_body: static vendor-specific object merged into payload["extra_body"].
+      api_extra_params: list of experiment params copied into payload["extra_body"].
+      api_param_map: mapping from experiment param -> extra_body key.
+      pass_params_to_extra_body: if true, copy all safe experiment params.
+
+    Example:
+      api_param_map:
+        w1_parallel_tokens: parallel_tokens
+        w1_decode_order: decode_order
+    """
+
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__(cfg)
         self.api_base = str(cfg.get("api_base") or os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")).rstrip("/")
         self.api_key = str(cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "EMPTY"))
         self.model_name = str(cfg.get("model") or cfg.get("path") or cfg.get("name"))
 
+    def _extra_body_from_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        extra: Dict[str, Any] = deepcopy(self.cfg.get("extra_body", {}) or {})
+        for key in self.cfg.get("api_extra_params", []) or []:
+            if key in params and params[key] is not None:
+                extra[str(key)] = params[key]
+        for src, dst in (self.cfg.get("api_param_map", {}) or {}).items():
+            if src in params and params[src] is not None:
+                extra[str(dst)] = params[src]
+        if self.cfg.get("pass_params_to_extra_body", False):
+            skip = {"gen_length", "max_new_tokens", "temperature", "sample_limit", "sample_indices", "num_samples",
+                    "return_trace", "trace_token_snapshots", "trace_decode_snapshots", "context_length",
+                    "needle_position", "needle_pair"}
+            for key, value in params.items():
+                if key not in skip and value is not None and isinstance(value, (str, int, float, bool, list, dict)):
+                    extra.setdefault(str(key), value)
+        return extra
+
     def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": float(params.get("temperature", 0.0) or 0.0),
             "max_tokens": int(params.get("max_new_tokens", params.get("gen_length", 128))),
         }
-        data = json.dumps(payload).encode("utf-8")
+        payload.update(deepcopy(self.cfg.get("generation_params", {}) or {}))
+        extra_body = self._extra_body_from_params(params)
+        if extra_body:
+            # Many OpenAI-compatible servers accept this field (vLLM style).
+            # If your W1 server expects top-level vendor fields instead, set
+            # config: extra_body_as_top_level: true.
+            if self.cfg.get("extra_body_as_top_level", False):
+                payload.update(extra_body)
+            else:
+                payload["extra_body"] = extra_body
+
+        data = json.dumps(payload, default=json_default).encode("utf-8")
         req = urllib.request.Request(
             self.api_base + "/chat/completions",
             data=data,
@@ -407,7 +760,11 @@ class OpenAICompatibleAdapter(BaseAdapter):
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"API request failed: {exc.code} {body[:500]}") from exc
         elapsed = time.perf_counter() - started
-        text = obj["choices"][0]["message"]["content"].strip()
+        choice = obj["choices"][0]
+        text = (choice.get("message", {}) or {}).get("content")
+        if text is None:
+            text = choice.get("text", "")
+        text = str(text).strip()
         usage = obj.get("usage", {}) or {}
         return GenerationResult(text=text, elapsed=elapsed, tokens_generated=usage.get("completion_tokens"))
 
@@ -418,9 +775,256 @@ def build_adapter(cfg: Dict[str, Any]) -> BaseAdapter:
         return ILLADAAdapter(cfg)
     if backend in {"hf", "hf_causal", "transformers", "causal"}:
         return HFCausalAdapter(cfg)
+    if backend in {"w1_4b", "whale4b", "w1_local", "w1hf"}:
+        return W14BLocalAdapter(cfg)
     if backend in {"openai_compatible", "api", "w1", "vllm"}:
         return OpenAICompatibleAdapter(cfg)
     raise SystemExit(f"Unsupported model backend `{backend}` for model {cfg.get('name')}")
+
+
+def _json_cell(value: Any) -> str:
+    """CSV cell helper: keep list/dict columns parseable by visualizers."""
+    return json.dumps(value, ensure_ascii=False, default=json_default)
+
+
+VISIBLE_BOX = "■"
+MASK_BOX = "□"
+
+
+def _compact_boxes(boxes: str, group: int = 16) -> str:
+    """Group a long mask/visible box line so CSV/HTML is compact and readable."""
+    raw = "".join(ch for ch in str(boxes) if ch in {VISIBLE_BOX, MASK_BOX})
+    if not raw:
+        return ""
+    group = max(1, int(group or 16))
+    return " ".join(raw[i:i + group] for i in range(0, len(raw), group))
+
+
+def _ungroup_boxes(boxes: Any) -> str:
+    return "".join(ch for ch in str(boxes or "") if ch in {VISIBLE_BOX, MASK_BOX})
+
+
+def _boxes_from_token_ids(token_ids: Sequence[Any], mask_id: int) -> str:
+    chars: List[str] = []
+    for token_id in token_ids:
+        try:
+            tid = int(token_id)
+        except Exception:
+            chars.append(VISIBLE_BOX)
+            continue
+        chars.append(MASK_BOX if tid == int(mask_id) else VISIBLE_BOX)
+    return "".join(chars)
+
+
+def _mask_boxes(count: Any) -> str:
+    try:
+        n = max(0, int(count))
+    except Exception:
+        n = 0
+    return MASK_BOX * n
+
+
+def _decode_ids(tokenizer: Any, token_ids: Sequence[Any], mask_id: Optional[int] = None) -> List[str]:
+    decoded: List[str] = []
+    for token_id in token_ids:
+        try:
+            tid = int(token_id)
+        except Exception:
+            decoded.append(str(token_id))
+            continue
+        if mask_id is not None and tid == int(mask_id):
+            # Do not put literal [MASK] tokens into the commit timeline.  The
+            # timeline should display committed/visible tokens; masks are tracked
+            # separately through mask_count_* and mask_positions.
+            continue
+        if tokenizer is not None:
+            try:
+                decoded.append(tokenizer.decode([tid], skip_special_tokens=False))
+                continue
+            except TypeError:
+                try:
+                    decoded.append(tokenizer.decode([tid]))
+                    continue
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        decoded.append(str(tid))
+    return decoded
+
+
+def _as_int_list(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out = []
+        for x in value:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+    return []
+
+
+def _threshold_label(value: Any) -> str:
+    if value is None:
+        return "none"
+    s = str(value).strip().lower()
+    if s in {"", "none", "null", "nan"}:
+        return "none"
+    return s.replace(".", "p")
+
+
+def _export_canonical_sample_trace(
+    out_dir: Path,
+    sample_dir: Path,
+    condition: Dict[str, Any],
+    sample: Dict[str, Any],
+    result: GenerationResult,
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Write the canonical files expected by visual_arness_trace.py.
+
+    The legacy visualizer expects step_events.csv, block_timeline.csv,
+    block_metrics.csv and sample_metrics.json under sample_traces/sample_XXXX.
+    The first native W1 patch only wrote trace.json; as a result, the visualizer
+    fell back to raw trace rows and displayed literal mask tokens.  This export
+    reconstructs a compact mask/visible view from selected_positions or native
+    state_boxes so the HTML/plots show square boxes instead of literal [MASK].
+    """
+    params = condition.get("params", {}) or {}
+    gen_length = int(params.get("gen_length", params.get("max_new_tokens", result.tokens_generated or 0)) or 0)
+    block_len = int(params.get("gen_blocksize", gen_length or 1) or (gen_length or 1))
+    block_len = max(1, block_len)
+    num_blocks = max(1, (max(gen_length, 1) + block_len - 1) // block_len)
+
+    # Cumulative commit state per block.  For W1 there is one logical generated
+    # span/block.  For iLLaDA, selected_positions are usually block-local when
+    # block_idx is present; the visualizer later converts to global positions.
+    committed: Dict[int, set[int]] = {b: set() for b in range(num_blocks)}
+    step_rows: List[Dict[str, Any]] = []
+    timeline_rows: List[Dict[str, Any]] = []
+    block_stats: Dict[int, Dict[str, Any]] = {b: {"selected_tokens_total": 0, "local_rounds": 0, "fallback_steps": 0, "conf": []} for b in range(num_blocks)}
+
+    for order, row in enumerate(rows):
+        step_idx = int(row.get("step_idx") if row.get("step_idx") is not None else order)
+        block_idx = int(row.get("block_idx") if row.get("block_idx") is not None else 0)
+        block_idx = max(0, min(block_idx, num_blocks - 1))
+        positions = _as_int_list(row.get("selected_positions"))
+        token_ids = _as_int_list(row.get("selected_token_ids"))
+        decoded = row.get("selected_decoded_tokens") or []
+        confs = row.get("selected_confidences") or []
+        selected_count = len(positions)
+        raw_state_boxes = _ungroup_boxes(row.get("state_boxes") or row.get("state_boxes_compact"))
+
+        for pos in positions:
+            if 0 <= int(pos) < block_len:
+                committed.setdefault(block_idx, set()).add(int(pos))
+
+        block_stats.setdefault(block_idx, {"selected_tokens_total": 0, "local_rounds": 0, "fallback_steps": 0, "conf": []})
+        block_stats[block_idx]["selected_tokens_total"] += selected_count
+        block_stats[block_idx]["local_rounds"] += 1
+        if str(row.get("transfer_reason", "")).lower().startswith("fallback"):
+            block_stats[block_idx]["fallback_steps"] += 1
+        for c in confs if isinstance(confs, list) else []:
+            try:
+                block_stats[block_idx]["conf"].append(float(c))
+            except Exception:
+                pass
+
+        step_rows.append({
+            "generation_step": step_idx,
+            "global_step_idx": step_idx,
+            "active_block_idx": block_idx,
+            "block_idx": block_idx,
+            "block_local_round": block_stats[block_idx]["local_rounds"],
+            "actual_transfer_count": selected_count,
+            "selected_count": selected_count,
+            "selected_positions": _json_cell(positions),
+            "selected_token_ids": _json_cell(token_ids),
+            "selected_decoded_tokens": _json_cell(decoded),
+            "selected_confidences": _json_cell(confs),
+            "mean_selected_confidence": (sum(block_stats[block_idx]["conf"]) / len(block_stats[block_idx]["conf"])) if block_stats[block_idx]["conf"] else "",
+            "mask_count_before": row.get("mask_count_before"),
+            "mask_count_after": row.get("mask_count_after"),
+            "changed_positions": _json_cell(row.get("changed_positions") or []),
+            "changed_count": row.get("changed_count", row.get("w1_selected_count", selected_count)),
+            "mask_positions": _json_cell(row.get("mask_positions") or []),
+            "mask_update_count": row.get("mask_update_count", 0),
+            "mask_boxes": row.get("mask_boxes") or _compact_boxes(_mask_boxes(row.get("mask_count_after", 0))),
+            "state_boxes": _compact_boxes(raw_state_boxes) if raw_state_boxes else "",
+            "visible_count": row.get("visible_count", raw_state_boxes.count(VISIBLE_BOX) if raw_state_boxes else ""),
+            "transfer_reason": row.get("transfer_reason", ""),
+            "current_completion_rate": row.get("current_completion_rate", ""),
+        })
+
+        trow: Dict[str, Any] = {
+            "generation_step": step_idx,
+            "global_step_idx": step_idx,
+            "active_block_idx": block_idx,
+        }
+        for b in range(num_blocks):
+            # Last block can be shorter.
+            start = b * block_len
+            this_len = max(0, min(block_len, max(gen_length, block_len) - start)) if gen_length else block_len
+            this_len = max(1, this_len)
+            if raw_state_boxes:
+                block_boxes = raw_state_boxes[start:start + this_len]
+                if len(block_boxes) < this_len:
+                    block_boxes += MASK_BOX * (this_len - len(block_boxes))
+                n = block_boxes.count(VISIBLE_BOX)
+            else:
+                n = len(committed.get(b, set()))
+                block_boxes = VISIBLE_BOX * min(n, this_len) + MASK_BOX * max(0, this_len - min(n, this_len))
+            trow[f"block_{b}_complete"] = f"{min(n, this_len)}/{this_len}"
+            # Human-readable square view for quick inspection in CSV/HTML.
+            # It is intentionally box-only: no literal [MASK] token appears here.
+            trow[f"block_{b}_boxes"] = _compact_boxes(block_boxes)
+        timeline_rows.append(trow)
+
+    block_rows: List[Dict[str, Any]] = []
+    for b, st in sorted(block_stats.items()):
+        conf = st.get("conf") or []
+        block_rows.append({
+            "block_idx": b,
+            "selected_tokens_total": st.get("selected_tokens_total", 0),
+            "local_rounds": st.get("local_rounds", 0),
+            "fallback_steps": st.get("fallback_steps", 0),
+            "mean_confidence": (sum(conf) / len(conf)) if conf else "",
+        })
+
+    metrics = {
+        "model": getattr(result, "model", None),
+        "benchmark": condition.get("benchmark"),
+        "sample_idx": sample.get("sample_id"),
+        "sample_id": sample.get("sample_id"),
+        "condition_key": condition.get("condition"),
+        "experiment": condition.get("experiment"),
+        "gen_length": gen_length,
+        "gen_steps": int(params.get("gen_steps", params.get("w1_steps", params.get("steps", gen_length or 0))) or 0),
+        "gen_blocksize": block_len,
+        "block_length": block_len,
+        "threshold_label": _threshold_label(params.get("token_selection_confidence_threshold")),
+        "token_selection_confidence_threshold": params.get("token_selection_confidence_threshold"),
+        "completion_rate": result.trace.get("completion_rate") if result.trace else None,
+        "actual_parallelism": result.trace.get("actual_parallelism") if result.trace else None,
+        "actual_arness": result.trace.get("actual_arness") if result.trace else None,
+        "threshold_pass_rate": result.trace.get("threshold_pass_rate") if result.trace else None,
+        "fallback_rate": result.trace.get("fallback_rate") if result.trace else None,
+        "prediction": result.text,
+        "answer": sample.get("answer"),
+    }
+
+    write_csv(sample_dir / "step_events.csv", step_rows)
+    write_csv(sample_dir / "block_timeline.csv", timeline_rows)
+    write_csv(sample_dir / "block_metrics.csv", block_rows)
+    write_json(sample_dir / "sample_metrics.json", metrics)
+    (sample_dir / "final_prediction.txt").write_text(result.text or "", encoding="utf-8")
+    (sample_dir / "problem_groundtruth_prediction.txt").write_text(
+        "PROMPT:\n" + str(sample.get("prompt", "")) + "\n\nGROUND TRUTH:\n" + str(sample.get("answer", "")) + "\n\nPREDICTION:\n" + str(result.text or ""),
+        encoding="utf-8",
+    )
 
 
 def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[str, Any], sample: Dict[str, Any], result: GenerationResult) -> None:
@@ -428,18 +1032,25 @@ def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[s
     if trace is None:
         return
     trace_path = out_dir / "trace.jsonl"
-    rows = []
+    rows: List[Dict[str, Any]] = []
     tokenizer = getattr(adapter, "tokenizer", None)
+    mask_id = int(condition.get("params", {}).get("mask_id", getattr(adapter, "mask_id", -999999)) or -999999)
     for step in trace.get("step_stats") or []:
-        selected_ids = step.get("selected_token_ids") or []
-        decoded = []
-        if tokenizer is not None:
-            for token_id in selected_ids:
-                try:
-                    decoded.append(tokenizer.decode([int(token_id)], skip_special_tokens=False))
-                except Exception:
-                    decoded.append(str(token_id))
-        rows.append({
+        raw_selected_ids = _as_int_list(step.get("selected_token_ids") or [])
+        raw_positions = _as_int_list(step.get("selected_positions") or [])
+        # Keep selected_positions aligned with non-mask selected_token_ids.  W1
+        # trace rows may contain separate mask_positions for revisions/remasks.
+        selected_pairs = [(p, t) for p, t in zip(raw_positions, raw_selected_ids) if t != mask_id]
+        if selected_pairs:
+            positions = [p for p, _ in selected_pairs]
+            selected_ids = [t for _, t in selected_pairs]
+        else:
+            positions = raw_positions if not raw_selected_ids else []
+            selected_ids = [t for t in raw_selected_ids if t != mask_id]
+        decoded = step.get("selected_decoded_tokens")
+        if not decoded or len(decoded) != len(selected_ids):
+            decoded = _decode_ids(tokenizer, selected_ids, mask_id=mask_id)
+        row = {
             "task_id": condition["task"],
             "sample_id": sample.get("sample_id"),
             "sample_idx": sample.get("sample_id"),
@@ -449,16 +1060,28 @@ def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[s
             "block_idx": step.get("block_idx"),
             "mask_count_before": step.get("mask_count_before"),
             "mask_count_after": step.get("mask_count_after"),
-            "selected_positions": step.get("selected_positions") or [],
+            "selected_count": len(positions),
+            "selected_positions": positions,
             "selected_token_ids": selected_ids,
             "selected_decoded_tokens": decoded,
             "selected_confidences": step.get("selected_confidences") or [],
+            "changed_positions": step.get("changed_positions") or positions,
+            "changed_count": step.get("changed_count", step.get("w1_selected_count", len(positions))),
+            "mask_positions": step.get("mask_positions") or [],
+            "mask_update_count": step.get("mask_update_count", 0),
+            "visible_positions": step.get("visible_positions") or [],
+            "visible_count": step.get("visible_count"),
+            "state_boxes": _compact_boxes(step.get("state_boxes") or step.get("state_boxes_compact") or ""),
+            "mask_boxes": step.get("mask_boxes") or _compact_boxes(_mask_boxes(step.get("mask_count_after", 0))),
             "candidate_positions": step.get("candidate_positions"),
             "candidate_confidences": step.get("candidate_confidences"),
             "transfer_reason": step.get("transfer_reason"),
             "cumulative_transferred_tokens": step.get("cumulative_transferred_tokens"),
             "current_completion_rate": step.get("current_completion_rate"),
-        })
+            "w1_selected_count": step.get("w1_selected_count"),
+            "w1_metadata": step.get("w1_metadata"),
+        }
+        rows.append(row)
     for row in rows:
         append_jsonl(trace_path, row)
 
@@ -467,7 +1090,7 @@ def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[s
     write_json(sample_dir / "trace.json", trace)
     write_json(sample_dir / "sample.json", {"sample": sample, "prediction": result.text, "condition": condition})
     (sample_dir / "prediction.txt").write_text(result.text, encoding="utf-8")
-
+    _export_canonical_sample_trace(out_dir, sample_dir, condition, sample, result, rows)
 
 def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Dict[str, Any], inputs: List[Dict[str, Any]], out_dir: Path, force: bool) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -608,7 +1231,7 @@ def main() -> int:
     parser.add_argument("--only", nargs="*", default=[], help="Task or experiment names to run.")
     parser.add_argument("--models", nargs="*", default=None, help="Model aliases to run. Defaults to experiment models or all config models.")
     parser.add_argument("--output-root", default="model_outputs")
-    parser.add_argument("--prepared-root", default=None, help="Override prepared root. Default: data.prepared_dir/native.")
+    parser.add_argument("--prepared-root", default=None, help="Override prepared root. Default: data.prepared_dir.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--auto-prepare", action="store_true", help="Run prepare_data.py first if inputs are missing.")
@@ -635,12 +1258,16 @@ def main() -> int:
 
     plan: List[Tuple[Dict[str, Any], Dict[str, Any], Path, Path]] = []
     for condition in conditions:
-        input_path = prepared_input_path(config, condition) if args.prepared_root is None else prepared_dir_for(Path(args.prepared_root), condition["task"], condition["benchmark"], condition["params"]) / "inputs.jsonl"
-        if not input_path.exists() and not args.dry_run:
-            raise SystemExit(
-                f"Missing prepared inputs: {input_path}\n"
-                f"Run: python prepare_data.py --config {config_path} --only {condition['experiment']}"
-            )
+        if args.prepared_root is None:
+            input_path = prepared_input_path(config, condition)
+        else:
+            base_override = Path(args.prepared_root)
+            if not base_override.is_absolute():
+                base_override = ROOT / base_override
+            if str(condition["benchmark"]) in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+                input_path = prepared_file_for(base_override, condition["benchmark"], condition["params"])
+            else:
+                input_path = base_override / str(condition["benchmark"]) / "original_source"
         for model_cfg in all_models:
             alias = model_alias(model_cfg)
             if explicit_models and alias not in explicit_models and str(model_cfg.get("name")) not in explicit_models:
@@ -676,9 +1303,9 @@ def main() -> int:
         adapter = build_adapter(model_cfg)
         try:
             for condition, input_path, out_dir in jobs:
-                inputs = read_jsonl(input_path)
-                _PREPARED_SOURCE = input_path
-                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)}", flush=True)
+                inputs, source_path, source_label = load_existing_or_prepared_inputs(config, condition, input_path)
+                _PREPARED_SOURCE = source_path
+                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)} | inputs={source_label}", flush=True)
                 result = run_condition(adapter, model_cfg, condition, inputs, out_dir, force=args.force)
                 manifest_rows.append({
                     "model": alias,
@@ -687,7 +1314,7 @@ def main() -> int:
                     "benchmark": condition["benchmark"],
                     "condition": condition["condition"],
                     "output_dir": str(out_dir),
-                    "input_path": str(input_path),
+                    "input_path": source_label,
                     **result,
                 })
         finally:

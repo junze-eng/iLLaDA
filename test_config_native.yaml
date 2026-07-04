@@ -4,9 +4,16 @@
 #   1) python prepare_data.py --config test_config_native.yaml --only <task-or-experiment> --force
 #   2) CUDA_VISIBLE_DEVICES=0 python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b] --auto-prepare
 #   3) python native_eval.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b]
-#   4) python native_plot_traces.py --root outputs/<task> --all
+#   4) python native_plot_traces.py --root native_outputs --all
 #
-# Key idea: native_output.py loads each selected model ONCE, then runs all selected
+# Paths:
+#   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl; GSM8K/MBPP/custom_math use original sources
+#   model outputs:   model_outputs/<model>/<task>/<benchmark>/<condition>/
+#   eval outputs:    native_outputs/<model>/<task>/<benchmark>/<condition>/
+#   comparisons:     native_outputs/_compare/<task>/<benchmark>/<condition>/compare.csv
+#
+# Key idea: prepare_data.py is the single config-driven data source;
+# native_output.py loads each selected model ONCE and then runs all selected
 # sweep conditions continuously. No OpenCompass CLI is used on this native path.
 
 run:

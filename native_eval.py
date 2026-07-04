@@ -10,9 +10,13 @@ same practical conventions used by OpenCompass-style generation benchmarks:
   - RULER single needle: normalized substring recall.
   - RULER order-2: exact ordered pair + unordered set + slot accuracies.
 
-It writes final artifacts under:
+It writes final artifacts under a model-first layout:
 
-    outputs/<task>/<benchmark_alias>/<condition>/<model_alias>/
+    native_outputs/<model_alias>/<task>/<benchmark_alias>/<condition>/
+
+Cross-model compare.csv files are written under:
+
+    native_outputs/_compare/<task>/<benchmark_alias>/<condition>/
 
 For ARness trace runs, trace.jsonl / summary.jsonl / sample_traces are copied so
 `visual_arness_trace.py` can be pointed directly at the final output directory.
@@ -84,7 +88,11 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
 
 
 def final_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return root / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"] / safe_name(model_name)
+    return root / safe_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
+
+
+def compare_dir_for(root: Path, condition: Dict[str, Any]) -> Path:
+    return root / "_compare" / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def normalize_text(text: Any) -> str:
@@ -379,7 +387,7 @@ def main() -> int:
     parser.add_argument("--only", nargs="*", default=[], help="Task or experiment names to evaluate.")
     parser.add_argument("--models", nargs="*", default=None)
     parser.add_argument("--model-output-root", default="model_outputs")
-    parser.add_argument("--output-root", default="outputs")
+    parser.add_argument("--output-root", default="native_outputs")
     parser.add_argument("--timeout", type=int, default=8, help="MBPP subprocess timeout per sample.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -438,7 +446,7 @@ def main() -> int:
             **{k: v for k, v in metrics.items() if not isinstance(v, (dict, list))},
         }
         manifest.append(row)
-        compare_dir = dst.parent
+        compare_dir = compare_dir_for(output_root, condition)
         compare_by_condition.setdefault(compare_dir, []).append(row)
 
     write_jsonl(output_root / "native_eval_manifest.jsonl", manifest)

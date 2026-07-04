@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
-"""Native data preparation for iLLaDA / W1 experiments.
+"""Config-driven native data preparation.
 
-This script is intentionally independent from OpenCompass execution.  It reads
-`test_config.yaml`, expands the selected experiments exactly like `run_test.py`,
-and writes one `inputs.jsonl` per expanded condition under:
+This file prepares the shared input jsonl used by the native side-channel.  The
+model runner never decides which samples belong to an experiment; it only reads
+the inputs selected here by `test_config_native.yaml`.
 
-    data/prepared/native/<task>/<benchmark_alias>/<condition>/inputs.jsonl
+Output schema:
 
-The generated schema is shared by `native_output.py` and `native_eval.py`:
+    data/prepared/<task>/<benchmark_alias>/<condition>/inputs.jsonl
 
-    {
-      "task": "context",
-      "benchmark": "ruler_niah_order_2",
-      "sample_id": 0,
-      "prompt": "...",
-      "answer": ["4930281", "7816254"],
-      "metadata": {...}
-    }
+Each row contains at least:
 
-Supported benchmarks:
-  - gsm8k
-  - mbpp
-  - custom_math
-  - ruler_niah_single_1
-  - ruler_niah_order_2
+    {"prompt": "...", "answer": "...", "metadata": {...}}
 
-The two RULER variants are generated locally from a haystack jsonl file.  GSM8K
-and MBPP are loaded with the HuggingFace `datasets` package so that the same
-prepared prompts can later be reused for iLLaDA, WhaleTech W1, or any other
-model backend.
+Standard datasets such as GSM8K and MBPP are exported into the same prepared
+layout as the new RULER-style tasks.  The only genuinely new benchmark added
+for the context extension is:
+
+    ruler_niah_order_2
+
+which inserts two needle records and evaluates ordered retrieval.
 """
 
 from __future__ import annotations
@@ -261,8 +252,47 @@ def condition_name(params: Dict[str, Any]) -> str:
     return text
 
 
+def ruler_prepared_condition_id(benchmark: str, params: Dict[str, Any]) -> str:
+    """Return the original LLaDA-style prepared filename stem for RULER data.
+
+    Keep RULER data under data/prepared/<benchmark>/<stem>.jsonl so the
+    native path can reuse the same data split as the OpenCompass/LLaDA path.
+    """
+    seed = int(params.get("seed", 42) or 42)
+    gen_length = int(params.get("gen_length", 128) or 128)
+    num_samples = int(params.get("num_samples", 20) or 20)
+    if benchmark == "ruler_niah_single_1":
+        return safe_name(
+            "ruler_niah_single_1_"
+            f"ctx{params.get('context_length')}_"
+            f"pos{params.get('needle_position')}_"
+            f"gen{gen_length}_"
+            f"samples{num_samples}_"
+            f"seed{seed}"
+        )
+    if benchmark == "ruler_niah_order_2":
+        return safe_name(
+            "ruler_niah_order_2_"
+            f"ctx{params.get('context_length')}_"
+            f"pair{params.get('needle_pair')}_"
+            f"gen{gen_length}_"
+            f"samples{num_samples}_"
+            f"seed{seed}"
+        )
+    return condition_name(params)
+
+
+def prepared_file_for(root: Path, benchmark: str, params: Dict[str, Any]) -> Path:
+    if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
+        return root / benchmark / f"{ruler_prepared_condition_id(benchmark, params)}.jsonl"
+    return root / benchmark / f"{condition_name(params)}.jsonl"
+
+
 def prepared_dir_for(root: Path, task: str, benchmark: str, params: Dict[str, Any]) -> Path:
-    return root / safe_name(task or "runs") / bench_alias(benchmark) / condition_name(params)
+    # Backward-compatible helper retained for older native_output imports.
+    # New RULER data is stored as data/prepared/<benchmark>/<file>.jsonl, not
+    # under task/native subdirectories.
+    return root / benchmark / condition_name(params)
 
 
 def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict[str, Any]]:
@@ -625,15 +655,20 @@ def prepare_ruler_order2(condition: Dict[str, Any], haystack_path: Path) -> List
     return rows
 
 
-def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: Path) -> List[Dict[str, Any]]:
+def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: Path) -> Optional[List[Dict[str, Any]]]:
+    """Prepare only synthetic RULER data.
+
+    GSM8K / MBPP / custom_math already have existing data loaders and should
+    not be duplicated into data/prepared.  native_output.py will read those
+    original sources directly and only copy the exact selected inputs into
+    model_outputs/<model>/... for provenance.
+    """
     benchmark = condition["benchmark"]
     data_cfg = config.get("data", {}) or {}
-    if benchmark == "gsm8k":
-        return prepare_gsm8k(condition)
-    if benchmark == "mbpp":
-        return prepare_mbpp(condition)
-    if benchmark == "custom_math":
-        return prepare_custom_math(condition, data_root)
+
+    if benchmark in {"gsm8k", "mbpp", "custom_math"}:
+        return None
+
     if benchmark in {"ruler_niah_single_1", "ruler_niah_order_2"}:
         haystack = Path(data_cfg.get("ruler_haystack_path", "data/ruler/paul_graham_essay.jsonl"))
         if not haystack.is_absolute():
@@ -641,14 +676,15 @@ def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: P
         if benchmark == "ruler_niah_single_1":
             return prepare_ruler_single(condition, haystack)
         return prepare_ruler_order2(condition, haystack)
-    raise SystemExit(f"Unsupported native benchmark `{benchmark}`.")
+
+    return None
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare native input jsonl files from test_config.yaml.")
     parser.add_argument("--config", default="test_config.yaml")
     parser.add_argument("--only", nargs="*", default=[], help="Task or experiment names to prepare.")
-    parser.add_argument("--output-root", default=None, help="Default: data.prepared_dir/native or data/prepared/native.")
+    parser.add_argument("--output-root", default=None, help="Default: data.prepared_dir or data/prepared.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -659,7 +695,7 @@ def main() -> int:
     config = load_yaml(config_path)
     selected = set(args.only or [])
     data_cfg = config.get("data", {}) or {}
-    base_prepared = Path(args.output_root or Path(data_cfg.get("prepared_dir", "data/prepared")) / "native")
+    base_prepared = Path(args.output_root or Path(data_cfg.get("prepared_dir", "data/prepared")))
     if not base_prepared.is_absolute():
         base_prepared = ROOT / base_prepared
 
@@ -672,18 +708,37 @@ def main() -> int:
     log(f"Preparing {len(conditions)} condition(s). Output root: {base_prepared}")
 
     for condition in conditions:
-        out_dir = prepared_dir_for(base_prepared, condition["task"], condition["benchmark"], condition["params"])
-        input_path = out_dir / "inputs.jsonl"
-        meta_path = out_dir / "prepared.json"
+        input_path = prepared_file_for(base_prepared, condition["benchmark"], condition["params"])
+        meta_path = input_path.with_suffix(".json")
+        rows = prepare_rows(condition, config, data_root)
+        if rows is None:
+            log(
+                f"- {condition['experiment']} / {condition['benchmark']} / {condition['condition']} "
+                "-> original dataset source, no prepared file needed"
+            )
+            if not args.dry_run:
+                manifest_rows.append({
+                    "task": condition["task"],
+                    "experiment": condition["experiment"],
+                    "benchmark": condition["benchmark"],
+                    "condition": condition["condition"],
+                    "params": condition["params"],
+                    "input_path": "original_source",
+                    "num_samples": None,
+                    "status": "skipped_original_source",
+                })
+            continue
+
         exists = input_path.exists()
         log(f"- {condition['experiment']} / {condition['benchmark']} / {condition['condition']} -> {input_path} ({'exists' if exists else 'new'})")
         if args.dry_run:
             continue
         if exists and not args.force:
             rows = read_jsonl(input_path)
+            status = "exists"
         else:
-            rows = prepare_rows(condition, config, data_root)
             write_jsonl(input_path, rows)
+            status = "prepared"
         meta = {
             "task": condition["task"],
             "experiment": condition["experiment"],
@@ -692,6 +747,7 @@ def main() -> int:
             "params": condition["params"],
             "input_path": str(input_path),
             "num_samples": len(rows),
+            "status": status,
         }
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=json_default), encoding="utf-8")
         manifest_rows.append(meta)
