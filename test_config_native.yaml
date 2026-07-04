@@ -1,0 +1,191 @@
+# Native side-channel config for efficient iLLaDA / WhaleTech W1 comparisons.
+# Workflow:
+#   1) python prepare_data.py --config test_config_native.yaml --only <task-or-experiment> --force
+#   2) CUDA_VISIBLE_DEVICES=0 python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1] --auto-prepare
+#   3) python native_eval.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1]
+#
+# Key idea: native_output.py loads each selected model ONCE, then runs all selected
+# sweep conditions continuously. native_eval.py reads model_outputs and writes final
+# outputs plus compare.csv. No OpenCompass CLI is used on this native path.
+
+run:
+  tasks: [native_quick_compare]
+
+data:
+  prepared_dir: data/prepared
+  ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
+
+models:
+  - name: illada
+    backend: illada
+    type: instruct
+    path: GSAI-ML/iLLaDA-8B-Instruct
+    mask_id: 5
+    apply_chat_template: true
+    gpu_telemetry: true
+    gpu_telemetry_interval: 5
+    model_kwargs:
+      device_map: auto
+      torch_dtype: torch.bfloat16
+
+  # W1 placeholder. Use --models w1 only after the local/API endpoint is ready.
+  # The api_param_map forwards experiment-level W1 controls into payload.extra_body.
+  # If your W1 server expects vendor-specific fields at top-level, set:
+  #   extra_body_as_top_level: true
+  - name: w1
+    backend: openai_compatible
+    model: whale-w1
+    api_base: http://localhost:8000/v1
+    api_key: EMPTY
+    timeout: 600
+    gpu_telemetry: false
+    generation_params:
+      top_p: 1.0
+    api_param_map:
+      w1_parallel_tokens: parallel_tokens
+      w1_decode_mode: decode_mode
+      w1_decode_order: decode_order
+      w1_confidence_threshold: confidence_threshold
+    extra_body: {}
+
+defaults:
+  sample_limit: null
+  sample_indices: null
+  num_samples: null
+  gen_length: 128
+  gen_steps: 128
+  gen_blocksize: 128
+  max_new_tokens: null
+  max_seq_len: 8192
+  temperature: 0.0
+  cfg: 0.0
+  remasking: low_confidence
+  mask_id: 5
+  token_selection_confidence_threshold: null
+  min_transfer_tokens: 1
+  diff_confidence_eos_eot_inf: true
+  diff_logits_eos_inf: false
+  return_trace: false
+  trace_token_snapshots: false
+  trace_decode_snapshots: false
+
+# ---------------------------------------------------------------------------
+# Recommended quick path: one representative sample per task/model.
+# This is designed for adding W1 as a cheap side-by-side comparison, while iLLaDA
+# can still run detailed ARness trace conditions separately.
+# ---------------------------------------------------------------------------
+tasks:
+  native_quick_compare:
+    description: "One-sample native comparison across core experiment families."
+    experiments:
+      # iLLaDA parallel decoding pressure on the same GSM8K sample.
+      - name: native_parallel_gsm8k_s7_illada
+        benchmark: gsm8k
+        models: [illada]
+        params:
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 256
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [256, 64, 32]
+          token_selection_confidence_threshold: [null]
+
+      # W1-side parallel controls. Rename/mapping can be adjusted in models.w1.api_param_map.
+      # This does NOT claim internal ARness trace; it is external behavior/latency under W1 controls.
+      - name: native_parallel_gsm8k_s7_w1
+        benchmark: gsm8k
+        models: [w1]
+        params:
+          sample_indices: [7]
+          gen_length: 256
+          max_new_tokens: 256
+          temperature: 0.0
+          w1_decode_mode: parallel
+        sweep:
+          w1_parallel_tokens: [1, 4, 8]
+
+      # Context harder probe: two needles, ordered output.
+      - name: native_context_order2_smoke_compare
+        benchmark: ruler_niah_order_2
+        models: [illada, w1]
+        params:
+          num_samples: 3
+          gen_length: 64
+          gen_steps: 64
+          gen_blocksize: 32
+          max_new_tokens: 64
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: false
+        sweep:
+          context_length: [2048]
+          needle_pair: [front_back]
+
+      # MBPP one-sample external behavior comparison. MBPP unit tests are run in native_eval.py.
+      - name: native_mbpp_s6_compare
+        benchmark: mbpp
+        models: [illada, w1]
+        params:
+          sample_indices: [6]
+          gen_length: 512
+          gen_steps: 512
+          gen_blocksize: 16
+          max_new_tokens: 512
+          min_transfer_tokens: 1
+          return_trace: false
+
+  # Detailed iLLaDA-only ARness trace. This is the mechanistic trace used by visual_arness_trace.py.
+  native_arness:
+    description: "iLLaDA detailed ARness trace; W1 cannot produce iLLaDA internal token trace."
+    experiments:
+      - name: native_arness_trace_gsm8k_sample7
+        benchmark: gsm8k
+        models: [illada]
+        params:
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 64
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          gen_steps: [64, 32, 16]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+
+      - name: native_arness_trace_mbpp_sample6
+        benchmark: mbpp
+        models: [illada]
+        params:
+          sample_indices: [6]
+          gen_length: 512
+          gen_blocksize: 16
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          gen_steps: [512, 256, 128]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+
+  # Fuller context order-2 run for the presentation, after smoke passes.
+  native_context_order2:
+    description: "Two-needle long-context ordered retrieval."
+    experiments:
+      - name: native_context_order2_2_4_8k
+        benchmark: ruler_niah_order_2
+        models: [illada, w1]
+        params:
+          num_samples: 20
+          gen_length: 64
+          gen_steps: 64
+          gen_blocksize: 32
+          max_new_tokens: 64
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: false
+        sweep:
+          context_length: [2048, 4096, 8192]
+          needle_pair: [front_middle, front_back, middle_back]
