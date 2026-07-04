@@ -1,41 +1,28 @@
-# Native side-channel config for efficient iLLaDA / WhaleTech W1 comparisons.
+# Native side-channel config focused ONLY on WhaleTech W1-4B.
+# iLLaDA has already been run; this config only runs the W1 conditions needed
+# for long-context parallel retrieval and ARness / generation-order comparison.
 #
 # Workflow:
-#   1) python prepare_data.py --config test_config_native.yaml --only <task-or-experiment> --force
-#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --only <task-or-experiment> --models iLLaDA [w1_4b] --auto-prepare
-#   3) python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models iLLaDA [w1_4b]
+#   1) python prepare_data.py --config test_config_native.yaml --force
+#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --models w1_4b --auto-prepare
+#   3) python native_output.py --config test_config_native.yaml --models w1_4b
 #   4) python native_visual.py --root native_outputs --output-root visual --all
 #
 # Paths:
-#   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl; GSM8K/MBPP/custom_math use original sources
+#   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl
 #   model outputs:   model_outputs/<model>/<task>/<benchmark>/<condition>/
 #   eval outputs:    native_outputs/<model>/<task>/<benchmark>/<condition>/
-#   comparisons:     native_outputs/_compare/<task>/<benchmark>/<condition>/compare.csv
-#
-# Key idea: prepare_data.py is the single config-driven data source;
-# native_model.py loads each selected model ONCE and then runs all selected
-# sweep conditions continuously. No OpenCompass CLI is used on this native path.
 
 run:
-  tasks: [native_w1_trace_focus]
+  tasks:
+    - native_context_order2_w1
+    - native_w1_trace_focus
 
 data:
   prepared_dir: data/prepared
   ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
 
 models:
-  - name: iLLaDA
-    backend: illada
-    type: instruct
-    path: GSAI-ML/iLLaDA-8B-Instruct
-    mask_id: 5
-    apply_chat_template: true
-    gpu_telemetry: true
-    gpu_telemetry_interval: 5
-    model_kwargs:
-      device_map: auto
-      torch_dtype: torch.bfloat16
-
   # Local Hugging Face W1-4B dLLM release.
   # Clone once before running:
   #   git clone https://huggingface.co/WhaletechAI/W1-4B-dLLM-Base /path/to/W1-4B-dLLM-Base
@@ -58,7 +45,7 @@ models:
     use_ema: true
     seed: 1234
 
-  # Optional legacy API wrapper, kept for later if W1 is served behind an OpenAI-compatible endpoint.
+  # Optional legacy API wrapper, not used by default.
   - name: w1_api
     backend: openai_compatible
     model: whale-w1
@@ -81,7 +68,7 @@ defaults:
   gen_steps: 128
   gen_blocksize: 128
   max_new_tokens: null
-  max_seq_len: 8192
+  max_seq_len: 4096
   temperature: 0.0
   cfg: 0.0
   remasking: low_confidence
@@ -95,14 +82,35 @@ defaults:
   trace_decode_snapshots: false
 
 # ---------------------------------------------------------------------------
-# W1-focused path.
-# W1's public release is not an iLLaDA-style threshold/block sampler.  It exposes
-# diffusion samplers {standard,gidd,jump}, steps, and max_new_tokens.  Therefore
-# W1 is evaluated mainly through sampler-step trace + small scoring probes.
+# W1-only native experiments.
+# Two groups are kept by default:
+#   1) native_context_order2_w1: long-context double-needle retrieval at matched
+#      planned parallelism levels, within W1's 4096-token context limit.
+#   2) native_w1_trace_focus: trace probes for generation order and sampler behavior.
 # ---------------------------------------------------------------------------
 tasks:
+  native_context_order2_w1:
+    description: "W1-4B double-needle long-context retrieval within its 4096-token limit; 2K/4K x 3 needle pairs x 1/2/4 token-per-step."
+    experiments:
+      - name: native_context_order2_w1_2_4k_parallel
+        benchmark: ruler_niah_double_2
+        models: [w1_4b]
+        params:
+          num_samples: 20
+          gen_length: 64
+          max_new_tokens: 64
+          max_seq_len: 4096
+          temperature: 0.0
+          return_trace: false
+          seed: 42
+        sweep:
+          context_length: [2048, 4096]
+          needle_pair: [front_middle, front_back, middle_back]
+          w1_sampler: [gidd]
+          w1_steps: [64, 32, 16]
+
   native_w1_trace_focus:
-    description: "W1-4B single-sample trace focus: sampler/step parallel generation behavior."
+    description: "W1-4B trace probes for generation order, sampler dynamics, and parallel decoding behavior."
     experiments:
       - name: native_w1_trace_gsm8k_sample7
         benchmark: gsm8k
@@ -113,19 +121,9 @@ tasks:
           max_new_tokens: 256
           temperature: 0.0
           return_trace: true
-        sweep:
-          w1_sampler: [standard, gidd, jump]
-          w1_steps: [64, 32, 16]
-
-      - name: native_w1_trace_mbpp_sample6
-        benchmark: mbpp
-        models: [w1_4b]
-        params:
-          sample_indices: [6]
-          gen_length: 512
-          max_new_tokens: 512
-          temperature: 0.0
-          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          seed: 42
         sweep:
           w1_sampler: [standard, gidd, jump]
           w1_steps: [64, 32, 16]
@@ -137,208 +135,14 @@ tasks:
           num_samples: 1
           gen_length: 64
           max_new_tokens: 64
-          temperature: 0.0
-          return_trace: true
-        sweep:
-          context_length: [2048]
-          needle_pair: [front_back]
-          w1_sampler: [standard, gidd, jump]
-          w1_steps: [64, 32]
-
-  native_w1_score_small:
-    description: "Small W1 score sanity check; no trace, low GPU cost."
-    experiments:
-      - name: native_w1_score_gsm8k_20
-        benchmark: gsm8k
-        models: [w1_4b]
-        params:
-          sample_limit: 20
-          gen_length: 256
-          max_new_tokens: 256
-          temperature: 0.0
-          return_trace: false
-        sweep:
-          w1_sampler: [gidd]
-          w1_steps: [64, 32, 16]
-
-      - name: native_w1_score_mbpp_10
-        benchmark: mbpp
-        models: [w1_4b]
-        params:
-          sample_limit: 10
-          gen_length: 512
-          max_new_tokens: 512
-          temperature: 0.0
-          return_trace: false
-        sweep:
-          w1_sampler: [gidd]
-          w1_steps: [64, 32]
-
-      - name: native_w1_score_context_order2_10
-        benchmark: ruler_niah_double_2
-        models: [w1_4b]
-        params:
-          num_samples: 10
-          gen_length: 64
-          max_new_tokens: 64
-          temperature: 0.0
-          return_trace: false
-        sweep:
-          context_length: [2048, 4096]
-          needle_pair: [front_back]
-          w1_sampler: [gidd]
-          w1_steps: [64, 32, 16]
-
-  # Quick side-by-side comparison, useful after W1 trace works.
-  native_quick_compare:
-    description: "One-sample native comparison across core experiment families."
-    experiments:
-      - name: native_parallel_gsm8k_s7_iLLaDA
-        benchmark: gsm8k
-        models: [iLLaDA]
-        params:
-          sample_indices: [7]
-          gen_length: 256
-          gen_blocksize: 256
-          min_transfer_tokens: 1
-          return_trace: true
-        sweep:
-          gen_steps: [256, 64, 32]
-          token_selection_confidence_threshold: [null]
-
-      - name: native_parallel_gsm8k_s7_w1
-        benchmark: gsm8k
-        models: [w1_4b]
-        params:
-          sample_indices: [7]
-          gen_length: 256
-          max_new_tokens: 256
-          temperature: 0.0
-          return_trace: true
-        sweep:
-          w1_sampler: [standard, gidd, jump]
-          w1_steps: [64, 32, 16]
-
-      - name: native_context_order2_smoke_compare
-        benchmark: ruler_niah_double_2
-        models: [iLLaDA, w1_4b]
-        params:
-          num_samples: 3
-          gen_length: 64
-          gen_steps: 64
-          gen_blocksize: 32
-          max_new_tokens: 64
           max_seq_len: 4096
-          min_transfer_tokens: 1
-          return_trace: false
-        sweep:
-          context_length: [2048]
-          needle_pair: [front_back]
-
-      - name: native_mbpp_s6_compare
-        benchmark: mbpp
-        models: [iLLaDA, w1_4b]
-        params:
-          sample_indices: [6]
-          gen_length: 512
-          gen_steps: 512
-          gen_blocksize: 16
-          max_new_tokens: 512
-          min_transfer_tokens: 1
-          return_trace: false
-        sweep:
-          w1_sampler: [gidd]
-          w1_steps: [64]
-
-  # Detailed iLLaDA-only ARness trace used by visual_arness_trace.py.
-  native_arness:
-    description: "iLLaDA detailed ARness trace; W1 trace is handled in native_w1_trace_focus."
-    experiments:
-      - name: native_arness_trace_gsm8k_sample7
-        benchmark: gsm8k
-        models: [iLLaDA]
-        params:
-          sample_indices: [7]
-          gen_length: 256
-          gen_blocksize: 64
-          min_transfer_tokens: 1
+          temperature: 0.0
           return_trace: true
           trace_token_snapshots: false
           trace_decode_snapshots: false
-        sweep:
-          gen_steps: [64, 32, 16]
-          token_selection_confidence_threshold: [null, 0.6, 0.8]
-
-      - name: native_arness_trace_mbpp_sample6
-        benchmark: mbpp
-        models: [iLLaDA]
-        params:
-          sample_indices: [6]
-          gen_length: 512
-          gen_blocksize: 16
-          min_transfer_tokens: 1
-          return_trace: true
-          trace_token_snapshots: false
-          trace_decode_snapshots: false
-        sweep:
-          gen_steps: [512, 256, 128]
-          token_selection_confidence_threshold: [null, 0.6, 0.8]
-
-  # Fuller context order-2 run for iLLaDA. iLLaDA has 8192-token max sequence.
-  native_context_order2_illada:
-    description: "Two-needle long-context ordered retrieval for iLLaDA up to 8k."
-    experiments:
-      - name: native_context_order2_iLLaDA_2_4_8k
-        benchmark: ruler_niah_double_2
-        models: [iLLaDA]
-        params:
-          num_samples: 20
-          gen_length: 64
-          gen_steps: 64
-          gen_blocksize: 32
-          max_new_tokens: 64
-          max_seq_len: 8192
-          min_transfer_tokens: 1
-          return_trace: false
-        sweep:
-          context_length: [2048, 4096, 8192]
-          needle_pair: [front_middle, front_back, middle_back]
-
-  native_context_double_8k_tps:
-    description: "iLLaDA 8k double-needle ordered retrieval; 3 needle-pair placements x 3 token-per-step settings."
-    experiments:
-      - name: native_context_double_8k_tps_iLLaDA
-        benchmark: ruler_niah_double_2
-        models: [iLLaDA]
-        params:
-          num_samples: 10
-          gen_length: 64
-          gen_blocksize: 64
-          max_new_tokens: 64
-          max_seq_len: 8192
-          min_transfer_tokens: 1
-          return_trace: false
           seed: 42
         sweep:
-          context_length: [8192]
-          needle_pair: [front_middle, front_back, middle_back]
-          gen_steps: [64, 32, 16]
-
-  # W1 context comparison is limited to 4096 by the W1 public config.
-  native_context_order2_w1:
-    description: "Two-needle ordered retrieval for W1-4B within its 4096-token limit."
-    experiments:
-      - name: native_context_order2_w1_2_4k
-        benchmark: ruler_niah_double_2
-        models: [w1_4b]
-        params:
-          num_samples: 20
-          gen_length: 64
-          max_new_tokens: 64
-          temperature: 0.0
-          return_trace: false
-        sweep:
           context_length: [2048, 4096]
-          needle_pair: [front_middle, front_back, middle_back]
-          w1_sampler: [gidd]
-          w1_steps: [64]
+          needle_pair: [front_back]
+          w1_sampler: [standard, gidd, jump]
+          w1_steps: [64, 32, 16]
