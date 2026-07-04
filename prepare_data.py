@@ -129,6 +129,8 @@ PARAM_ALIASES = {
     "speed_schedule_label": "spd",
     "speed_schedule_name": "spd",
     "decode_order": "ord",
+    "w1_sampler": "w1sam",
+    "w1_steps": "w1st",
     "w1_parallel_tokens": "w1pt",
     "w1_decode_mode": "w1mode",
     "w1_decode_order": "w1ord",
@@ -151,6 +153,8 @@ PREFERRED_KEYS = [
     "speed_schedule_label",
     "speed_schedule_name",
     "decode_order",
+    "w1_sampler",
+    "w1_steps",
     "w1_parallel_tokens",
     "w1_decode_mode",
     "w1_decode_order",
@@ -238,8 +242,14 @@ def value_label(value: Any) -> str:
 
 def condition_name(params: Dict[str, Any]) -> str:
     pieces = []
+    # W1 public backend uses w1_steps / w1_sampler instead of iLLaDA
+    # gen_steps / gen_blocksize.  Skip irrelevant default iLLaDA knobs so paths
+    # stay short and semantically meaningful.
+    dynamic_skip = set(NAMELESS_KEYS)
+    if params.get("w1_sampler") is not None or params.get("w1_steps") is not None:
+        dynamic_skip.update({"gen_steps", "gen_blocksize", "token_selection_confidence_threshold"})
     for key in PREFERRED_KEYS:
-        if key in params and key not in NAMELESS_KEYS and params.get(key) is not None:
+        if key in params and key not in dynamic_skip and params.get(key) is not None:
             pieces.append(f"{PARAM_ALIASES.get(key, key)}{value_label(params.get(key))}")
     if not pieces:
         pieces.append("default")

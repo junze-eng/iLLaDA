@@ -379,68 +379,20 @@ class HFCausalAdapter(BaseAdapter):
 
 
 class OpenAICompatibleAdapter(BaseAdapter):
-    """OpenAI-compatible chat backend, including WhaleTech W1-style local APIs.
-
-    The base OpenAI schema is deliberately kept simple, while model-specific
-    decoding knobs can be forwarded through config-driven mappings.  This lets
-    the same native pipeline test W1-style parallel decoding without changing
-    this file again.
-
-    Config keys supported:
-      generation_params: static fields merged into every request payload.
-      extra_body: static vendor-specific object merged into payload["extra_body"].
-      api_extra_params: list of experiment params copied into payload["extra_body"].
-      api_param_map: mapping from experiment param -> extra_body key.
-      pass_params_to_extra_body: if true, copy all safe experiment params.
-
-    Example:
-      api_param_map:
-        w1_parallel_tokens: parallel_tokens
-        w1_decode_order: decode_order
-    """
-
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__(cfg)
         self.api_base = str(cfg.get("api_base") or os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")).rstrip("/")
         self.api_key = str(cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "EMPTY"))
         self.model_name = str(cfg.get("model") or cfg.get("path") or cfg.get("name"))
 
-    def _extra_body_from_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        extra: Dict[str, Any] = deepcopy(self.cfg.get("extra_body", {}) or {})
-        for key in self.cfg.get("api_extra_params", []) or []:
-            if key in params and params[key] is not None:
-                extra[str(key)] = params[key]
-        for src, dst in (self.cfg.get("api_param_map", {}) or {}).items():
-            if src in params and params[src] is not None:
-                extra[str(dst)] = params[src]
-        if self.cfg.get("pass_params_to_extra_body", False):
-            skip = {"gen_length", "max_new_tokens", "temperature", "sample_limit", "sample_indices", "num_samples",
-                    "return_trace", "trace_token_snapshots", "trace_decode_snapshots", "context_length",
-                    "needle_position", "needle_pair"}
-            for key, value in params.items():
-                if key not in skip and value is not None and isinstance(value, (str, int, float, bool, list, dict)):
-                    extra.setdefault(str(key), value)
-        return extra
-
     def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
-        payload: Dict[str, Any] = {
+        payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": float(params.get("temperature", 0.0) or 0.0),
             "max_tokens": int(params.get("max_new_tokens", params.get("gen_length", 128))),
         }
-        payload.update(deepcopy(self.cfg.get("generation_params", {}) or {}))
-        extra_body = self._extra_body_from_params(params)
-        if extra_body:
-            # Many OpenAI-compatible servers accept this field (vLLM style).
-            # If your W1 server expects top-level vendor fields instead, set
-            # config: extra_body_as_top_level: true.
-            if self.cfg.get("extra_body_as_top_level", False):
-                payload.update(extra_body)
-            else:
-                payload["extra_body"] = extra_body
-
-        data = json.dumps(payload, default=json_default).encode("utf-8")
+        data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.api_base + "/chat/completions",
             data=data,
@@ -455,11 +407,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"API request failed: {exc.code} {body[:500]}") from exc
         elapsed = time.perf_counter() - started
-        choice = obj["choices"][0]
-        text = (choice.get("message", {}) or {}).get("content")
-        if text is None:
-            text = choice.get("text", "")
-        text = str(text).strip()
+        text = obj["choices"][0]["message"]["content"].strip()
         usage = obj.get("usage", {}) or {}
         return GenerationResult(text=text, elapsed=elapsed, tokens_generated=usage.get("completion_tokens"))
 

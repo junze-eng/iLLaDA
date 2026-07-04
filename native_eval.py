@@ -337,7 +337,10 @@ def copy_artifacts(src: Path, dst: Path, sample_idx: Optional[int] = None) -> No
             shutil.copytree(sp, dp)
     if (dst / "trace.jsonl").exists():
         idx = 0 if sample_idx is None else sample_idx
+        # visual_arness_trace.py remains the rich iLLaDA ARness viewer.  The
+        # native plotter is model-agnostic and is the preferred W1 trace view.
         (dst / "visual_command.txt").write_text(f'python visual_arness_trace.py "{dst}" --sample-idx {idx}\n', encoding="utf-8")
+        (dst / "native_plot_command.txt").write_text(f'python native_plot_traces.py --run "{dst}"\n', encoding="utf-8")
 
 
 def evaluate_run(model_output_dir: Path, final_dir: Path, timeout: int = 8) -> Dict[str, Any]:
