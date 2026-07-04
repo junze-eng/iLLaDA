@@ -1,28 +1,40 @@
-# Temporary config: only the remaining iLLaDA tests
-# 1) MBPP ARness trace: sample 6, gen_length=1024, block=32, steps=1024, threshold null/0.6/0.8
-# 2) New RULER double-needle context: 8192 context, 3 needle pairs x 3 TPS, 10 samples each
-#
-# This config loads GSAI-ML/iLLaDA-8B-Instruct only.
+# Temporary config for the run_model.py / run_outputs.py path.
+# Only runs the remaining iLLaDA checks:
+#   1) MBPP sample 6, gen_length=1024, block=32, steps=1024, thr=null/0.6/0.8
+#   2) New RULER double-needle 8k context, 3 needle pairs x 3 TPS, 10 samples each
 
 run:
-  tasks:
-  - native_arness
-  - native_context_double_8k_tps
+  tasks: [runmodel_arness, runmodel_context_double_8k_tps]
+
+execution:
+  stop_on_error: true
+  opencompass_args: []
+  gpu_telemetry:
+    enabled: true
+    interval_seconds: 5
+
 data:
   prepared_dir: data/prepared
   ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
-models:
-- name: iLLaDA
-  backend: illada
+
+model:
   type: instruct
+  abbr: iLLaDA
   path: GSAI-ML/iLLaDA-8B-Instruct
   mask_id: 5
   apply_chat_template: true
-  gpu_telemetry: true
-  gpu_telemetry_interval: 5
   model_kwargs:
     device_map: auto
     torch_dtype: torch.bfloat16
+
+runner:
+  partitioner:
+    num_worker: 1
+    min_task_size: 1
+  runner:
+    max_num_workers: 1
+    retry: 1
+
 defaults:
   sample_limit: null
   sample_indices: null
@@ -30,12 +42,10 @@ defaults:
   gen_length: 128
   gen_steps: 128
   gen_blocksize: 128
-  max_new_tokens: null
   max_seq_len: 8192
   temperature: 0.0
   cfg: 0.0
   remasking: low_confidence
-  mask_id: 5
   token_selection_confidence_threshold: null
   min_transfer_tokens: 1
   diff_confidence_eos_eot_inf: true
@@ -43,55 +53,39 @@ defaults:
   return_trace: false
   trace_token_snapshots: false
   trace_decode_snapshots: false
+
 tasks:
-  native_arness:
-    description: iLLaDA MBPP sample-6 ARness trace at long generation length.
+  runmodel_arness:
+    description: "iLLaDA MBPP sample-6 ARness trace via run_model.py."
     experiments:
-    - name: native_arness_trace_mbpp_sample6_steps1024
-      benchmark: mbpp
-      models:
-      - iLLaDA
-      params:
-        sample_indices:
-        - 6
-        gen_length: 1024
-        gen_blocksize: 32
-        min_transfer_tokens: 1
-        return_trace: true
-        trace_token_snapshots: false
-        trace_decode_snapshots: false
-      sweep:
-        gen_steps:
-        - 1024
-        token_selection_confidence_threshold:
-        - null
-        - 0.6
-        - 0.8
-  native_context_double_8k_tps:
-    description: iLLaDA 8k double-needle ordered retrieval; 3 needle pairs x 3 token-per-step
-      settings.
+      - name: arness_trace_mbpp_sample6_steps1024
+        benchmark: mbpp
+        params:
+          sample_indices: [6]
+          gen_length: 1024
+          gen_blocksize: 32
+          gen_steps: 1024
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+
+  runmodel_context_double_8k_tps:
+    description: "iLLaDA 8k double-needle ordered retrieval via run_model.py."
     experiments:
-    - name: native_context_double_8k_tps_iLLaDA
-      benchmark: ruler_niah_double_2
-      models:
-      - iLLaDA
-      params:
-        num_samples: 10
-        gen_length: 64
-        gen_blocksize: 64
-        max_new_tokens: 64
-        max_seq_len: 8192
-        min_transfer_tokens: 1
-        return_trace: false
-        seed: 42
-      sweep:
-        context_length:
-        - 8192
-        needle_pair:
-        - front_middle
-        - front_back
-        - middle_back
-        gen_steps:
-        - 64
-        - 32
-        - 16
+      - name: context_double_8k_tps_iLLaDA
+        benchmark: ruler_niah_double_2
+        params:
+          num_samples: 10
+          gen_length: 64
+          gen_blocksize: 64
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: false
+          seed: 42
+        sweep:
+          context_length: [8192]
+          needle_pair: [front_middle, front_back, middle_back]
+          gen_steps: [64, 32, 16]

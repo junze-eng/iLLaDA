@@ -264,6 +264,21 @@ tasks:
           gen_steps: [512, 256, 128]
           token_selection_confidence_threshold: [null, 0.6, 0.8]
 
+      - name: arness_trace_mbpp_sample6_steps1024
+        benchmark: mbpp
+        output_path: outputs/arness/arness_trace_mbpp_sample6
+        params:
+          sample_indices: [6]
+          gen_length: 1024
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          gen_steps: [1024]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+          
   temp_threshold_study:
     description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
     output_path: outputs/temp_threshold_study
