@@ -6,11 +6,11 @@ This is the GPU-side half of the split workflow:
   test_config.yaml -> generated OpenCompass config -> OpenCompass -m infer
 
 Outputs are written under the same condition layout as run_test.py, rooted at
-outputs/ by default:
-  outputs/<task_name>/<compact_experiment>/<visual_condition>/
+model_outputs/ by default:
+  model_outputs/<task_name>/<compact_experiment>/<visual_condition>/
 
 It intentionally does not run OpenCompass evaluation. Use run_outputs.py later
-on the saved outputs directory to evaluate/reuse the inference outputs.
+on the saved model_outputs directory to evaluate/reuse the inference outputs.
 """
 
 from __future__ import annotations
@@ -291,8 +291,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-root",
-        default="outputs",
-        help="Root for saved inference outputs. Default: outputs",
+        default="model_outputs",
+        help="Root for saved inference outputs. Default: model_outputs",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print commands only.")
     args = parser.parse_args()

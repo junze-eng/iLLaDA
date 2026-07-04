@@ -7,7 +7,7 @@ created by run_model.py, then runs OpenCompass in eval/viz mode with -r to reuse
 already generated predictions.
 
 Typical usage:
-  python run_outputs.py --root outputs/arness/mbpp_s6
+  python run_outputs.py --root model_outputs/arness/mbpp_s6
 """
 
 from __future__ import annotations
@@ -127,7 +127,7 @@ def run_command(command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
 def resolve_from_manifest(record: Dict[str, Any], manifest_path: Path, key: str) -> Path:
     """Resolve an absolute path, falling back to *_rel under manifest directory.
 
-    This makes outputs portable after copying the outputs tree from GPU to local.
+    This makes outputs portable after copying the model_outputs tree from GPU to local.
     """
     raw = record.get(key)
     if raw:
@@ -200,8 +200,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--root",
-        default="outputs",
-        help="Outputs root, an experiment folder, or an infer_manifest.jsonl file.",
+        default="model_outputs",
+        help="model_outputs root, an experiment folder, or an infer_manifest.jsonl file.",
     )
     parser.add_argument(
         "--only",
