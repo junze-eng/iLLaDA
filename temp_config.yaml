@@ -4,7 +4,7 @@
 #   2) New RULER double-needle 8k context, 3 needle pairs x 3 TPS, 10 samples each
 
 run:
-  tasks: [runmodel_arness, runmodel_context_double_8k_tps]
+  tasks: [runmodel_context_double_8k_tps]
 
 execution:
   stop_on_error: true
@@ -79,8 +79,8 @@ tasks:
         benchmark: ruler_niah_double_2
         params:
           num_samples: 10
-          gen_length: 64
-          gen_blocksize: 64
+          gen_length: 128
+          gen_blocksize: 32
           max_seq_len: 8192
           min_transfer_tokens: 1
           return_trace: false
@@ -88,4 +88,4 @@ tasks:
         sweep:
           context_length: [8192]
           needle_pair: [front_middle, front_back, middle_back]
-          gen_steps: [64, 32, 16]
+          gen_steps: [128, 64, 32]
