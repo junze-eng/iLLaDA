@@ -10,8 +10,8 @@ main questions are:
   - whether updates are spread across the generated span or concentrated left-to-right.
 
 Usage:
-  python native_visual.py --root native_outputs/w1_4b/native_w1_trace_focus --all
-  python native_visual.py --run native_outputs/w1_4b/native_w1_trace_focus/gsm8k/s7_l256_w1samgidd_w1st32
+  python native_visual.py --root native_outputs --output-root visual --all
+  python native_visual.py --run native_outputs/w1_4b/native_w1_trace_focus/gsm8k/s7_l256_w1samgidd_w1st32 --output-root visual
 """
 from __future__ import annotations
 
@@ -67,13 +67,15 @@ def flatten_positions(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, int]]:
     return points
 
 
-def write_trace_summary(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def write_trace_summary(run_dir: Path, output_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     steps = len(rows)
     counts = [selected_count(r) for r in rows]
     remain_after = [safe_int(r.get("mask_count_after"), -1) for r in rows if r.get("mask_count_after") is not None]
     points = flatten_positions(rows)
     summary = {
         "trace_path": str(run_dir / "trace.jsonl"),
+        "visual_dir": str(output_dir),
         "steps_recorded": steps,
         "total_changed_positions": sum(counts),
         "avg_changed_positions_per_step": (sum(counts) / steps) if steps else None,
@@ -81,9 +83,9 @@ def write_trace_summary(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
         "final_mask_count_after": remain_after[-1] if remain_after else None,
         "position_points": len(points),
     }
-    (run_dir / "native_trace_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_dir / "native_trace_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    with (run_dir / "native_trace_steps.csv").open("w", encoding="utf-8", newline="") as f:
+    with (output_dir / "native_trace_steps.csv").open("w", encoding="utf-8", newline="") as f:
         fieldnames = ["step_idx", "selected_count", "mask_count_before", "mask_count_after", "t", "sampler"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -100,7 +102,7 @@ def write_trace_summary(run_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
     return summary
 
 
-def plot_run(run_dir: Path) -> Optional[Dict[str, Any]]:
+def plot_run(run_dir: Path, output_dir: Path) -> Optional[Dict[str, Any]]:
     rows = read_jsonl(run_dir / "trace.jsonl")
     if not rows:
         return None
@@ -114,7 +116,7 @@ def plot_run(run_dir: Path) -> Optional[Dict[str, Any]]:
     before = [safe_int(r.get("mask_count_before"), 0) for r in rows]
     after = [safe_int(r.get("mask_count_after"), 0) for r in rows]
 
-    summary = write_trace_summary(run_dir, rows)
+    summary = write_trace_summary(run_dir, output_dir, rows)
 
     fig = plt.figure(figsize=(8, 4.5))
     plt.plot(steps, counts, marker="o", linewidth=1)
@@ -122,7 +124,7 @@ def plot_run(run_dir: Path) -> Optional[Dict[str, Any]]:
     plt.ylabel("changed / selected positions")
     plt.title("Native trace: positions changed per step")
     plt.tight_layout()
-    fig.savefig(run_dir / "trace_selected_per_step.png", dpi=180)
+    fig.savefig(output_dir / "trace_selected_per_step.png", dpi=180)
     plt.close(fig)
 
     fig = plt.figure(figsize=(8, 4.5))
@@ -135,7 +137,7 @@ def plot_run(run_dir: Path) -> Optional[Dict[str, Any]]:
     plt.title("Native trace: mask count over time")
     plt.legend()
     plt.tight_layout()
-    fig.savefig(run_dir / "trace_remaining_masks.png", dpi=180)
+    fig.savefig(output_dir / "trace_remaining_masks.png", dpi=180)
     plt.close(fig)
 
     points = flatten_positions(rows)
@@ -146,7 +148,7 @@ def plot_run(run_dir: Path) -> Optional[Dict[str, Any]]:
         plt.ylabel("generated-token position")
         plt.title("Native trace: changed positions")
         plt.tight_layout()
-        fig.savefig(run_dir / "trace_position_scatter.png", dpi=180)
+        fig.savefig(output_dir / "trace_position_scatter.png", dpi=180)
         plt.close(fig)
 
     return summary
@@ -160,17 +162,30 @@ def find_trace_dirs(root: Path) -> List[Path]:
     return sorted({p.parent for p in root.rglob("trace.jsonl")})
 
 
+def visual_dir_for(run_dir: Path, root: Path, output_root: Path) -> Path:
+    try:
+        rel = run_dir.resolve().relative_to(root.resolve())
+    except Exception:
+        # For --run outside --root, keep enough context but avoid absolute paths.
+        parts = run_dir.parts[-4:] if len(run_dir.parts) >= 4 else run_dir.parts
+        rel = Path(*parts)
+    return output_root / rel
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot native W1/iLLaDA trace artifacts.")
     parser.add_argument("--root", default="native_outputs", help="Root directory to search when --all is set.")
+    parser.add_argument("--output-root", default="visual", help="Where generated figures are written. Default: visual/")
     parser.add_argument("--run", help="Specific evaluated/model-output run directory containing trace.jsonl.")
     parser.add_argument("--all", action="store_true", help="Plot every trace.jsonl under --root.")
     args = parser.parse_args()
 
+    root = Path(args.root)
+    output_root = Path(args.output_root)
     if args.run:
         dirs = find_trace_dirs(Path(args.run))
     else:
-        dirs = find_trace_dirs(Path(args.root)) if args.all else find_trace_dirs(Path(args.root))
+        dirs = find_trace_dirs(root) if args.all else find_trace_dirs(root)
 
     if not dirs:
         print("No trace.jsonl found.")
@@ -179,12 +194,13 @@ def main() -> int:
     ok = 0
     for d in dirs:
         try:
-            summary = plot_run(d)
+            out_dir = visual_dir_for(d, root, output_root)
+            summary = plot_run(d, out_dir)
             if summary is None:
                 print(f"[skip] {d}: empty trace")
                 continue
             ok += 1
-            print(f"[plot] {d} | steps={summary.get('steps_recorded')} avg_changed={summary.get('avg_changed_positions_per_step')}")
+            print(f"[plot] {d} -> {out_dir} | steps={summary.get('steps_recorded')} avg_changed={summary.get('avg_changed_positions_per_step')}")
         except Exception as exc:
             print(f"[error] {d}: {exc}")
     print(f"Plotted {ok}/{len(dirs)} trace run(s).")

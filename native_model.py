@@ -11,13 +11,13 @@ all selected sweep conditions are generated in the same process.  This avoids th
 old repeated load cost across gen_steps/threshold/config sweeps.
 
 Supported backends:
-  - illada: native masked-diffusion generation via generate.py
+  - illada: internal backend key for iLLaDA native masked-diffusion generation via generate.py
   - hf_causal / hf: HuggingFace AutoModelForCausalLM.generate
   - w1_4b / whale4b: local WhaleTech W1-4B dLLM release via SamplingRunner
   - openai_compatible / api: POST /chat/completions style local/API model
 
 If the config has no top-level `models:` block, the legacy top-level `model:`
-block is treated as an iLLaDA model named by `abbr` or `illada`.
+block is treated as an iLLaDA model named by `abbr` or `iLLaDA`.
 """
 
 from __future__ import annotations
@@ -79,8 +79,50 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=False, default=json_default) + "\n")
 
 
+def safe_model_name(value: str) -> str:
+    """Filesystem-safe model name that preserves canonical casing.
+
+    We keep iLLaDA as `iLLaDA` in model_outputs/native_outputs while still
+    accepting lowercase CLI/config aliases such as `illada`.
+    """
+    text = re.sub(r"[^0-9a-zA-Z]+", "_", str(value)).strip("_")
+    text = re.sub(r"_+", "_", text)
+    return text or "model"
+
+
 def model_alias(model_cfg: Dict[str, Any]) -> str:
-    return safe_name(str(model_cfg.get("name") or model_cfg.get("abbr") or Path(str(model_cfg.get("path", "model"))).name or "model"))
+    return safe_model_name(str(model_cfg.get("name") or model_cfg.get("abbr") or Path(str(model_cfg.get("path", "model"))).name or "model"))
+
+
+def model_keys(model_cfg: Dict[str, Any]) -> Set[str]:
+    """All names that should select this model.
+
+    This lets config use the canonical `iLLaDA` while old commands such as
+    `--models illada` continue to work.
+    """
+    keys: Set[str] = set()
+    for value in (model_cfg.get("name"), model_cfg.get("abbr"), model_cfg.get("backend"), model_alias(model_cfg)):
+        if value is None:
+            continue
+        value = str(value)
+        keys.add(value)
+        keys.add(value.lower())
+        keys.add(safe_name(value))
+        keys.add(safe_model_name(value))
+    return {k for k in keys if k}
+
+
+def model_selected(model_cfg: Dict[str, Any], selected: Optional[Set[str]]) -> bool:
+    if not selected:
+        return True
+    wanted: Set[str] = set()
+    for item in selected:
+        item = str(item)
+        wanted.add(item)
+        wanted.add(item.lower())
+        wanted.add(safe_name(item))
+        wanted.add(safe_model_name(item))
+    return bool(model_keys(model_cfg) & wanted)
 
 
 def normalize_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -99,7 +141,7 @@ def normalize_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             models.append(cfg)
     if not models:
         legacy = deepcopy(config.get("model", {}) or {})
-        legacy.setdefault("name", legacy.get("abbr", "illada"))
+        legacy.setdefault("name", legacy.get("abbr", "iLLaDA"))
         legacy.setdefault("backend", "illada")
         if legacy.get("type") in {"instruct", "base"}:
             legacy.setdefault("backend", "illada")
@@ -131,7 +173,7 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
 
 
 def output_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return root / safe_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / safe_model_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def prepared_input_path(config: Dict[str, Any], condition: Dict[str, Any]) -> Path:
@@ -1270,10 +1312,10 @@ def main() -> int:
                 input_path = base_override / str(condition["benchmark"]) / "original_source"
         for model_cfg in all_models:
             alias = model_alias(model_cfg)
-            if explicit_models and alias not in explicit_models and str(model_cfg.get("name")) not in explicit_models:
+            if not model_selected(model_cfg, explicit_models):
                 continue
             exp_models = condition.get("experiment_models")
-            if exp_models and alias not in exp_models and str(model_cfg.get("name")) not in exp_models:
+            if not model_selected(model_cfg, exp_models):
                 continue
             out_dir = output_dir_for(output_root, alias, condition)
             plan.append((model_cfg, condition, input_path, out_dir))

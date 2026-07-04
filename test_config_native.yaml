@@ -2,9 +2,9 @@
 #
 # Workflow:
 #   1) python prepare_data.py --config test_config_native.yaml --only <task-or-experiment> --force
-#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b] --auto-prepare
-#   3) python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models illada [w1_4b]
-#   4) python native_visual.py --root native_outputs --all
+#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --only <task-or-experiment> --models iLLaDA [w1_4b] --auto-prepare
+#   3) python native_output.py --config test_config_native.yaml --only <task-or-experiment> --models iLLaDA [w1_4b]
+#   4) python native_visual.py --root native_outputs --output-root visual --all
 #
 # Paths:
 #   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl; GSM8K/MBPP/custom_math use original sources
@@ -24,7 +24,7 @@ data:
   ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
 
 models:
-  - name: illada
+  - name: iLLaDA
     backend: illada
     type: instruct
     path: GSAI-ML/iLLaDA-8B-Instruct
@@ -193,9 +193,9 @@ tasks:
   native_quick_compare:
     description: "One-sample native comparison across core experiment families."
     experiments:
-      - name: native_parallel_gsm8k_s7_illada
+      - name: native_parallel_gsm8k_s7_iLLaDA
         benchmark: gsm8k
-        models: [illada]
+        models: [iLLaDA]
         params:
           sample_indices: [7]
           gen_length: 256
@@ -221,7 +221,7 @@ tasks:
 
       - name: native_context_order2_smoke_compare
         benchmark: ruler_niah_double_2
-        models: [illada, w1_4b]
+        models: [iLLaDA, w1_4b]
         params:
           num_samples: 3
           gen_length: 64
@@ -237,7 +237,7 @@ tasks:
 
       - name: native_mbpp_s6_compare
         benchmark: mbpp
-        models: [illada, w1_4b]
+        models: [iLLaDA, w1_4b]
         params:
           sample_indices: [6]
           gen_length: 512
@@ -256,7 +256,7 @@ tasks:
     experiments:
       - name: native_arness_trace_gsm8k_sample7
         benchmark: gsm8k
-        models: [illada]
+        models: [iLLaDA]
         params:
           sample_indices: [7]
           gen_length: 256
@@ -271,7 +271,7 @@ tasks:
 
       - name: native_arness_trace_mbpp_sample6
         benchmark: mbpp
-        models: [illada]
+        models: [iLLaDA]
         params:
           sample_indices: [6]
           gen_length: 512
@@ -288,9 +288,9 @@ tasks:
   native_context_order2_illada:
     description: "Two-needle long-context ordered retrieval for iLLaDA up to 8k."
     experiments:
-      - name: native_context_order2_illada_2_4_8k
+      - name: native_context_order2_iLLaDA_2_4_8k
         benchmark: ruler_niah_double_2
-        models: [illada]
+        models: [iLLaDA]
         params:
           num_samples: 20
           gen_length: 64
@@ -303,6 +303,26 @@ tasks:
         sweep:
           context_length: [2048, 4096, 8192]
           needle_pair: [front_middle, front_back, middle_back]
+
+  native_context_double_8k_tps:
+    description: "iLLaDA 8k double-needle ordered retrieval; 3 needle-pair placements x 3 token-per-step settings."
+    experiments:
+      - name: native_context_double_8k_tps_iLLaDA
+        benchmark: ruler_niah_double_2
+        models: [iLLaDA]
+        params:
+          num_samples: 10
+          gen_length: 64
+          gen_blocksize: 64
+          max_new_tokens: 64
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: false
+          seed: 42
+        sweep:
+          context_length: [8192]
+          needle_pair: [front_middle, front_back, middle_back]
+          gen_steps: [64, 32, 16]
 
   # W1 context comparison is limited to 4096 by the W1 public config.
   native_context_order2_w1:

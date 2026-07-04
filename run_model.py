@@ -166,6 +166,16 @@ def model_alias(model_cfg: Dict[str, Any], override: Optional[str] = None) -> st
     return safe_path_segment(Path(raw).name if "/" in raw else raw)
 
 
+
+def localize_opencompass_config_text(text: str) -> str:
+    """Keep run_test-style OpenCompass config imports unchanged.
+
+    The generated configs should keep ``with read_base(): from opencompass.configs...``.
+    We make the package-data path visible with ensure_opencompass_configs_available()
+    before launching OpenCompass.
+    """
+    return text
+
 def strip_opencompass_control_args(args: Sequence[Any] | None) -> List[str]:
     """Keep user extra OpenCompass args, but remove mode/workdir/reuse controls."""
     cleaned: List[str] = []
@@ -226,111 +236,173 @@ def run_command(command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
     return proc.wait()
 
 
-def current_gpu_snapshot() -> Dict[str, Any]:
-    command = [
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw",
-        "--format=csv,noheader,nounits",
+
+
+
+
+def _find_opencompass_configs_dir() -> Optional[Path]:
+    """Return the real OpenCompass configs directory if this checkout has one.
+
+    Do not assume that ``mbpp_gen.py`` exists. Some OpenCompass versions use
+    hashed/deprecated MBPP config names, and some pip/editable installs do not
+    ship the configs tree at all. This helper only returns a configs root when
+    it can prove that an MBPP dataset config is available under it.
+    """
+    candidates = [
+        OPENCOMPASS_DIR / "configs",
+        OPENCOMPASS_DIR / "opencompass" / "configs",
+        ROOT / "configs",
     ]
+    probes = [
+        Path("datasets") / "mbpp" / "mbpp_gen.py",
+        Path("datasets") / "mbpp" / "mbpp_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_passk_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_repeat10_gen_1e1056.py",
+    ]
+    for candidate in candidates:
+        if any((candidate / p).exists() for p in probes):
+            return candidate.resolve()
+
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {"available": False}
-    if result.returncode != 0:
-        return {"available": False, "error": result.stderr.strip()}
-    rows: List[Dict[str, Any]] = []
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) == 6:
-            rows.append(
-                {
-                    "index": parts[0],
-                    "name": parts[1],
-                    "memory_used_mb": parts[2],
-                    "memory_total_mb": parts[3],
-                    "utilization_gpu_percent": parts[4],
-                    "power_draw_w": parts[5],
-                }
-            )
-    return {"available": True, "gpus": rows}
+        for hit in OPENCOMPASS_DIR.rglob("*mbpp*gen*.py"):
+            parts = list(hit.resolve().parts)
+            for i, part in enumerate(parts):
+                if part == "configs" and "datasets" in parts[i + 1 :] and "mbpp" in parts[i + 1 :]:
+                    return Path(*parts[: i + 1]).resolve()
+    except Exception:
+        pass
+    return None
 
 
-class GpuTelemetry:
-    def __init__(self, output_path: Path, interval_seconds: float = 1.0):
-        self.output_path = output_path
-        self.interval_seconds = interval_seconds
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+def _mbpp_gen_fallback_text() -> str:
+    """A minimal OpenCompass MBPP config compatible with run_test imports."""
+    return """
+from opencompass.openicl.icl_prompt_template import PromptTemplate
+from opencompass.openicl.icl_retriever import ZeroRetriever
+from opencompass.openicl.icl_inferencer import GenInferencer
+from opencompass.datasets import MBPPDataset, MBPPEvaluator
 
-    def start(self) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+mbpp_reader_cfg = dict(input_columns=['text', 'test_list'], output_column='test_list_2')
 
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(2.0, self.interval_seconds * 2))
+mbpp_infer_cfg = dict(
+    prompt_template=dict(
+        type=PromptTemplate,
+        template=dict(
+            round=[
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a function to find the similar elements from the given two tuple lists.\\nYour code should pass these tests:\\n\\n assert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)\\n assert similar_elements((1, 2, 3, 4),(5, 4, 3, 7)) == (3, 4) \\n assert similar_elements((11, 12, 14, 13),(17, 15, 14, 13)) == (13, 14) \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'def similar_elements(test_tup1, test_tup2):\\\\n    res = tuple(set(test_tup1) & set(test_tup2))\\\\n    return (res)'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a python function to identify non-prime numbers.\\nYour code should pass these tests:\\n\\n assert is_not_prime(2) == False \\n assert is_not_prime(10) == True \\n assert is_not_prime(35) == True \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'import math\\\\ndef is_not_prime(n):\\\\n    result = False\\\\n    for i in range(2,int(math.sqrt(n)) + 1):\\\\n        if n % i == 0:\\\\n            result = True\\\\n    return result'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a function to find the largest integers from a given list of numbers using heap queue algorithm.\\nYour code should pass these tests:\\n\\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],3)==[85, 75, 65] \\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],2)==[85, 75] \\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65, 58, 35] \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'import heapq as hq\\\\ndef heap_queue_largest(nums,n):\\\\n    largest_nums = hq.nlargest(n, nums)\\\\n    return largest_nums'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: {text} Your code should pass these tests:\\n\\n {test_list} \\n'),
+                dict(role='BOT', prompt='[BEGIN]\\n'),
+            ],
+        ),
+    ),
+    retriever=dict(type=ZeroRetriever),
+    inferencer=dict(type=GenInferencer, max_out_len=512),
+)
 
-    def _run(self) -> None:
-        fields = [
-            "timestamp_utc",
-            "gpu_index",
-            "gpu_name",
-            "utilization_gpu_percent",
-            "memory_used_mb",
-            "memory_total_mb",
-            "power_draw_w",
-            "temperature_gpu_c",
-        ]
-        query = [
-            "nvidia-smi",
-            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        with self.output_path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            while not self._stop.is_set():
-                timestamp = utc_now()
+mbpp_eval_cfg = dict(evaluator=dict(type=MBPPEvaluator), pred_role='BOT')
+
+mbpp_datasets = [
+    dict(
+        type=MBPPDataset,
+        abbr='mbpp',
+        path='./data/mbpp/mbpp.jsonl',
+        reader_cfg=mbpp_reader_cfg,
+        infer_cfg=mbpp_infer_cfg,
+        eval_cfg=mbpp_eval_cfg,
+    )
+]
+""".lstrip()
+
+
+def _write_mbpp_config_fallback(configs_root: Path) -> None:
+    mbpp_dir = configs_root / "datasets" / "mbpp"
+    mbpp_dir.mkdir(parents=True, exist_ok=True)
+    for pkg_dir in [configs_root, configs_root / "datasets", mbpp_dir]:
+        init = pkg_dir / "__init__.py"
+        if not init.exists():
+            init.write_text("", encoding="utf-8")
+    target = mbpp_dir / "mbpp_gen.py"
+    if not target.exists():
+        target.write_text(_mbpp_gen_fallback_text(), encoding="utf-8")
+
+
+def ensure_opencompass_configs_available() -> None:
+    """Make ``opencompass.configs.datasets.mbpp.mbpp_gen`` resolvable.
+
+    Keep the run_test config style (``with read_base()`` and
+    ``from opencompass.configs...``). If the local/pip OpenCompass checkout does
+    not ship configs, create the minimal MBPP config at the package locations
+    MMEngine actually checks.
+    """
+    probe_rel = Path("datasets") / "mbpp" / "mbpp_gen.py"
+    src = _find_opencompass_configs_dir()
+
+    candidates: Set[Path] = set()
+    candidates.add(OPENCOMPASS_DIR / "opencompass" / "configs")
+    candidates.add(OPENCOMPASS_DIR / "configs")
+
+    try:
+        import site
+        site_paths = [site.getusersitepackages()]
+        try:
+            site_paths.extend(site.getsitepackages())
+        except Exception:
+            pass
+        for base in site_paths:
+            if base:
+                candidates.add(Path(base) / "opencompass" / "configs")
+    except Exception:
+        pass
+
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("opencompass")
+        if spec and spec.origin:
+            candidates.add(Path(spec.origin).resolve().parent / "configs")
+    except Exception:
+        pass
+
+    errors: List[str] = []
+    for dst in sorted(candidates, key=lambda p: str(p).lower()):
+        try:
+            if src is not None and src.exists():
                 try:
-                    result = subprocess.run(
-                        query,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    if result.returncode == 0:
-                        for line in result.stdout.splitlines():
-                            parts = [part.strip() for part in line.split(",")]
-                            if len(parts) == 7:
-                                writer.writerow(
-                                    {
-                                        "timestamp_utc": timestamp,
-                                        "gpu_index": parts[0],
-                                        "gpu_name": parts[1],
-                                        "utilization_gpu_percent": parts[2],
-                                        "memory_used_mb": parts[3],
-                                        "memory_total_mb": parts[4],
-                                        "power_draw_w": parts[5],
-                                        "temperature_gpu_c": parts[6],
-                                    }
-                                )
-                    else:
-                        writer.writerow({"timestamp_utc": timestamp})
-                    f.flush()
-                except (OSError, subprocess.TimeoutExpired):
-                    writer.writerow({"timestamp_utc": timestamp})
-                    f.flush()
-                self._stop.wait(self.interval_seconds)
+                    same = dst.resolve() == src.resolve()
+                except Exception:
+                    same = False
+                if not same:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+            _write_mbpp_config_fallback(dst)
+        except Exception as exc:
+            errors.append(f"{dst}: {exc}")
 
+    ready = [dst for dst in candidates if (dst / probe_rel).exists()]
+    if not ready:
+        raise RuntimeError(
+            "Failed to expose/create OpenCompass MBPP config. "
+            f"OPENCOMPASS_DIR={OPENCOMPASS_DIR}; src={src}; errors={' ; '.join(errors)}"
+        )
 
 def opencompass_timestamp_dirs(work_dir: Path) -> Set[str]:
     if not work_dir.exists():
@@ -455,6 +527,7 @@ def main() -> int:
     telemetry_enabled = bool(telemetry_cfg.get("enabled", True))
     telemetry_interval = float(telemetry_cfg.get("interval_seconds", 1.0))
 
+    ensure_opencompass_configs_available()
     env = build_env()
     planned = 0
     for experiment in experiments:
@@ -521,6 +594,7 @@ def main() -> int:
                     experiment_params=merged_params,
                     data_cfg=data_cfg,
                 )
+                config_text = localize_opencompass_config_text(config_text)
                 generated_config.write_text(config_text, encoding="utf-8")
 
                 run_config = {

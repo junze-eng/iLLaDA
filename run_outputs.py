@@ -321,6 +321,187 @@ def run_command(command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
     return proc.wait()
 
 
+
+
+
+def _find_opencompass_configs_dir() -> Optional[Path]:
+    """Return the real OpenCompass configs directory if this checkout has one.
+
+    Do not assume that ``mbpp_gen.py`` exists. Some OpenCompass versions use
+    hashed/deprecated MBPP config names, and some pip/editable installs do not
+    ship the configs tree at all. This helper only returns a configs root when
+    it can prove that an MBPP dataset config is available under it.
+    """
+    candidates = [
+        OPENCOMPASS_DIR / "configs",
+        OPENCOMPASS_DIR / "opencompass" / "configs",
+        ROOT / "configs",
+    ]
+    probes = [
+        Path("datasets") / "mbpp" / "mbpp_gen.py",
+        Path("datasets") / "mbpp" / "mbpp_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_passk_gen_1e1056.py",
+        Path("datasets") / "mbpp" / "deprecated_mbpp_repeat10_gen_1e1056.py",
+    ]
+    for candidate in candidates:
+        if any((candidate / p).exists() for p in probes):
+            return candidate.resolve()
+
+    try:
+        for hit in OPENCOMPASS_DIR.rglob("*mbpp*gen*.py"):
+            parts = list(hit.resolve().parts)
+            for i, part in enumerate(parts):
+                if part == "configs" and "datasets" in parts[i + 1 :] and "mbpp" in parts[i + 1 :]:
+                    return Path(*parts[: i + 1]).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _mbpp_gen_fallback_text() -> str:
+    """A minimal OpenCompass MBPP config compatible with run_test imports."""
+    return """
+from opencompass.openicl.icl_prompt_template import PromptTemplate
+from opencompass.openicl.icl_retriever import ZeroRetriever
+from opencompass.openicl.icl_inferencer import GenInferencer
+from opencompass.datasets import MBPPDataset, MBPPEvaluator
+
+mbpp_reader_cfg = dict(input_columns=['text', 'test_list'], output_column='test_list_2')
+
+mbpp_infer_cfg = dict(
+    prompt_template=dict(
+        type=PromptTemplate,
+        template=dict(
+            round=[
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a function to find the similar elements from the given two tuple lists.\\nYour code should pass these tests:\\n\\n assert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)\\n assert similar_elements((1, 2, 3, 4),(5, 4, 3, 7)) == (3, 4) \\n assert similar_elements((11, 12, 14, 13),(17, 15, 14, 13)) == (13, 14) \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'def similar_elements(test_tup1, test_tup2):\\\\n    res = tuple(set(test_tup1) & set(test_tup2))\\\\n    return (res)'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a python function to identify non-prime numbers.\\nYour code should pass these tests:\\n\\n assert is_not_prime(2) == False \\n assert is_not_prime(10) == True \\n assert is_not_prime(35) == True \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'import math\\\\ndef is_not_prime(n):\\\\n    result = False\\\\n    for i in range(2,int(math.sqrt(n)) + 1):\\\\n        if n % i == 0:\\\\n            result = True\\\\n    return result'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: Write a function to find the largest integers from a given list of numbers using heap queue algorithm.\\nYour code should pass these tests:\\n\\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],3)==[85, 75, 65] \\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],2)==[85, 75] \\n assert heap_queue_largest( [25, 35, 22, 85, 14, 65, 75, 22, 58],5)==[85, 75, 65, 58, 35] \\n'),
+                dict(
+                    role='BOT',
+                    prompt=\"[BEGIN]\\n'import heapq as hq\\\\ndef heap_queue_largest(nums,n):\\\\n    largest_nums = hq.nlargest(n, nums)\\\\n    return largest_nums'\\n[DONE]\\n\\n\"),
+                dict(
+                    role='HUMAN',
+                    prompt='You are an expert Python programmer, and here is your task: {text} Your code should pass these tests:\\n\\n {test_list} \\n'),
+                dict(role='BOT', prompt='[BEGIN]\\n'),
+            ],
+        ),
+    ),
+    retriever=dict(type=ZeroRetriever),
+    inferencer=dict(type=GenInferencer, max_out_len=512),
+)
+
+mbpp_eval_cfg = dict(evaluator=dict(type=MBPPEvaluator), pred_role='BOT')
+
+mbpp_datasets = [
+    dict(
+        type=MBPPDataset,
+        abbr='mbpp',
+        path='./data/mbpp/mbpp.jsonl',
+        reader_cfg=mbpp_reader_cfg,
+        infer_cfg=mbpp_infer_cfg,
+        eval_cfg=mbpp_eval_cfg,
+    )
+]
+""".lstrip()
+
+
+def _write_mbpp_config_fallback(configs_root: Path) -> None:
+    mbpp_dir = configs_root / "datasets" / "mbpp"
+    mbpp_dir.mkdir(parents=True, exist_ok=True)
+    for pkg_dir in [configs_root, configs_root / "datasets", mbpp_dir]:
+        init = pkg_dir / "__init__.py"
+        if not init.exists():
+            init.write_text("", encoding="utf-8")
+    target = mbpp_dir / "mbpp_gen.py"
+    if not target.exists():
+        target.write_text(_mbpp_gen_fallback_text(), encoding="utf-8")
+
+
+def ensure_opencompass_configs_available() -> None:
+    """Make ``opencompass.configs.datasets.mbpp.mbpp_gen`` resolvable.
+
+    Keep the run_test config style (``with read_base()`` and
+    ``from opencompass.configs...``). If the local/pip OpenCompass checkout does
+    not ship configs, create the minimal MBPP config at the package locations
+    MMEngine actually checks.
+    """
+    probe_rel = Path("datasets") / "mbpp" / "mbpp_gen.py"
+    src = _find_opencompass_configs_dir()
+
+    candidates: Set[Path] = set()
+    candidates.add(OPENCOMPASS_DIR / "opencompass" / "configs")
+    candidates.add(OPENCOMPASS_DIR / "configs")
+
+    try:
+        import site
+        site_paths = [site.getusersitepackages()]
+        try:
+            site_paths.extend(site.getsitepackages())
+        except Exception:
+            pass
+        for base in site_paths:
+            if base:
+                candidates.add(Path(base) / "opencompass" / "configs")
+    except Exception:
+        pass
+
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("opencompass")
+        if spec and spec.origin:
+            candidates.add(Path(spec.origin).resolve().parent / "configs")
+    except Exception:
+        pass
+
+    errors: List[str] = []
+    for dst in sorted(candidates, key=lambda p: str(p).lower()):
+        try:
+            if src is not None and src.exists():
+                try:
+                    same = dst.resolve() == src.resolve()
+                except Exception:
+                    same = False
+                if not same:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+            _write_mbpp_config_fallback(dst)
+        except Exception as exc:
+            errors.append(f"{dst}: {exc}")
+
+    ready = [dst for dst in candidates if (dst / probe_rel).exists()]
+    if not ready:
+        raise RuntimeError(
+            "Failed to expose/create OpenCompass MBPP config. "
+            f"OPENCOMPASS_DIR={OPENCOMPASS_DIR}; src={src}; errors={' ; '.join(errors)}"
+        )
+
+def localize_opencompass_config_text(text: str) -> str:
+    """Keep run_test-style OpenCompass config imports unchanged.
+
+    The generated configs use ``with read_base(): from opencompass.configs...``.
+    That is the format MMEngine expects.  We make the package-data path visible
+    with ensure_opencompass_configs_available() instead of rewriting imports.
+    """
+    return text
+
+
+def localize_opencompass_config_file(config_path: Path, work_dir: Path) -> Path:
+    ensure_opencompass_configs_available()
+    return config_path
+
 def resolve_from_manifest(record: Dict[str, Any], manifest_path: Path, key: str) -> Path:
     """Resolve an absolute path, falling back to *_rel under manifest directory.
 
@@ -740,6 +921,11 @@ def materialize_evaluated_outputs(
         raise FileNotFoundError(f"Missing raw outputs_jsonl: {outputs_jsonl}")
     raw_rows = read_jsonl_list(outputs_jsonl)
     eval_rows, official_metrics, detail_sources = collect_opencompass_details(timestamp_dir)
+    if not eval_rows and not official_metrics:
+        raise FileNotFoundError(
+            f"No OpenCompass eval artifacts found under {timestamp_dir / 'results'} "
+            f"or {timestamp_dir / 'predictions'}"
+        )
     scored_outputs, scores = merge_eval_rows(raw_rows, eval_rows)
     metrics = aggregate_scores(scores, official_metrics)
 
@@ -946,6 +1132,7 @@ def main() -> int:
         searched = ", ".join(str(x) for x in search_roots)
         raise SystemExit(f"No infer_manifest.jsonl found under: {searched}")
 
+    ensure_opencompass_configs_available()
     env = build_env()
     extra_args = strip_opencompass_control_args(args.extra_opencompass_args or [])
     total = 0
@@ -958,6 +1145,17 @@ def main() -> int:
         done_keys: Set[str] = set()
         if eval_manifest.exists() and not args.force:
             for item in read_jsonl(eval_manifest):
+                # Only a successful OpenCompass subprocess should be treated as done.
+                # Older versions recorded failed attempts in eval_manifest.jsonl before
+                # returning non-zero, which made later runs print ``already evaluated``
+                # and materialize stale/unscored folders without rerunning eval.
+                rc = item.get("returncode")
+                try:
+                    rc_ok = int(rc) == 0
+                except Exception:
+                    rc_ok = False
+                if not rc_ok:
+                    continue
                 done_keys.add(
                     f"{item.get('run_name')}|{item.get('mode')}|{item.get('reuse_timestamp')}"
                 )
@@ -979,6 +1177,7 @@ def main() -> int:
 
             config_path = resolve_from_manifest(record, manifest_path, "config")
             work_dir = resolve_from_manifest(record, manifest_path, "work_dir")
+            config_path = localize_opencompass_config_file(config_path, work_dir)
             outputs_jsonl = resolve_artifact_path(record, manifest_path, "outputs_jsonl", work_dir / "outputs.jsonl")
             summary_jsonl = resolve_artifact_path(record, manifest_path, "summary_jsonl", work_dir / "summary.jsonl")
             trace_jsonl = resolve_artifact_path(record, manifest_path, "trace_jsonl", work_dir / "trace.jsonl")
