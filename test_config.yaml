@@ -207,6 +207,19 @@ tasks:
           gen_steps: [256, 64, 32]
           temperature: [0.0, 0.3]
           token_selection_confidence_threshold: [null, 0.8, 0.9]
+
+      - name: task4_gsm8k_resume_temp03
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          temperature: 0.3
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [256, 64, 32]
+          token_selection_confidence_threshold: [null, 0.8, 0.9]
   custom_benchmark:
     description: "Task 5: parallel-decoding mechanism study on custom_math (self-authored, paper-clean -- fine to use as headline evaluation evidence). task5_custom_math_ar_like/mild/strong_parallel mirror Task 1's steps-only sweep (block_length held at gen_length). task5_custom_math_block_grid extends this to the block_length=32/8 rows of a full gen_steps x block_length grid (block_length=256 row already covered by the ar_like/mild/strong experiments above) to test whether semi-autoregressive block splitting changes the strong_parallel collapse (see Task 1/Task 3 sample7 case study). task5_custom_math_overprovisioned_steps tests gen_steps > gen_length (2x) crossed with confidence threshold, to isolate whether threshold's completion_rate drop (seen in Task 3/4) is a real filtering effect or just a steps-budget artifact -- see generate.py's get_num_transfer_tokens: when steps > block_length, each masked position gets scheduled exactly once, so the threshold fallback (min_transfer_tokens) becomes unconditional and every position should eventually get force-committed. Mirrored on gsm8k as Task 6 (gsm8k_mechanism) so the two can run on separate GPUs in parallel."
     output_path: outputs/custom_benchmark
@@ -428,6 +441,22 @@ tasks:
           trace_token_snapshots: false
           trace_decode_snapshots: false
 
+      - name: dynspeed_gsm8k_sample7_block32_slow_fast_slow_1_4_1
+        benchmark: gsm8k
+        params:
+          speed_schedule_label: slow_fast_slow_1_4_1
+          sample_indices: [7]
+          gen_length: 256
+          gen_blocksize: 32
+          steps_per_block_schedule: [32, 32, 8, 8, 8, 8, 32, 32]
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
   dynamic_threshold_gsm8k:
     description: "Exploratory GSM8K per-block confidence-threshold schedule study."
     output_path: outputs/dynamic_threshold_gsm8k
@@ -492,6 +521,78 @@ tasks:
           gen_steps: 64
           threshold_schedule_label: high_to_low
           token_selection_confidence_threshold_schedule: [0.8, 0.8, 0.6, 0.6, 0.6, 0.6, null, null]
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+  step0_confidence_probe:
+    description: "Cheap ARness probe: record the model's confidence for every generation-region position (not just committed ones) at the very first diffusion step, to see how initial confidence decays with distance from the prompt. Same 5 samples as dynamic_threshold_gsm8k for consistency. Single block (block_length=gen_length) so step 0 covers the whole generation region."
+    output_path: outputs/step0_confidence_probe
+    experiments:
+      - name: step0_confidence_gsm8k_sample7_13_21_34_55
+        benchmark: gsm8k
+        params:
+          sample_indices: [7, 13, 21, 34, 55]
+          gen_length: 256
+          gen_blocksize: 256
+          gen_steps: 256
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_step0_full_confidence: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+  decode_order_probe:
+    description: "Does iLLaDA's free (confidence-based) decoding order carry real value over a forced order? Compares accuracy at matched gen_length/steps across three decode_order settings: 'confidence' (current default -- pick highest-confidence masked positions each step), 'left_to_right' (force the leftmost masked positions, ignoring confidence), 'random' (force a random subset). If confidence ~= left_to_right >> random, iLLaDA's capability is essentially autoregressive under the hood and the parallel/free-order aspect of diffusion decoding is not doing much work. If confidence is clearly better than left_to_right, the free ordering has real value. GSM8K, n=20, steps=gen_length=256 (ar_like pace, block_length=256) so the only variable is which positions get committed each step, not how many."
+    output_path: outputs/decode_order_probe
+    experiments:
+      - name: decode_order_gsm8k_confidence
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: confidence
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: decode_order_gsm8k_left_to_right
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: left_to_right
+          token_selection_confidence_threshold: null
+          min_transfer_tokens: 1
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+
+      - name: decode_order_gsm8k_random
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_steps: 256
+          gen_blocksize: 256
+          decode_order: random
           token_selection_confidence_threshold: null
           min_transfer_tokens: 1
           temperature: 0.0
