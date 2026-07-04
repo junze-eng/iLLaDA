@@ -17,7 +17,7 @@ needed by the ARness visualizer:
     <opencompass_timestamp>/...
 
 Example:
-  outputs/arness/mbpp_s6/l512_b16_st512_thr0p6/
+  outputs/arness/mbpp_s6/mbpp_sample6_len512_block16_steps512_thr0p6/
 """
 
 from __future__ import annotations
@@ -55,14 +55,6 @@ BENCHMARKS = {
         "module": "opencompass.configs.datasets.ruler.ruler_niah_single_1",
         "var": "ruler_niah_single_1_datasets",
     },
-    "ruler_niah_double_2": {
-        "module": "opencompass.configs.datasets.ruler.ruler_niah_double_2",
-        "var": "ruler_niah_double_2_datasets",
-    },
-    "ruler_niah_order_2": {
-        "module": "opencompass.configs.datasets.ruler.ruler_niah_double_2",
-        "var": "ruler_niah_double_2_datasets",
-    },
     "custom_math": {
         "module": "opencompass.configs.datasets.custom_math.custom_math_gen",
         "var": "custom_math_datasets",
@@ -70,7 +62,7 @@ BENCHMARKS = {
 }
 
 CUSTOM_BENCHMARKS: Set[str] = set()
-DATASET_PARAM_KEYS = {"context_length", "needle_position", "needle_pair", "num_samples", "depth_percents"}
+DATASET_PARAM_KEYS = {"context_length", "needle_position", "num_samples", "depth_percents"}
 EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "seed", "speed_schedule_label"} | DATASET_PARAM_KEYS
 MODEL_TYPES = {
     "instruct": "LLaDAModel",
@@ -92,8 +84,6 @@ BENCH_ALIASES = {
     "piqa": "piqa",
     "math": "math",
     "ruler_niah_single_1": "niah1",
-    "ruler_niah_double_2": "niah2",
-    "ruler_niah_order_2": "niah2",
     "custom_math": "cmath",
 }
 
@@ -102,7 +92,6 @@ PARAM_ALIASES = {
     "sample_limit": "n",
     "context_length": "ctx",
     "needle_position": "pos",
-    "needle_pair": "pair",
     "num_samples": "n",
     "gen_length": "l",
     "gen_blocksize": "b",
@@ -129,7 +118,6 @@ PREFERRED_NAME_KEYS = [
     "sample_indices",
     "context_length",
     "needle_position",
-    "needle_pair",
     "num_samples",
     "sample_limit",
     "gen_length",
@@ -388,7 +376,7 @@ def compact_experiment_name(experiment: Dict[str, Any], benchmark: Optional[str]
     raw = str(experiment.get("name") or "experiment")
     lower = safe_name(raw).lower()
     sample_match = re.search(
-        r"(?P<bench>ruler_niah_single_1|ruler_niah_double_2|ruler_niah_order_2|gsm8k|mbpp|humaneval|mmlu_pro|mmlu|arc_c|arc|hellaswag|piqa|math|custom_math)[_-]*sample(?P<idx>\d+)",
+        r"(?P<bench>ruler_niah_single_1|gsm8k|mbpp|humaneval|mmlu_pro|mmlu|arc_c|arc|hellaswag|piqa|math|custom_math)[_-]*sample(?P<idx>\d+)",
         lower,
     )
     if sample_match:
@@ -422,37 +410,23 @@ def compact_experiment_output_dir(base_output_dir: Path, experiment: Dict[str, A
     return experiment_output_dir(base_output_dir, experiment) / compact_exp_name
 
 
-def ruler_prepared_condition_id(params: Dict[str, Any], benchmark: str = "ruler_niah_single_1") -> str:
+def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
     seed = int(params.get("seed", 42) or 42)
-    gen_length = int(params.get("gen_length", 128) or 128)
-    num_samples = int(params.get("num_samples", 20) or 20)
-    if benchmark == "ruler_niah_single_1":
-        return safe_name(
-            "ruler_niah_single_1_"
-            f"ctx{params.get('context_length')}_"
-            f"pos{params.get('needle_position')}_"
-            f"gen{gen_length}_"
-            f"samples{num_samples}_"
-            f"seed{seed}"
-        )
-    if benchmark in {"ruler_niah_double_2", "ruler_niah_order_2"}:
-        return safe_name(
-            f"{benchmark}_"
-            f"ctx{params.get('context_length')}_"
-            f"pair{params.get('needle_pair')}_"
-            f"gen{gen_length}_"
-            f"samples{num_samples}_"
-            f"seed{seed}"
-        )
-    return safe_name(f"{benchmark}_seed{seed}")
+    return safe_name(
+        "ruler_niah_single_1_"
+        f"ctx{params.get('context_length')}_"
+        f"pos{params.get('needle_position')}_"
+        f"gen{params.get('gen_length', 128)}_"
+        f"samples{params.get('num_samples', 20)}_"
+        f"seed{seed}"
+    )
 
 
-def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any], benchmark: str = "ruler_niah_single_1") -> Path:
+def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any]) -> Path:
     prepared_dir = Path(data_cfg.get("prepared_dir", "data/prepared"))
     if not prepared_dir.is_absolute():
         prepared_dir = ROOT / prepared_dir
-    folder = "ruler_niah_double_2" if benchmark == "ruler_niah_order_2" else benchmark
-    return prepared_dir / folder / f"{ruler_prepared_condition_id(params, benchmark)}.jsonl"
+    return prepared_dir / "ruler_niah_single_1" / f"{ruler_prepared_condition_id(params)}.jsonl"
 
 
 def schedule_label(value: Any) -> str:
@@ -581,14 +555,13 @@ def render_opencompass_config(
         lines.append("for _dataset in datasets:")
         lines.append(f"    _dataset['path'] = {python_literal(str(custom_math_path))}")
 
-    if benchmark in {"ruler_niah_single_1", "ruler_niah_double_2", "ruler_niah_order_2"}:
+    if benchmark == "ruler_niah_single_1":
         experiment_params = experiment_params or {}
         context_length = experiment_params.get("context_length")
         num_samples = experiment_params.get("num_samples")
         needle_position = experiment_params.get("needle_position")
-        needle_pair = experiment_params.get("needle_pair")
         tokens_to_generate = model_cfg.get("gen_length")
-        prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params, benchmark)
+        prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params)
         depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
         lines.append("for _dataset in datasets:")
         lines.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
@@ -604,12 +577,6 @@ def render_opencompass_config(
             if depths is None:
                 raise SystemExit(f"Unsupported needle_position `{needle_position}` for ruler_niah_single_1.")
             lines.append(f"    _dataset['depth_percents'] = {python_literal(depths)}")
-        if needle_pair is not None:
-            # For our prepared double-needle task OpenCompass only needs to read
-            # the JSONL.  Keep metadata here so the generated config/run.json
-            # records which ordered pair was used.
-            _needle_pair = str(needle_pair)
-            lines.append(f"    _dataset['needle_pair'] = {python_literal(_needle_pair)}")
 
     model_entries = ",\n        ".join(f"{key}={python_literal(value)}" for key, value in model_cfg.items())
     lines.append("models = [")
@@ -705,14 +672,35 @@ def compact_run_label(params: Dict[str, Any], include_keys: List[str], compact_e
             keys.append(key)
     pieces: List[str] = []
     for key in keys:
-        if params.get(key) is None:
-            continue
         if key == "sample_indices" and sample_already_in_exp_name(compact_exp_dir):
             continue
         pieces.append(param_piece(key, params.get(key)))
     if not pieces:
         pieces.append(f"r{idx:03d}")
     return short_slug("_".join(pieces), max_len=96)
+
+
+def arness_visual_condition_label(benchmark: Any, params: Dict[str, Any]) -> Optional[str]:
+    """Return the condition directory name expected by visual_arness_trace.py.
+
+    The ARness visualizer keys conditions by benchmark/sample/length/block/steps/
+    threshold, so keep that name stable across the one-shot and split runners.
+    """
+    bench = safe_name(str(benchmark)).lower()
+    sample_indices = as_list(params.get("sample_indices"))
+    if bench not in {"gsm8k", "mbpp"} or len(sample_indices) != 1:
+        return None
+    required = ["gen_length", "gen_blocksize", "gen_steps"]
+    if any(params.get(key) is None for key in required):
+        return None
+    threshold = params.get("token_selection_confidence_threshold")
+    return safe_name(
+        f"{bench}_sample{int(sample_indices[0])}_"
+        f"len{int(params['gen_length'])}_"
+        f"block{int(params['gen_blocksize'])}_"
+        f"steps{int(params['gen_steps'])}_"
+        f"thr{value_to_label(threshold)}"
+    )
 
 
 def unique_label(label: str, used: Set[str], idx: int) -> str:
@@ -1028,7 +1016,12 @@ def main() -> int:
                     gpu_csv = run_dir / "gpu_telemetry.csv"
                     oc_run_name = full_run_name
                 else:
-                    run_label = unique_label(compact_run_label(merged_params, include_keys, compact_exp_dir, idx), used_labels, idx)
+                    visual_label = arness_visual_condition_label(benchmark, merged_params)
+                    run_label = unique_label(
+                        visual_label or compact_run_label(merged_params, include_keys, compact_exp_dir, idx),
+                        used_labels,
+                        idx,
+                    )
                     run_dir = exp_root / run_label
                     config_path_out = run_dir / "oc_config.py"
                     run_json = run_dir / "run.json"
@@ -1047,6 +1040,7 @@ def main() -> int:
                 model_cfg.setdefault("metrics_output", str(summary_jsonl))
                 if model_cfg.get("return_trace") or model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
                     model_cfg.setdefault("step_trace_output", str(trace_jsonl))
+                    model_cfg["arness_trace_output"] = str(run_dir / "sample_traces")
 
                 config_text = render_opencompass_config(
                     benchmark=str(benchmark),
