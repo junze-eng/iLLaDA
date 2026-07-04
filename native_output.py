@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""Native offline output materializer/evaluator for model_outputs produced by native_model.py.
+"""Native GPU generation runner for iLLaDA / W1 experiments.
 
-This script reads `test_config.yaml` and evaluates existing model outputs without
-loading any model and without invoking OpenCompass CLI.  The scoring follows the
-same practical conventions used by OpenCompass-style generation benchmarks:
+This replaces the OpenCompass inference path for mechanism-oriented tests.  It
+reads the same `test_config.yaml`, reuses prepared `inputs.jsonl` files produced
+by `prepare_data.py`, and writes model outputs under:
 
-  - GSM8K: final numeric answer extraction and exact match.
-  - MBPP: extract Python code and run the provided unit tests.
-  - RULER single needle: normalized substring recall.
-  - RULER order-2: exact ordered pair + unordered set + slot accuracies.
+    model_outputs/<model_alias>/<task>/<benchmark_alias>/<condition>/
 
-It writes final artifacts under a model-first layout:
+Important efficiency property: the model is loaded once per selected model, then
+all selected sweep conditions are generated in the same process.  This avoids the
+old repeated load cost across gen_steps/threshold/config sweeps.
 
-    native_outputs/<model_alias>/<task>/<benchmark_alias>/<condition>/
+Supported backends:
+  - illada: native masked-diffusion generation via generate.py
+  - hf_causal / hf: HuggingFace AutoModelForCausalLM.generate
+  - openai_compatible / api: POST /chat/completions style local/API model
 
-Cross-model compare.csv files are written under:
-
-    native_outputs/_compare/<task>/<benchmark_alias>/<condition>/
-
-For ARness trace runs, trace.jsonl / summary.jsonl / sample_traces are copied so
-`visual_arness_trace.py` can be pointed directly at the final output directory.
+If the config has no top-level `models:` block, the legacy top-level `model:`
+block is treated as an iLLaDA model named by `abbr` or `illada`.
 """
 
 from __future__ import annotations
@@ -27,13 +25,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import os
 import re
 import shutil
 import subprocess
-import tempfile
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -43,8 +45,11 @@ except Exception:  # pragma: no cover
     ROOT = Path(__file__).resolve().parent
     from prepare_data import as_list, deep_merge, load_yaml, safe_name, collect_experiments, expand_matrix  # type: ignore
 
-from prepare_data import bench_alias, condition_name, read_jsonl, write_jsonl, json_default
-from native_model import model_alias, normalize_models, output_dir_for
+from prepare_data import bench_alias, condition_name, prepared_dir_for, read_jsonl, write_jsonl, json_default
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def write_json(path: Path, obj: Dict[str, Any]) -> None:
@@ -68,6 +73,44 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, default=json_default) + "\n")
+
+
+def model_alias(model_cfg: Dict[str, Any]) -> str:
+    return safe_name(str(model_cfg.get("name") or model_cfg.get("abbr") or Path(str(model_cfg.get("path", "model"))).name or "model"))
+
+
+def normalize_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = config.get("models")
+    models: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                models.append({"name": item, "backend": item})
+            elif isinstance(item, dict):
+                models.append(deepcopy(item))
+    elif isinstance(raw, dict):
+        for name, item in raw.items():
+            cfg = deepcopy(item or {})
+            cfg.setdefault("name", name)
+            models.append(cfg)
+    if not models:
+        legacy = deepcopy(config.get("model", {}) or {})
+        legacy.setdefault("name", legacy.get("abbr", "illada"))
+        legacy.setdefault("backend", "illada")
+        if legacy.get("type") in {"instruct", "base"}:
+            legacy.setdefault("backend", "illada")
+        models.append(legacy)
+    for cfg in models:
+        cfg.setdefault("name", model_alias(cfg))
+        if "backend" not in cfg:
+            cfg["backend"] = "illada" if cfg.get("type") in {"instruct", "base"} else "hf_causal"
+    return models
+
+
 def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict[str, Any]]:
     defaults = config.get("defaults", {}) or {}
     for experiment in collect_experiments(config, selected):
@@ -87,309 +130,488 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
                 }
 
 
-def final_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
+def output_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
     return root / safe_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
-def compare_dir_for(root: Path, condition: Dict[str, Any]) -> Path:
-    return root / "_compare" / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
+def prepared_input_path(config: Dict[str, Any], condition: Dict[str, Any]) -> Path:
+    data_cfg = config.get("data", {}) or {}
+    base = Path(data_cfg.get("prepared_dir", "data/prepared")) / "native"
+    if not base.is_absolute():
+        base = ROOT / base
+    return prepared_dir_for(base, condition["task"], condition["benchmark"], condition["params"]) / "inputs.jsonl"
 
 
-def normalize_text(text: Any) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip()).lower()
+class GpuTelemetry:
+    def __init__(self, path: Path, interval: float = 2.0):
+        self.path = path
+        self.interval = float(interval)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "index", "name", "memory_used_mb", "memory_total_mb", "utilization_gpu", "power_draw_w"])
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval * 2, 1.0))
+
+    def _loop(self) -> None:
+        query = "index,name,memory.used,memory.total,utilization.gpu,power.draw"
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                now = utc_now()
+                with self.path.open("a", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    for line in out.splitlines():
+                        parts = [p.strip() for p in line.split(",")]
+                        writer.writerow([now] + parts)
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
 
 
-# ------------------------------- GSM8K -------------------------------------
+class GenerationResult:
+    def __init__(self, text: str, elapsed: float, tokens_generated: Optional[int] = None, trace: Optional[Dict[str, Any]] = None):
+        self.text = text
+        self.elapsed = elapsed
+        self.tokens_generated = tokens_generated
+        self.trace = trace
 
 
-def normalize_number(text: str) -> Optional[str]:
-    if text is None:
-        return None
-    text = str(text).replace(",", "")
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:/[1-9]\d*)?", text)
-    if not nums:
-        return None
-    val = nums[-1]
-    if "/" in val:
+class BaseAdapter:
+    supports_trace = False
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.alias = model_alias(cfg)
+
+    def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class ILLADAAdapter(BaseAdapter):
+    supports_trace = True
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        from generate import generate
+
+        self.torch = torch
+        self.generate_fn = generate
+        self.device = str(cfg.get("device", "cuda"))
+        path = str(cfg.get("path", "GSAI-ML/iLLaDA-8B-Instruct"))
+        model_kwargs = deepcopy(cfg.get("model_kwargs", {}) or {})
+        dtype_value = cfg.get("torch_dtype", cfg.get("dtype"))
+        if dtype_value is not None and "torch_dtype" not in model_kwargs:
+            model_kwargs["torch_dtype"] = self._parse_torch_dtype(dtype_value)
+        elif isinstance(model_kwargs.get("torch_dtype"), str):
+            model_kwargs["torch_dtype"] = self._parse_torch_dtype(model_kwargs["torch_dtype"])
+        if "torch_dtype" not in model_kwargs:
+            model_kwargs["torch_dtype"] = torch.bfloat16
+
+        self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(path, trust_remote_code=True, **model_kwargs)
+        if not model_kwargs.get("device_map"):
+            self.model = self.model.to(self.device)
+        self.model.eval()
+        self.mask_id = int(cfg.get("mask_id", 5))
+        self.apply_chat_template = bool(cfg.get("apply_chat_template", True))
+        self.path = path
+
+    def _parse_torch_dtype(self, value: Any):
+        if not isinstance(value, str):
+            return value
+        value = value.replace("torch.", "")
+        return getattr(self.torch, value)
+
+    @property
+    def model_device(self):
         try:
-            a, b = val.split("/", 1)
-            return str(float(a) / float(b)).rstrip("0").rstrip(".")
+            return self.model.device
         except Exception:
-            return val
-    try:
-        f = float(val)
-        if abs(f - int(f)) < 1e-9:
-            return str(int(f))
-        return ("%.10f" % f).rstrip("0").rstrip(".")
-    except Exception:
-        return val
+            return next(self.model.parameters()).device
 
-
-def gsm8k_gold(answer: Any) -> Optional[str]:
-    text = str(answer or "")
-    if "####" in text:
-        text = text.split("####")[-1]
-    return normalize_number(text)
-
-
-def score_gsm8k(row: Dict[str, Any]) -> Dict[str, Any]:
-    pred = normalize_number(row.get("prediction") or row.get("raw_output") or "")
-    gold = gsm8k_gold(row.get("answer"))
-    correct = pred is not None and gold is not None and pred == gold
-    return {"correct": bool(correct), "prediction_answer": pred, "gold_answer": gold, "score": 1.0 if correct else 0.0}
-
-
-# -------------------------------- MBPP --------------------------------------
-
-
-def extract_code(raw: str) -> str:
-    raw = str(raw or "")
-    m = re.search(r"```(?:python)?\s*(.*?)```", raw, flags=re.S | re.I)
-    if m:
-        return m.group(1).strip()
-    lines = raw.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("def ") or stripped.startswith("import ") or stripped.startswith("from ") or stripped.startswith("class "):
-            start = i
-            break
-    return "\n".join(lines[start:]).strip() if start is not None else raw.strip()
-
-
-def run_python_tests(code: str, tests: Sequence[str], setup_code: str = "", timeout: int = 8) -> Dict[str, Any]:
-    program = "\n".join([setup_code or "", code, "", "\n".join(str(t) for t in tests)])
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "candidate.py"
-        path.write_text(program, encoding="utf-8")
-        try:
-            proc = subprocess.run(
-                ["python", str(path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
+    def _render_prompt(self, prompt: str) -> str:
+        if self.apply_chat_template and hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
             )
-        except subprocess.TimeoutExpired:
-            return {"passed": False, "error_type": "timeout", "stderr": "TimeoutExpired"}
-    if proc.returncode == 0:
-        return {"passed": True, "error_type": "pass", "stderr": ""}
-    stderr = proc.stderr or ""
-    if "SyntaxError" in stderr:
-        etype = "syntax_error"
-    elif "NameError" in stderr:
-        etype = "name_error_or_missing_function"
-    elif "AssertionError" in stderr:
-        etype = "wrong_answer"
-    else:
-        etype = "runtime_error"
-    return {"passed": False, "error_type": etype, "stderr": stderr[-1200:]}
+        return prompt
 
-
-def score_mbpp(row: Dict[str, Any], timeout: int = 8) -> Dict[str, Any]:
-    metadata = row.get("metadata") or {}
-    tests = metadata.get("test_list") or metadata.get("tests") or []
-    if isinstance(tests, str):
+    def _trim_output(self, text: str, params: Dict[str, Any]) -> str:
+        stops = []
+        stops.extend(as_list(params.get("until")))
+        stops.extend(as_list(self.cfg.get("until")))
+        for tok_attr in ("eos_token", "pad_token"):
+            tok = getattr(self.tokenizer, tok_attr, None)
+            if tok:
+                stops.append(tok)
+        stops.extend(["<|eot_id|>", "<|endoftext|>"])
+        for stop in stops:
+            if stop and stop in text:
+                text = text.split(str(stop))[0]
+        ids = self.tokenizer(text, add_special_tokens=False).get("input_ids", [])
         try:
-            tests = json.loads(tests)
+            return self.tokenizer.decode(ids, skip_special_tokens=True).strip()
         except Exception:
-            tests = [tests]
-    code = extract_code(row.get("prediction") or row.get("raw_output") or "")
-    if not tests:
-        return {"correct": None, "score": None, "error_type": "no_tests", "extracted_code": code}
-    result = run_python_tests(code, tests, setup_code=str(metadata.get("test_setup_code") or ""), timeout=timeout)
-    return {
-        "correct": bool(result["passed"]),
-        "score": 1.0 if result["passed"] else 0.0,
-        "error_type": result["error_type"],
-        "stderr": result.get("stderr", ""),
-        "extracted_code": code,
-    }
+            return text.strip()
+
+    def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
+        torch = self.torch
+        rendered = self._render_prompt(prompt)
+        encoded = self.tokenizer(rendered, add_special_tokens=False, return_tensors="pt")
+        input_ids = encoded["input_ids"].to(self.model_device)
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.model_device)
+
+        if self.model_device.type == "cuda":
+            torch.cuda.synchronize(self.model_device)
+            torch.cuda.reset_peak_memory_stats(self.model_device)
+        started = time.perf_counter()
+        with torch.no_grad():
+            generated = self.generate_fn(
+                self.model,
+                input_ids,
+                attention_mask=attention_mask,
+                steps=int(params.get("gen_steps", params.get("steps", params.get("gen_length", 128)))),
+                gen_length=int(params.get("gen_length", 128)),
+                block_length=int(params.get("gen_blocksize", params.get("block_length", params.get("gen_length", 128)))),
+                temperature=float(params.get("temperature", self.cfg.get("temperature", 0.0)) or 0.0),
+                cfg_scale=float(params.get("cfg", self.cfg.get("cfg", 0.0)) or 0.0),
+                remasking=str(params.get("remasking", self.cfg.get("remasking", "low_confidence"))),
+                mask_id=int(params.get("mask_id", self.mask_id)),
+                logits_eos_inf=bool(params.get("diff_logits_eos_inf", params.get("logits_eos_inf", False))),
+                confidence_eos_eot_inf=bool(params.get("diff_confidence_eos_eot_inf", params.get("confidence_eos_eot_inf", False))),
+                token_selection_confidence_threshold=params.get("token_selection_confidence_threshold"),
+                min_transfer_tokens=int(params.get("min_transfer_tokens", 1)),
+                return_trace=bool(params.get("return_trace", False)),
+                trace_token_snapshots=bool(params.get("trace_token_snapshots", False) or params.get("trace_decode_snapshots", False)),
+                tokenizer=self.tokenizer,
+                speed_schedule_name=params.get("speed_schedule_name"),
+                steps_per_block_schedule=params.get("steps_per_block_schedule"),
+                token_selection_confidence_threshold_schedule=params.get("token_selection_confidence_threshold_schedule"),
+                trace_step0_full_confidence=bool(params.get("trace_step0_full_confidence", False)),
+                decode_order=str(params.get("decode_order", "confidence")),
+            )
+        if self.model_device.type == "cuda":
+            torch.cuda.synchronize(self.model_device)
+        elapsed = time.perf_counter() - started
+        if bool(params.get("return_trace", False)):
+            token_tensor, trace = generated
+        else:
+            token_tensor, trace = generated, None
+        answer_ids = token_tensor[0][input_ids.shape[1]:]
+        raw_text = self.tokenizer.decode(answer_ids, skip_special_tokens=False)
+        text = self._trim_output(raw_text, params)
+        return GenerationResult(text=text, elapsed=elapsed, tokens_generated=int(params.get("gen_length", 128)), trace=trace)
 
 
-# ------------------------------- RULER --------------------------------------
+class HFCausalAdapter(BaseAdapter):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        self.torch = torch
+        self.device = str(cfg.get("device", "cuda"))
+        path = str(cfg.get("path") or cfg.get("model") or cfg.get("name"))
+        model_kwargs = deepcopy(cfg.get("model_kwargs", {}) or {})
+        dtype_value = cfg.get("torch_dtype", cfg.get("dtype"))
+        if dtype_value and "torch_dtype" not in model_kwargs:
+            model_kwargs["torch_dtype"] = getattr(torch, str(dtype_value).replace("torch.", "")) if isinstance(dtype_value, str) else dtype_value
+        self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **model_kwargs)
+        if not model_kwargs.get("device_map"):
+            self.model = self.model.to(self.device)
+        self.model.eval()
+        self.apply_chat_template = bool(cfg.get("apply_chat_template", True))
+        self.path = path
 
-def score_ruler_single(row: Dict[str, Any]) -> Dict[str, Any]:
-    pred = normalize_text(row.get("prediction") or row.get("raw_output") or "")
-    gold = normalize_text(row.get("answer"))
-    correct = bool(gold and gold in pred)
-    return {"correct": correct, "score": 1.0 if correct else 0.0, "gold_answer": row.get("answer")}
-
-
-def extract_order_values(text: str) -> List[str]:
-    text = str(text or "")
-    # Prefer JSON array if the model followed instructions.
-    m = re.search(r"\[[^\]]*\]", text, flags=re.S)
-    if m:
+    @property
+    def model_device(self):
         try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, list):
-                vals = [str(x) for x in obj]
-                nums = []
-                for val in vals:
-                    found = re.findall(r"\b\d{7}\b", val)
-                    nums.extend(found if found else [val])
-                return nums
+            return self.model.device
         except Exception:
-            pass
-    return re.findall(r"\b\d{7}\b", text)
+            return next(self.model.parameters()).device
+
+    def render_prompt(self, prompt: str) -> str:
+        if self.apply_chat_template and hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
+        return prompt
+
+    def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
+        torch = self.torch
+        rendered = self.render_prompt(prompt)
+        encoded = self.tokenizer(rendered, return_tensors="pt").to(self.model_device)
+        started = time.perf_counter()
+        with torch.no_grad():
+            out = self.model.generate(
+                **encoded,
+                max_new_tokens=int(params.get("max_new_tokens", params.get("gen_length", 128))),
+                do_sample=bool(float(params.get("temperature", 0.0) or 0.0) > 0),
+                temperature=max(float(params.get("temperature", 0.0) or 0.0), 1e-6),
+                pad_token_id=getattr(self.tokenizer, "eos_token_id", None),
+            )
+        elapsed = time.perf_counter() - started
+        answer = self.tokenizer.decode(out[0][encoded["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        return GenerationResult(text=answer, elapsed=elapsed, tokens_generated=int(out.shape[1] - encoded["input_ids"].shape[1]))
 
 
-def score_ruler_order2(row: Dict[str, Any]) -> Dict[str, Any]:
-    pred_vals = extract_order_values(row.get("prediction") or row.get("raw_output") or "")
-    answer = row.get("answer")
-    if not isinstance(answer, list):
-        metadata = row.get("metadata") or {}
-        answer = metadata.get("needle_values_in_order") or []
-    ref = [str(x) for x in answer][:2]
-    first_two = pred_vals[:2]
-    exact = len(first_two) >= 2 and first_two == ref
-    unordered = len(first_two) >= 2 and set(first_two) == set(ref)
-    slot1 = len(first_two) >= 1 and len(ref) >= 1 and first_two[0] == ref[0]
-    slot2 = len(first_two) >= 2 and len(ref) >= 2 and first_two[1] == ref[1]
-    return {
-        "correct": bool(exact),
-        "score": 1.0 if exact else 0.0,
-        "exact_order": bool(exact),
-        "set_match": bool(unordered),
-        "slot1": bool(slot1),
-        "slot2": bool(slot2),
-        "pred_values": pred_vals,
-        "gold_values": ref,
-    }
+class OpenAICompatibleAdapter(BaseAdapter):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        self.api_base = str(cfg.get("api_base") or os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")).rstrip("/")
+        self.api_key = str(cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "EMPTY"))
+        self.model_name = str(cfg.get("model") or cfg.get("path") or cfg.get("name"))
+
+    def generate_one(self, prompt: str, params: Dict[str, Any]) -> GenerationResult:
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": float(params.get("temperature", 0.0) or 0.0),
+            "max_tokens": int(params.get("max_new_tokens", params.get("gen_length", 128))),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.api_base + "/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+            method="POST",
+        )
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=float(self.cfg.get("timeout", 600))) as resp:
+                obj = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"API request failed: {exc.code} {body[:500]}") from exc
+        elapsed = time.perf_counter() - started
+        text = obj["choices"][0]["message"]["content"].strip()
+        usage = obj.get("usage", {}) or {}
+        return GenerationResult(text=text, elapsed=elapsed, tokens_generated=usage.get("completion_tokens"))
 
 
-# ------------------------------- generic ------------------------------------
+def build_adapter(cfg: Dict[str, Any]) -> BaseAdapter:
+    backend = str(cfg.get("backend", "illada")).lower()
+    if backend in {"illada", "llada", "diffusion"}:
+        return ILLADAAdapter(cfg)
+    if backend in {"hf", "hf_causal", "transformers", "causal"}:
+        return HFCausalAdapter(cfg)
+    if backend in {"openai_compatible", "api", "w1", "vllm"}:
+        return OpenAICompatibleAdapter(cfg)
+    raise SystemExit(f"Unsupported model backend `{backend}` for model {cfg.get('name')}")
 
 
-def score_generic(row: Dict[str, Any]) -> Dict[str, Any]:
-    pred = normalize_text(row.get("prediction") or row.get("raw_output") or "")
-    gold = normalize_text(row.get("answer"))
-    correct = bool(gold and gold in pred)
-    return {"correct": correct, "score": 1.0 if correct else 0.0}
-
-
-def score_row(row: Dict[str, Any], timeout: int = 8) -> Dict[str, Any]:
-    bench = str(row.get("benchmark"))
-    if bench == "gsm8k":
-        return score_gsm8k(row)
-    if bench == "mbpp":
-        return score_mbpp(row, timeout=timeout)
-    if bench == "ruler_niah_single_1":
-        return score_ruler_single(row)
-    if bench in {"ruler_niah_order_2", "ruler_niah_double_2"}:
-        return score_ruler_order2(row)
-    return score_generic(row)
-
-
-def mean(values: Iterable[Optional[float]]) -> Optional[float]:
-    vals = [float(v) for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
-
-
-def aggregate_scores(rows: List[Dict[str, Any]], outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    n = len(rows)
-    score = mean([r.get("score") for r in rows])
-    metrics: Dict[str, Any] = {
-        "n": n,
-        "score": round(score * 100, 4) if score is not None else None,
-        "accuracy": round(score * 100, 4) if score is not None else None,
-    }
-    # Optional task-specific metrics.
-    for key, out_key in [
-        ("exact_order", "exact_order_acc"),
-        ("set_match", "set_acc"),
-        ("slot1", "slot1_acc"),
-        ("slot2", "slot2_acc"),
-    ]:
-        if any(key in r for r in rows):
-            vals = [1.0 if r.get(key) else 0.0 for r in rows]
-            metrics[out_key] = round(sum(vals) / max(len(vals), 1) * 100, 4)
-    # Error breakdown for code tasks.
-    errors: Dict[str, int] = {}
-    for row in rows:
-        et = row.get("error_type")
-        if et:
-            errors[str(et)] = errors.get(str(et), 0) + 1
-    if errors:
-        metrics["error_breakdown"] = errors
-    # Timing from outputs.
-    latencies = []
-    tps = []
-    for row in outputs:
-        timing = row.get("timing") or {}
-        if timing.get("elapsed_seconds") is not None:
-            latencies.append(timing.get("elapsed_seconds"))
-        if timing.get("tokens_per_second") is not None:
-            tps.append(timing.get("tokens_per_second"))
-    metrics["avg_latency_sec"] = round(mean(latencies) or 0.0, 6) if latencies else None
-    metrics["avg_tps"] = round(mean(tps) or 0.0, 6) if tps else None
-    return metrics
-
-
-def copy_artifacts(src: Path, dst: Path, sample_idx: Optional[int] = None) -> None:
-    dst.mkdir(parents=True, exist_ok=True)
-    for name in ["inputs.jsonl", "outputs.jsonl", "summary.jsonl", "trace.jsonl", "gpu.csv", "run.json", "output_manifest.json"]:
-        sp = src / name
-        if sp.exists():
-            shutil.copy2(sp, dst / name)
-    for name in ["sample_traces"]:
-        sp = src / name
-        dp = dst / name
-        if sp.exists():
-            if dp.exists():
-                shutil.rmtree(dp)
-            shutil.copytree(sp, dp)
-    if (dst / "trace.jsonl").exists():
-        idx = 0 if sample_idx is None else sample_idx
-        # visual_arness_trace.py remains the rich iLLaDA ARness viewer.  The
-        # native plotter is model-agnostic and is the preferred W1 trace view.
-        (dst / "visual_command.txt").write_text(f'python visual_arness_trace.py "{dst}" --sample-idx {idx}\n', encoding="utf-8")
-        (dst / "native_visual_command.txt").write_text(f'python native_visual.py --run "{dst}"\n', encoding="utf-8")
-
-
-def evaluate_run(model_output_dir: Path, final_dir: Path, timeout: int = 8) -> Dict[str, Any]:
-    outputs_path = model_output_dir / "outputs.jsonl"
-    if not outputs_path.exists():
-        raise FileNotFoundError(f"Missing outputs.jsonl: {outputs_path}")
-    outputs = read_jsonl(outputs_path)
-    scores: List[Dict[str, Any]] = []
-    for row in outputs:
-        score = score_row(row, timeout=timeout)
-        scores.append({
-            "model": row.get("model"),
-            "task": row.get("task"),
-            "experiment": row.get("experiment"),
-            "benchmark": row.get("benchmark"),
-            "condition": row.get("condition"),
-            "sample_id": row.get("sample_id"),
-            **score,
+def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[str, Any], sample: Dict[str, Any], result: GenerationResult) -> None:
+    trace = result.trace
+    if trace is None:
+        return
+    trace_path = out_dir / "trace.jsonl"
+    rows = []
+    tokenizer = getattr(adapter, "tokenizer", None)
+    for step in trace.get("step_stats") or []:
+        selected_ids = step.get("selected_token_ids") or []
+        decoded = []
+        if tokenizer is not None:
+            for token_id in selected_ids:
+                try:
+                    decoded.append(tokenizer.decode([int(token_id)], skip_special_tokens=False))
+                except Exception:
+                    decoded.append(str(token_id))
+        rows.append({
+            "task_id": condition["task"],
+            "sample_id": sample.get("sample_id"),
+            "sample_idx": sample.get("sample_id"),
+            "benchmark": condition["benchmark"],
+            "decoding_config_name": condition["condition"],
+            "step_idx": step.get("step_idx"),
+            "block_idx": step.get("block_idx"),
+            "mask_count_before": step.get("mask_count_before"),
+            "mask_count_after": step.get("mask_count_after"),
+            "selected_positions": step.get("selected_positions") or [],
+            "selected_token_ids": selected_ids,
+            "selected_decoded_tokens": decoded,
+            "selected_confidences": step.get("selected_confidences") or [],
+            "candidate_positions": step.get("candidate_positions"),
+            "candidate_confidences": step.get("candidate_confidences"),
+            "transfer_reason": step.get("transfer_reason"),
+            "cumulative_transferred_tokens": step.get("cumulative_transferred_tokens"),
+            "current_completion_rate": step.get("current_completion_rate"),
         })
-    metrics = aggregate_scores(scores, outputs)
-    final_dir.mkdir(parents=True, exist_ok=True)
-    copy_artifacts(model_output_dir, final_dir, sample_idx=outputs[0].get("sample_id") if outputs else None)
-    write_jsonl(final_dir / "scores.jsonl", scores)
-    write_json(final_dir / "metrics.json", metrics)
-    write_csv(final_dir / "scores.csv", scores)
-    return metrics
+    for row in rows:
+        append_jsonl(trace_path, row)
+
+    sample_dir = out_dir / "sample_traces" / f"sample_{int(sample.get('sample_id', 0)):04d}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    write_json(sample_dir / "trace.json", trace)
+    write_json(sample_dir / "sample.json", {"sample": sample, "prediction": result.text, "condition": condition})
+    (sample_dir / "prediction.txt").write_text(result.text, encoding="utf-8")
 
 
-def model_output_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return output_dir_for(root, model_name, condition)
+def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Dict[str, Any], inputs: List[Dict[str, Any]], out_dir: Path, force: bool) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs_path = out_dir / "outputs.jsonl"
+    summary_path = out_dir / "summary.jsonl"
+    if force:
+        for path in [outputs_path, summary_path, out_dir / "trace.jsonl"]:
+            if path.exists():
+                path.unlink()
+        sample_traces = out_dir / "sample_traces"
+        if sample_traces.exists():
+            shutil.rmtree(sample_traces)
+    elif outputs_path.exists():
+        existing = read_jsonl(outputs_path)
+        if len(existing) >= len(inputs):
+            return {"status": "skipped_existing", "num_samples": len(existing)}
+
+    shutil.copyfile(prepared_source_path(condition), out_dir / "inputs.jsonl") if prepared_source_path(condition).exists() else write_jsonl(out_dir / "inputs.jsonl", inputs)
+    write_json(out_dir / "run.json", {
+        "created_at": utc_now(),
+        "model": model_cfg,
+        "model_alias": adapter.alias,
+        "task": condition["task"],
+        "experiment": condition["experiment"],
+        "benchmark": condition["benchmark"],
+        "condition": condition["condition"],
+        "params": condition["params"],
+        "num_samples": len(inputs),
+    })
+
+    telemetry = None
+    if model_cfg.get("gpu_telemetry", True):
+        telemetry = GpuTelemetry(out_dir / "gpu.csv", interval=float(model_cfg.get("gpu_telemetry_interval", 5)))
+        telemetry.start()
+
+    started_all = time.perf_counter()
+    try:
+        for local_idx, sample in enumerate(inputs):
+            prompt = str(sample["prompt"])
+            started = time.perf_counter()
+            try:
+                result = adapter.generate_one(prompt, condition["params"])
+                error = None
+            except Exception as exc:
+                elapsed = time.perf_counter() - started
+                result = GenerationResult(text="", elapsed=elapsed, tokens_generated=None, trace=None)
+                error = repr(exc)
+
+            tokens = result.tokens_generated
+            tps = (tokens / result.elapsed) if tokens and result.elapsed > 0 else None
+            out_row = {
+                "model": adapter.alias,
+                "task": condition["task"],
+                "experiment": condition["experiment"],
+                "benchmark": condition["benchmark"],
+                "condition": condition["condition"],
+                "sample_id": sample.get("sample_id", local_idx),
+                "dataset_index": sample.get("dataset_index"),
+                "prompt": prompt,
+                "answer": sample.get("answer"),
+                "raw_output": result.text,
+                "prediction": result.text,
+                "params": condition["params"],
+                "metadata": sample.get("metadata", {}),
+                "timing": {
+                    "elapsed_seconds": round(result.elapsed, 6),
+                    "tokens_generated": tokens,
+                    "tokens_per_second": round(tps, 6) if tps is not None else None,
+                },
+                "error": error,
+            }
+            append_jsonl(outputs_path, out_row)
+
+            trace = result.trace
+            summary_row = {
+                "model": adapter.alias,
+                "benchmark": condition["benchmark"],
+                "sample_idx": sample.get("sample_id", local_idx),
+                "sample_id": sample.get("sample_id", local_idx),
+                "decoding_config_name": condition["condition"],
+                "input": prompt,
+                "prediction": result.text,
+                "elapsed_seconds": round(result.elapsed, 6),
+                "tokens_per_second": round(tps, 6) if tps is not None else None,
+                "steps": int(condition["params"].get("gen_steps", condition["params"].get("gen_length", 128))),
+                "gen_length": int(condition["params"].get("gen_length", 128)),
+                "block_length": int(condition["params"].get("gen_blocksize", condition["params"].get("gen_length", 128))),
+                "completion_rate": trace.get("completion_rate") if trace else None,
+                "actual_parallelism": trace.get("actual_parallelism") if trace else None,
+                "actual_arness": trace.get("actual_arness") if trace else None,
+                "threshold_pass_rate": trace.get("threshold_pass_rate") if trace else None,
+                "fallback_rate": trace.get("fallback_rate") if trace else None,
+                "error": error,
+            }
+            append_jsonl(summary_path, summary_row)
+            write_trace_artifacts(out_dir, adapter, condition, sample, result)
+    finally:
+        if telemetry is not None:
+            telemetry.stop()
+
+    elapsed_all = time.perf_counter() - started_all
+    manifest = {"status": "finished", "num_samples": len(inputs), "elapsed_seconds": round(elapsed_all, 3)}
+    write_json(out_dir / "output_manifest.json", manifest)
+    if condition["params"].get("return_trace"):
+        sample_idx = inputs[0].get("sample_id", 0) if inputs else 0
+        command = f'python visual_arness_trace.py "{out_dir}" --sample-idx {sample_idx}\n'
+        (out_dir / "visual_command.txt").write_text(command, encoding="utf-8")
+    return manifest
+
+
+# Small mutable bridge used by run_condition for exact input copy without making
+# its signature noisier. It is set just before calling run_condition.
+_PREPARED_SOURCE: Optional[Path] = None
+
+
+def prepared_source_path(condition: Dict[str, Any]) -> Path:
+    return _PREPARED_SOURCE or Path("__missing__")
+
+
+def maybe_auto_prepare(config_path: Path, only: Sequence[str], force: bool = False) -> None:
+    import prepare_data
+    argv = ["--config", str(config_path)]
+    if only:
+        argv += ["--only", *only]
+    if force:
+        argv.append("--force")
+    old_argv = sys.argv
+    try:
+        sys.argv = ["prepare_data.py"] + argv
+        prepare_data.main()
+    finally:
+        sys.argv = old_argv
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Materialize and evaluate native model_outputs into native_outputs.")
+    parser = argparse.ArgumentParser(description="Generate model outputs natively without OpenCompass inference.")
     parser.add_argument("--config", default="test_config.yaml")
-    parser.add_argument("--only", nargs="*", default=[], help="Task or experiment names to evaluate.")
-    parser.add_argument("--models", nargs="*", default=None)
-    parser.add_argument("--model-output-root", default="model_outputs")
-    parser.add_argument("--output-root", default="native_outputs")
-    parser.add_argument("--timeout", type=int, default=8, help="MBPP subprocess timeout per sample.")
+    parser.add_argument("--only", nargs="*", default=[], help="Task or experiment names to run.")
+    parser.add_argument("--models", nargs="*", default=None, help="Model aliases to run. Defaults to experiment models or all config models.")
+    parser.add_argument("--output-root", default="model_outputs")
+    parser.add_argument("--prepared-root", default=None, help="Override prepared root. Default: data.prepared_dir/native.")
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--auto-prepare", action="store_true", help="Run prepare_data.py first if inputs are missing.")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -397,63 +619,83 @@ def main() -> int:
         config_path = ROOT / config_path
     config = load_yaml(config_path)
     selected = set(args.only or [])
-    conditions = list(iter_conditions(config, selected))
-    models = normalize_models(config)
-    explicit = set(args.models or []) if args.models else None
 
-    model_root = Path(args.model_output_root)
-    if not model_root.is_absolute():
-        model_root = ROOT / model_root
+    all_models = normalize_models(config)
+    explicit_models = set(args.models or []) if args.models else None
+    conditions = list(iter_conditions(config, selected))
+    if not conditions:
+        raise SystemExit("No experiments matched.")
+
     output_root = Path(args.output_root)
     if not output_root.is_absolute():
         output_root = ROOT / output_root
 
-    plan: List[Tuple[str, Dict[str, Any], Path, Path]] = []
+    if args.auto_prepare:
+        maybe_auto_prepare(config_path, args.only, force=False)
+
+    plan: List[Tuple[Dict[str, Any], Dict[str, Any], Path, Path]] = []
     for condition in conditions:
-        exp_models = condition.get("experiment_models")
-        for model_cfg in models:
+        input_path = prepared_input_path(config, condition) if args.prepared_root is None else prepared_dir_for(Path(args.prepared_root), condition["task"], condition["benchmark"], condition["params"]) / "inputs.jsonl"
+        if not input_path.exists() and not args.dry_run:
+            raise SystemExit(
+                f"Missing prepared inputs: {input_path}\n"
+                f"Run: python prepare_data.py --config {config_path} --only {condition['experiment']}"
+            )
+        for model_cfg in all_models:
             alias = model_alias(model_cfg)
-            if explicit and alias not in explicit and str(model_cfg.get("name")) not in explicit:
+            if explicit_models and alias not in explicit_models and str(model_cfg.get("name")) not in explicit_models:
                 continue
+            exp_models = condition.get("experiment_models")
             if exp_models and alias not in exp_models and str(model_cfg.get("name")) not in exp_models:
                 continue
-            src = model_output_dir_for(model_root, alias, condition)
-            dst = final_dir_for(output_root, alias, condition)
-            plan.append((alias, condition, src, dst))
+            out_dir = output_dir_for(output_root, alias, condition)
+            plan.append((model_cfg, condition, input_path, out_dir))
 
-    print(f"Native output/eval plan: {len(plan)} run(s).")
-    for alias, condition, src, dst in plan:
-        exists = (src / "outputs.jsonl").exists()
-        print(f"- {alias} | {condition['experiment']} | {condition['condition']} | src={src} ({'ok' if exists else 'missing'}) | dst={dst}")
+    if not plan:
+        raise SystemExit("No model/condition pairs selected.")
+
+    print(f"Native generation plan: {len(plan)} run(s), {len(set(model_alias(p[0]) for p in plan))} model(s).")
+    for model_cfg, condition, input_path, out_dir in plan:
+        print(f"- {model_alias(model_cfg)} | {condition['experiment']} | {condition['condition']} | inputs={input_path} | out={out_dir}")
     if args.dry_run:
         return 0
 
-    manifest: List[Dict[str, Any]] = []
-    compare_by_condition: Dict[Path, List[Dict[str, Any]]] = {}
-    for alias, condition, src, dst in plan:
-        if not (src / "outputs.jsonl").exists():
-            print(f"[SKIP] missing outputs: {src}")
-            continue
-        print(f"[EVAL] {alias} | {condition['experiment']} | {condition['condition']}")
-        metrics = evaluate_run(src, dst, timeout=args.timeout)
-        row = {
-            "model": alias,
-            "task": condition["task"],
-            "experiment": condition["experiment"],
-            "benchmark": condition["benchmark"],
-            "condition": condition["condition"],
-            "output_dir": str(dst),
-            **{k: v for k, v in metrics.items() if not isinstance(v, (dict, list))},
-        }
-        manifest.append(row)
-        compare_dir = compare_dir_for(output_root, condition)
-        compare_by_condition.setdefault(compare_dir, []).append(row)
+    # Load once per model and run all selected conditions for that model.
+    by_model: Dict[str, List[Tuple[Dict[str, Any], Path, Path]]] = {}
+    model_cfg_by_alias: Dict[str, Dict[str, Any]] = {}
+    for model_cfg, condition, input_path, out_dir in plan:
+        alias = model_alias(model_cfg)
+        by_model.setdefault(alias, []).append((condition, input_path, out_dir))
+        model_cfg_by_alias[alias] = model_cfg
 
-    write_jsonl(output_root / "native_output_manifest.jsonl", manifest)
-    write_csv(output_root / "native_output_manifest.csv", manifest)
-    for compare_dir, rows in compare_by_condition.items():
-        write_csv(compare_dir / "compare.csv", rows)
-    print(f"Wrote output/eval manifest: {output_root / 'native_output_manifest.jsonl'}")
+    global _PREPARED_SOURCE
+    manifest_rows: List[Dict[str, Any]] = []
+    for alias, jobs in by_model.items():
+        model_cfg = model_cfg_by_alias[alias]
+        print(f"\n[LOAD] {alias} backend={model_cfg.get('backend')} path={model_cfg.get('path') or model_cfg.get('model')}", flush=True)
+        adapter = build_adapter(model_cfg)
+        try:
+            for condition, input_path, out_dir in jobs:
+                inputs = read_jsonl(input_path)
+                _PREPARED_SOURCE = input_path
+                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)}", flush=True)
+                result = run_condition(adapter, model_cfg, condition, inputs, out_dir, force=args.force)
+                manifest_rows.append({
+                    "model": alias,
+                    "task": condition["task"],
+                    "experiment": condition["experiment"],
+                    "benchmark": condition["benchmark"],
+                    "condition": condition["condition"],
+                    "output_dir": str(out_dir),
+                    "input_path": str(input_path),
+                    **result,
+                })
+        finally:
+            adapter.close()
+
+    write_jsonl(output_root / "native_output_manifest.jsonl", manifest_rows)
+    write_csv(output_root / "native_output_manifest.csv", manifest_rows)
+    print(f"\nWrote manifest: {output_root / 'native_output_manifest.jsonl'}")
     return 0
 
 
