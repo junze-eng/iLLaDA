@@ -152,6 +152,21 @@ DOUBLE_BENCHMARKS = {"ruler_niah_double", "ruler_niah_double_2", "ruler_niah_ord
 RULER_BENCHMARKS = SINGLE_BENCHMARKS | DOUBLE_BENCHMARKS
 STANDARD_BENCHMARKS = {"gsm8k", "mbpp", "custom_math"}
 
+
+def bench_alias(benchmark: str) -> str:
+    """Canonical benchmark key used by native_model.py for output/prepared paths.
+
+    `ruler_niah_double` is kept as a backwards-compatible alias of
+    `ruler_niah_double_2`; every other name is filesystem-sanitized only.
+    """
+    text = str(benchmark)
+    if text == "ruler_niah_double":
+        text = "ruler_niah_double_2"
+    try:
+        return safe_name(text)
+    except Exception:
+        return _fallback_safe_name(text)
+
 DEPTH_BY_POSITION = {
     "front": [15],
     "middle": [50],
@@ -852,6 +867,16 @@ def prepare_ruler_double(condition: Dict[str, Any], haystack_path: Path) -> List
             }
         )
     return rows
+
+
+def prepare_ruler_order2(condition: Dict[str, Any], haystack_path: Path) -> List[Dict[str, Any]]:
+    """Compatibility alias expected by native_model.py for double-needle/order-2 NIAH."""
+    return prepare_ruler_double(condition, haystack_path)
+
+
+def prepare_ruler_double_2(condition: Dict[str, Any], haystack_path: Path) -> List[Dict[str, Any]]:
+    """Compatibility alias for explicit double-needle benchmark naming."""
+    return prepare_ruler_double(condition, haystack_path)
 
 
 def prepare_rows(condition: Dict[str, Any], config: Dict[str, Any], data_root: Path) -> Optional[List[Dict[str, Any]]]:

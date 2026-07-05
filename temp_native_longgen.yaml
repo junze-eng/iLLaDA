@@ -1,3 +1,6 @@
+# Native iLLaDA long-generation probe for MBPP sample 6.
+# This bypasses OpenCompass inference/eval and directly records native generation + trace.
+
 run:
   tasks: [native_longgen_mbpp_s6]
 
@@ -43,7 +46,7 @@ defaults:
 
 tasks:
   native_longgen_mbpp_s6:
-    description: "iLLaDA native long generation MBPP sample 6."
+    description: "iLLaDA native long-generation MBPP sample 6, len1024/block32."
     experiments:
       - name: native_longgen_mbpp_sample6_len1024
         benchmark: mbpp
