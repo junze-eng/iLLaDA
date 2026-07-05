@@ -23,6 +23,10 @@ It writes final artifacts under a model-first layout:
 
     native_outputs/<model_alias>/<task>/<benchmark_alias>/<condition>/
 
+Per-model eval manifests are written under:
+
+    native_outputs/<model_alias>/native_output_manifest.{jsonl,csv}
+
 Cross-model compare.csv files are written under:
 
     native_outputs/_compare/<task>/<benchmark_alias>/<condition>/
@@ -145,16 +149,61 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def collect_native_experiments(config: Dict[str, Any], selected: Set[str]) -> List[Dict[str, Any]]:
+    """Collect experiments for native scripts.
+
+    Unlike the older run_test helper, an explicit --only selection should be
+    able to run any task/experiment present in test_config_native.yaml even when
+    run.tasks is set to a safe default such as [context_double_8k_tps].  When
+    --only is omitted, run.tasks/run.experiments still act as the default plan.
+    """
+    selected = {str(x) for x in (selected or set()) if str(x)}
+    explicit_selection = bool(selected)
+    tasks = config.get("tasks", {}) or {}
+    run_cfg = config.get("run", {}) or {}
+    run_tasks = {str(x) for x in as_list(run_cfg.get("tasks"))}
+    run_exps = {str(x) for x in as_list(run_cfg.get("experiments"))}
+
+    out: List[Dict[str, Any]] = []
+    for task_name, task_def in tasks.items():
+        if not isinstance(task_def, dict):
+            continue
+        if not explicit_selection:
+            if run_tasks and "all" not in run_tasks and str(task_name) not in run_tasks:
+                continue
+        for exp in task_def.get("experiments", []) or []:
+            if not isinstance(exp, dict):
+                continue
+            exp_name = str(exp.get("name") or "")
+            if not explicit_selection:
+                if run_exps and "all" not in run_exps and exp_name not in run_exps:
+                    continue
+            if explicit_selection and "all" not in selected and str(task_name) not in selected and exp_name not in selected:
+                continue
+            item = deepcopy(exp)
+            item.setdefault("task", task_name)
+            item.setdefault("task_output_path", task_def.get("output_path"))
+            out.append(item)
+    return out
+
+
 def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict[str, Any]]:
     defaults = config.get("defaults", {}) or {}
-    for experiment in collect_experiments(config, selected):
+    for experiment in collect_native_experiments(config, selected):
         task = experiment.get("task") or "runs"
+        output_task = (
+            experiment.get("output_task")
+            or experiment.get("output_task_name")
+            or experiment.get("output_name")
+            or task
+        )
         exp_models = set(str(x) for x in as_list(experiment.get("models"))) if experiment.get("models") is not None else None
         for benchmark in as_list(experiment.get("benchmark")):
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 merged = deep_merge(defaults, params)
                 yield {
                     "task": task,
+                    "output_task": output_task,
                     "experiment": experiment.get("name"),
                     "benchmark": str(benchmark),
                     "params": merged,
@@ -164,12 +213,49 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
                 }
 
 
+def task_dir_name(condition: Dict[str, Any]) -> str:
+    return safe_name(str(condition.get("output_task") or condition.get("task") or "runs"))
+
+
 def final_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return root / safe_model_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / safe_model_name(model_name) / task_dir_name(condition) / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def compare_dir_for(root: Path, condition: Dict[str, Any]) -> Path:
-    return root / "_compare" / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / "_compare" / task_dir_name(condition) / bench_alias(condition["benchmark"]) / condition["condition"]
+
+
+def write_model_manifests(output_root: Path, stem: str, rows: List[Dict[str, Any]], write_global: bool = False) -> List[Path]:
+    """Write manifests under each model directory.
+
+    Scored artifacts already use native_outputs/<model>/..., so the default
+    manifest location should be native_outputs/<model>/<stem>.*.  Aggregate
+    manifests are optional and, when requested, go under _manifests/ instead of
+    polluting the model root.
+    """
+    by_model: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        alias = safe_model_name(str(row.get("model") or "model"))
+        by_model.setdefault(alias, []).append(row)
+
+    written: List[Path] = []
+    for alias, model_rows in sorted(by_model.items()):
+        model_root = output_root / alias
+        jsonl_path = model_root / f"{stem}.jsonl"
+        csv_path = model_root / f"{stem}.csv"
+        write_jsonl(jsonl_path, model_rows)
+        write_csv(csv_path, model_rows)
+        written.extend([jsonl_path, csv_path])
+
+    if write_global:
+        manifest_root = output_root / "_manifests"
+        jsonl_path = manifest_root / f"{stem}.jsonl"
+        csv_path = manifest_root / f"{stem}.csv"
+        write_jsonl(jsonl_path, rows)
+        write_csv(csv_path, rows)
+        written.extend([jsonl_path, csv_path])
+
+    return written
 
 
 def normalize_text(text: Any) -> str:
@@ -488,6 +574,14 @@ def main() -> int:
     parser.add_argument("--allow-generic-eval", action="store_true", help="Exploratory only: allow generic substring fallback for unregistered benchmarks. Default is false to keep scores comparable with previous iLLaDA runs.")
     parser.add_argument("--print-eval-policy", action="store_true", help="Print the fixed benchmark -> evaluator mapping used for consistency across old iLLaDA and future runs.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--write-global-manifest",
+        action="store_true",
+        help=(
+            "Also write aggregate manifests under <output-root>/_manifests/. "
+            "Default: only per-model manifests under <output-root>/<model>/ are written."
+        ),
+    )
     args = parser.parse_args()
 
     if args.print_eval_policy:
@@ -541,6 +635,7 @@ def main() -> int:
         row = {
             "model": alias,
             "task": condition["task"],
+            "output_task": condition.get("output_task", condition["task"]),
             "experiment": condition["experiment"],
             "benchmark": condition["benchmark"],
             "condition": condition["condition"],
@@ -551,11 +646,17 @@ def main() -> int:
         compare_dir = compare_dir_for(output_root, condition)
         compare_by_condition.setdefault(compare_dir, []).append(row)
 
-    write_jsonl(output_root / "native_output_manifest.jsonl", manifest)
-    write_csv(output_root / "native_output_manifest.csv", manifest)
+    manifest_paths = write_model_manifests(
+        output_root,
+        "native_output_manifest",
+        manifest,
+        write_global=args.write_global_manifest,
+    )
     for compare_dir, rows in compare_by_condition.items():
         write_csv(compare_dir / "compare.csv", rows)
-    print(f"Wrote output/eval manifest: {output_root / 'native_output_manifest.jsonl'}")
+    print("Wrote per-model output/eval manifests:")
+    for path in manifest_paths:
+        print(f"- {path}")
     return 0
 
 

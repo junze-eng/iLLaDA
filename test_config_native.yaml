@@ -1,33 +1,48 @@
-# Native side-channel config focused ONLY on WhaleTech W1-4B.
-# iLLaDA has already been run; this config only runs the W1 conditions needed
-# for long-context parallel retrieval and ARness / generation-order comparison.
+# Unified native config for iLLaDA / W1 experiments.
+# This config is intended for native_model.py + native_output.py, not run_model.py.
 #
-# Workflow:
-#   1) python prepare_data.py --config test_config_native.yaml --force
-#   2) CUDA_VISIBLE_DEVICES=0 python native_model.py --config test_config_native.yaml --models w1_4b --auto-prepare
-#   3) python native_output.py --config test_config_native.yaml --models w1_4b
-#   4) python native_visual.py --root native_outputs --output-root visual --all
+# Recommended context-double workflow:
+#   python native_model.py --config test_config_native.yaml --only context_double_8k_tps_iLLaDA --models iLLaDA --output-root outputs/context_double/model_outputs --auto-prepare --force
+#   python native_output.py --config test_config_native.yaml --only context_double_8k_tps_iLLaDA --models iLLaDA --model-output-root outputs/context_double/model_outputs --output-root outputs/context_double/native_outputs
 #
-# Paths:
-#   prepared data:   RULER only -> data/prepared/<ruler_benchmark>/<condition>.jsonl
-#   model outputs:   model_outputs/<model>/<task>/<benchmark>/<condition>/
-#   eval outputs:    native_outputs/<model>/<task>/<benchmark>/<condition>/
+# Recommended MBPP long-generation workflow:
+#   python native_model.py --config test_config_native.yaml --only mbpp_s6_l1024 --models iLLaDA --output-root outputs/context_double/model_outputs --auto-prepare --force
+#   python native_output.py --config test_config_native.yaml --only mbpp_s6_l1024 --models iLLaDA --model-output-root outputs/context_double/model_outputs --output-root outputs/context_double/native_outputs
+#
+# Output layout with patched native_model.py/native_output.py:
+#   outputs/context_double/model_outputs/<model>/<task_alias>/<benchmark>/<condition>/
+#   outputs/context_double/model_outputs/<model>/native_model_manifest.{jsonl,csv}
+#   outputs/context_double/native_outputs/<model>/<task_alias>/<benchmark>/<condition>/
+#   outputs/context_double/native_outputs/<model>/native_output_manifest.{jsonl,csv}
 
 run:
   tasks:
-    - native_context_order2_w1
-    - native_w1_trace_focus
+    - context_double_8k_tps
+
+execution:
+  gpu_telemetry:
+    enabled: true
+    interval_seconds: 5
 
 data:
   prepared_dir: data/prepared
   ruler_haystack_path: data/ruler/paul_graham_essay.jsonl
 
 models:
-  # Local Hugging Face W1-4B dLLM release.
-  # Clone once before running:
-  #   git clone https://huggingface.co/WhaletechAI/W1-4B-dLLM-Base /path/to/W1-4B-dLLM-Base
-  #   pip install -r /path/to/W1-4B-dLLM-Base/requirements.txt
-  # Then set repo_path below, or export W1_4B_REPO=/path/to/W1-4B-dLLM-Base.
+  - name: iLLaDA
+    backend: illada
+    type: instruct
+    abbr: iLLaDA
+    path: GSAI-ML/iLLaDA-8B-Instruct
+    mask_id: 5
+    apply_chat_template: true
+    gpu_telemetry: true
+    gpu_telemetry_interval: 5
+    model_kwargs:
+      device_map: auto
+      torch_dtype: torch.bfloat16
+
+  # Optional W1 local backend. It is not run unless --models w1_4b or a W1 task is selected.
   - name: w1_4b
     backend: w1_4b
     repo_path: ${W1_4B_REPO:-W1-4B-dLLM-Base}
@@ -45,30 +60,15 @@ models:
     use_ema: true
     seed: 1234
 
-  # Optional legacy API wrapper, not used by default.
-  - name: w1_api
-    backend: openai_compatible
-    model: whale-w1
-    api_base: http://localhost:8000/v1
-    api_key: EMPTY
-    timeout: 600
-    gpu_telemetry: false
-    generation_params:
-      top_p: 1.0
-    api_param_map:
-      w1_sampler: sampler
-      w1_steps: steps
-    extra_body: {}
-
 defaults:
   sample_limit: null
   sample_indices: null
   num_samples: null
   gen_length: 128
   gen_steps: 128
-  gen_blocksize: 128
+  gen_blocksize: 32
   max_new_tokens: null
-  max_seq_len: 4096
+  max_seq_len: 8192
   temperature: 0.0
   cfg: 0.0
   remasking: low_confidence
@@ -81,18 +81,80 @@ defaults:
   trace_token_snapshots: false
   trace_decode_snapshots: false
 
-# ---------------------------------------------------------------------------
-# W1-only native experiments.
-# Two groups are kept by default:
-#   1) native_context_order2_w1: long-context double-needle retrieval at matched
-#      planned parallelism levels, within W1's 4096-token context limit.
-#   2) native_w1_trace_focus: trace probes for generation order and sampler behavior.
-# ---------------------------------------------------------------------------
 tasks:
-  native_context_order2_w1:
-    description: "W1-4B double-needle long-context retrieval within its 4096-token limit; 2K/4K x 3 needle pairs x 1/2/4 token-per-step."
+  # Your preferred task directory name is preserved:
+  #   <output-root>/iLLaDA/mbpp_s6_l1024/mbpp/s6_l1024_b32_st1024...
+  mbpp_s6_l1024:
+    description: "iLLaDA native MBPP sample 6 long-generation trace, len=1024, block=32."
     experiments:
-      - name: native_context_order2_w1_2_4k_parallel
+      - name: mbpp_s6_l1024
+        output_task: mbpp_s6_l1024
+        benchmark: mbpp
+        models: [iLLaDA]
+        params:
+          sample_indices: [6]
+          gen_length: 1024
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          gen_steps: [1024, 512, 256]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+
+  # Context double main test. Use --output-root outputs/context_double/model_outputs.
+  # Result path:
+  #   outputs/context_double/model_outputs/iLLaDA/context_double_8k_tps/ruler_niah_double_2/<condition>/
+  context_double_8k_tps:
+    description: "iLLaDA native 8k double-needle ordered retrieval, 3 needle pairs x 3 planned TPS."
+    experiments:
+      - name: context_double_8k_tps_iLLaDA
+        output_task: context_double_8k_tps
+        benchmark: ruler_niah_double_2
+        models: [iLLaDA]
+        params:
+          num_samples: 10
+          gen_length: 64
+          gen_blocksize: 32
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: false
+          seed: 42
+        sweep:
+          context_length: [8192]
+          needle_pair: [front_middle, front_back, middle_back]
+          gen_steps: [128, 64, 32]
+
+  # Optional one-sample context trace probe. It is separate from the main context score run.
+  context_double_trace_probe:
+    description: "Single-sample trace probe for iLLaDA double-needle context; use only for mechanism visualization."
+    experiments:
+      - name: context_double_trace_probe_iLLaDA
+        output_task: context_double_trace_probe
+        benchmark: ruler_niah_double_2
+        models: [iLLaDA]
+        params:
+          num_samples: 1
+          gen_length: 64
+          gen_blocksize: 32
+          max_seq_len: 8192
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          seed: 42
+        sweep:
+          context_length: [8192]
+          needle_pair: [front_back]
+          gen_steps: [128, 64, 32]
+
+  # Optional W1 context comparison within W1's 4096-token context limit.
+  context_double_w1_2_4k:
+    description: "W1-4B double-needle retrieval within 2K/4K context, 3 needle pairs x 1/2/4 planned tokens per step."
+    experiments:
+      - name: context_double_w1_2_4k_parallel
+        output_task: context_double_w1_2_4k
         benchmark: ruler_niah_double_2
         models: [w1_4b]
         params:
@@ -109,10 +171,12 @@ tasks:
           w1_sampler: [gidd]
           w1_steps: [64, 32, 16]
 
-  native_w1_trace_focus:
+  # Optional W1 trace probes.
+  w1_trace_focus:
     description: "W1-4B trace probes for generation order, sampler dynamics, and parallel decoding behavior."
     experiments:
-      - name: native_w1_trace_gsm8k_sample7
+      - name: w1_trace_gsm8k_sample7
+        output_task: w1_trace_focus
         benchmark: gsm8k
         models: [w1_4b]
         params:
@@ -128,7 +192,8 @@ tasks:
           w1_sampler: [standard, gidd, jump]
           w1_steps: [64, 32, 16]
 
-      - name: native_w1_trace_context_order2_sample0
+      - name: w1_trace_context_double_sample0
+        output_task: w1_trace_focus
         benchmark: ruler_niah_double_2
         models: [w1_4b]
         params:

@@ -185,30 +185,53 @@ COND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Native route naming used by test_config_native.yaml, e.g.:
+#   s6_l1024_b32_st256
+#   s6_l1024_b32_st256_thr0p6
+# In this project this short form is used for MBPP sample 6 long-generation
+# stress tests.  Keep the old COND_RE above so previous ARness outputs still
+# work unchanged.
+NATIVE_SHORT_COND_RE = re.compile(
+    r"^s(?P<sample>\d+)_l(?P<gen_length>\d+)_b(?P<block>\d+)_st(?P<steps>\d+)"
+    r"(?:_thr(?P<thr>[A-Za-z0-9p.-]+))?$",
+    re.IGNORECASE,
+)
+
 
 def parse_condition_from_name(name: str) -> Optional[Dict[str, Any]]:
     m = COND_RE.match(name)
-    if not m:
-        return None
-    d = m.groupdict()
-    benchmark = str(d["benchmark"]).lower()
+    benchmark = "mbpp"
+    native_short = False
+    if m:
+        d = m.groupdict()
+        benchmark = str(d["benchmark"]).lower()
+    else:
+        m = NATIVE_SHORT_COND_RE.match(name)
+        if not m:
+            return None
+        d = m.groupdict()
+        native_short = True
     sample = int(d["sample"])
-    thr = canonical_threshold_label(d["thr"])
+    thr = canonical_threshold_label(d.get("thr") or "none")
     threshold = None if thr == "none" else to_float(thr.replace("p", "."), float("nan"))
     if isinstance(threshold, float) and math.isnan(threshold):
         threshold = None
+    gen_length = int(d["gen_length"])
+    block = int(d["block"])
+    steps = int(d["steps"])
+    experiment = f"native_longgen_{benchmark}_sample{sample}_len{gen_length}" if native_short else f"arness_trace_{benchmark}_sample{sample}"
     return {
         "benchmark": benchmark,
         "sample_idx": sample,
-        "gen_length": int(d["gen_length"]),
-        "gen_steps": int(d["steps"]),
-        "steps": int(d["steps"]),
-        "gen_blocksize": int(d["block"]),
-        "block_length": int(d["block"]),
+        "gen_length": gen_length,
+        "gen_steps": steps,
+        "steps": steps,
+        "gen_blocksize": block,
+        "block_length": block,
         "threshold_label": thr,
         "token_selection_confidence_threshold": threshold,
-        "experiment": f"arness_trace_{benchmark}_sample{sample}",
-        "condition_key": f"{benchmark}_sample{sample}_len{int(d['gen_length'])}_block{int(d['block'])}_steps{int(d['steps'])}_thr{thr}",
+        "experiment": experiment,
+        "condition_key": f"{benchmark}_sample{sample}_len{gen_length}_block{block}_steps{steps}_thr{thr}",
     }
 
 
@@ -608,20 +631,31 @@ def load_condition(condition_dir: Path, sample_idx: Optional[int]) -> Tuple[Dict
 
 def _plot_metric_lines_by_parallelism(ax, df: pd.DataFrame, col: str, ylabel: str, thresholds: Sequence[str]) -> None:
     plot_df = df.copy()
+    if col not in plot_df.columns or "planned_parallelism" not in plot_df.columns:
+        ax.text(0.5, 0.5, f"No {col}", ha="center", va="center", fontsize=9)
+        ax.set_xlabel("Planned parallelism = gen_length / gen_steps")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.2)
+        return
     plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
     plot_df["planned_parallelism"] = pd.to_numeric(plot_df["planned_parallelism"], errors="coerce")
     plot_df = plot_df.dropna(subset=["planned_parallelism", col])
+    plotted = False
     for thr in thresholds:
         g = plot_df[plot_df["threshold_label"] == thr].sort_values("planned_parallelism")
         if g.empty:
             continue
+        plotted = True
         ax.plot(g["planned_parallelism"], g[col], marker="o", linewidth=1.8, markersize=5, label=f"thr={thr}")
         for _, r in g.iterrows():
             ax.annotate(str(to_int(r.get("gen_steps"), 0)), (r["planned_parallelism"], r[col]), fontsize=8, xytext=(4, 3), textcoords="offset points")
+    if not plotted:
+        ax.text(0.5, 0.5, f"No numeric {col}", ha="center", va="center", fontsize=9)
     ax.set_xlabel("Planned parallelism = gen_length / gen_steps")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    if plotted:
+        ax.legend(fontsize=8)
 
 
 def plot_overall_comparison(exp_df: pd.DataFrame, out_path: Path, title: str) -> None:
@@ -657,23 +691,36 @@ def plot_overall_comparison(exp_df: pd.DataFrame, out_path: Path, title: str) ->
 
 def _plot_metric_lines_by_threshold(ax, df: pd.DataFrame, col: str, ylabel: str, steps: Sequence[int]) -> None:
     plot_df = df.copy()
+    if col not in plot_df.columns:
+        ax.text(0.5, 0.5, f"No {col}", ha="center", va="center", fontsize=9)
+        ax.set_xlabel("Threshold")
+        ax.set_xticks(list(range(len(ALL_THRESHOLDS_ORDER))))
+        ax.set_xticklabels(ALL_THRESHOLDS_ORDER)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.2)
+        return
     plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
     plot_df = plot_df.dropna(subset=[col])
     order_map = {thr: i for i, thr in enumerate(ALL_THRESHOLDS_ORDER)}
+    plotted = False
     for step in steps:
         g = plot_df[plot_df["gen_steps"] == step].copy()
         if g.empty:
             continue
+        plotted = True
         g["thr_order"] = g["threshold_label"].map(lambda x: order_map.get(canonical_threshold_label(x), 999))
         g = g.sort_values("thr_order")
         xs = [order_map.get(canonical_threshold_label(x), 999) for x in g["threshold_label"]]
         ax.plot(xs, g[col], marker="o", linewidth=1.8, markersize=5, label=f"steps={step}")
+    if not plotted:
+        ax.text(0.5, 0.5, f"No numeric {col}", ha="center", va="center", fontsize=9)
     ax.set_xlabel("Threshold")
     ax.set_xticks(list(range(len(ALL_THRESHOLDS_ORDER))))
     ax.set_xticklabels(ALL_THRESHOLDS_ORDER)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    if plotted:
+        ax.legend(fontsize=8)
 
 
 def plot_top2_steps_thresholds(exp_df: pd.DataFrame, out_path: Path, title: str) -> None:
@@ -894,17 +941,26 @@ def main() -> None:
         raise SystemExit(f"[ERROR] no ARness condition dirs found under: {input_root}")
 
     metrics_rows: List[Dict[str, Any]] = []
+    overview_root = out_root / "overview"
     for cond_dir in condition_dirs:
         try:
             if args.overview_only:
-                metrics, _, _, _ = load_condition(cond_dir, args.sample_idx)
+                metrics, step_events, _, _ = load_condition(cond_dir, args.sample_idx)
+                # Even in overview-only mode, export commit_order.csv so the
+                # token-order grids are real plots instead of empty placeholders.
+                commit_df = commit_order_dataframe(step_events, metrics)
+                if not commit_df.empty:
+                    commit_path = overview_root / "_commit_orders" / safe_name(metrics.get("experiment", cond_dir.parent.name)) / f"{cond_dir.name}.csv"
+                    commit_path.parent.mkdir(parents=True, exist_ok=True)
+                    commit_df.to_csv(commit_path, index=False)
+                    metrics["commit_order_csv"] = str(commit_path)
             else:
                 metrics = visualize_condition(cond_dir, args.sample_idx, out_root)
             metrics_rows.append(metrics)
         except Exception as exc:
             print(f"[WARN] skip {cond_dir}: {exc}")
 
-    write_overview(metrics_rows, out_root / "overview")
+    write_overview(metrics_rows, overview_root)
     print(f"[DONE] conditions visualized/indexed: {len(metrics_rows)}")
     print(f"[DONE] visual root: {out_root}")
 
