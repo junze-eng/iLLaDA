@@ -77,6 +77,95 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def append_csv_row(path: Path, row: Dict[str, Any], fieldnames: Optional[List[str]] = None) -> None:
+    """Append one CSV row and write the header on first use."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fieldnames is None:
+        fieldnames = list(row.keys())
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    """Human-readable duration for console progress and CSV ETA fields."""
+    if seconds is None:
+        return "?"
+    try:
+        value = float(seconds)
+    except Exception:
+        return "?"
+    if value < 0:
+        value = 0.0
+    if value < 60:
+        return f"{value:.1f}s"
+    minutes, sec = divmod(int(round(value)), 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{sec:02d}s"
+
+
+def format_rate(value: Optional[float]) -> str:
+    if value is None:
+        return "?"
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return "?"
+
+
+class SampleProgressBar:
+    """Tiny dependency-free per-sample progress display.
+
+    tqdm is intentionally avoided because this script is often copied into a
+    minimal runpod/venv.  On a real TTY it updates one line in place; in logs it
+    prints one line per completed sample so the history is preserved.
+    """
+
+    def __init__(self, label: str, total: int, stream: Any = None, width: int = 28):
+        self.label = label
+        self.total = max(0, int(total))
+        self.stream = stream or sys.stderr
+        self.width = max(10, int(width))
+        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._last_len = 0
+
+    def _line(self, done: int, last_s: float, avg_s: float, eta_s: Optional[float], tps: Optional[float], status: str) -> str:
+        total = max(self.total, 1)
+        done = max(0, min(int(done), total))
+        frac = done / total
+        filled = int(round(frac * self.width))
+        bar = "█" * filled + "░" * (self.width - filled)
+        pct = 100.0 * frac
+        return (
+            f"[{self.label}] {done}/{self.total} {pct:5.1f}% |{bar}| "
+            f"last={format_duration(last_s)} avg={format_duration(avg_s)} "
+            f"eta={format_duration(eta_s)} tps={format_rate(tps)} {status}"
+        )
+
+    def update(self, done: int, last_s: float, avg_s: float, eta_s: Optional[float], tps: Optional[float], error: Optional[str] = None) -> None:
+        status = "ERR" if error else "OK"
+        line = self._line(done, last_s, avg_s, eta_s, tps, status)
+        if self.is_tty:
+            pad = " " * max(0, self._last_len - len(line))
+            self.stream.write("\r" + line + pad)
+            self.stream.flush()
+            self._last_len = len(line)
+        else:
+            self.stream.write(line + "\n")
+            self.stream.flush()
+
+    def close(self) -> None:
+        if self.is_tty and self._last_len:
+            self.stream.write("\n")
+            self.stream.flush()
+            self._last_len = 0
+
+
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -1225,8 +1314,9 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs_path = out_dir / "outputs.jsonl"
     summary_path = out_dir / "summary.jsonl"
+    progress_path = out_dir / "sample_progress.csv"
     if force:
-        for path in [outputs_path, summary_path, out_dir / "trace.jsonl"]:
+        for path in [outputs_path, summary_path, out_dir / "trace.jsonl", progress_path]:
             if path.exists():
                 path.unlink()
         sample_traces = out_dir / "sample_traces"
@@ -1249,15 +1339,42 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
         "condition": condition["condition"],
         "params": condition["params"],
         "num_samples": len(inputs),
+        "progress_path": str(progress_path),
     })
 
-    telemetry = None
-    if model_cfg.get("gpu_telemetry", True):
-        telemetry = GpuTelemetry(out_dir / "gpu.csv", interval=float(model_cfg.get("gpu_telemetry_interval", 5)))
-        telemetry.start()
+    progress_fields = [
+        "timestamp",
+        "model",
+        "task",
+        "experiment",
+        "benchmark",
+        "condition",
+        "sample_id",
+        "dataset_index",
+        "sample_ordinal",
+        "num_samples",
+        "sample_elapsed_seconds",
+        "total_elapsed_seconds",
+        "avg_seconds_per_sample",
+        "eta_seconds",
+        "eta_human",
+        "tokens_generated",
+        "tokens_per_second",
+        "error",
+    ]
 
+    telemetry = None
+    progress = SampleProgressBar(
+        label=f"{adapter.alias} | {condition['experiment']} | {condition['condition']}",
+        total=len(inputs),
+    )
+    completed_samples = 0
     started_all = time.perf_counter()
     try:
+        if model_cfg.get("gpu_telemetry", True):
+            telemetry = GpuTelemetry(out_dir / "gpu.csv", interval=float(model_cfg.get("gpu_telemetry_interval", 5)))
+            telemetry.start()
+
         for local_idx, sample in enumerate(inputs):
             prompt = str(sample["prompt"])
             started = time.perf_counter()
@@ -1269,8 +1386,35 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                 result = GenerationResult(text="", elapsed=elapsed, tokens_generated=None, trace=None)
                 error = repr(exc)
 
+            completed_samples = local_idx + 1
+            total_elapsed = time.perf_counter() - started_all
+            avg_seconds = total_elapsed / completed_samples if completed_samples else None
+            remaining = max(0, len(inputs) - completed_samples)
+            eta_seconds = (avg_seconds * remaining) if avg_seconds is not None else None
             tokens = result.tokens_generated
             tps = (tokens / result.elapsed) if tokens and result.elapsed > 0 else None
+            progress_row = {
+                "timestamp": utc_now(),
+                "model": adapter.alias,
+                "task": condition["task"],
+                "experiment": condition["experiment"],
+                "benchmark": condition["benchmark"],
+                "condition": condition["condition"],
+                "sample_id": sample.get("sample_id", local_idx),
+                "dataset_index": sample.get("dataset_index"),
+                "sample_ordinal": completed_samples,
+                "num_samples": len(inputs),
+                "sample_elapsed_seconds": round(result.elapsed, 6),
+                "total_elapsed_seconds": round(total_elapsed, 6),
+                "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
+                "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
+                "eta_human": format_duration(eta_seconds),
+                "tokens_generated": tokens,
+                "tokens_per_second": round(tps, 6) if tps is not None else None,
+                "error": error,
+            }
+            append_csv_row(progress_path, progress_row, progress_fields)
+
             out_row = {
                 "model": adapter.alias,
                 "task": condition["task"],
@@ -1289,6 +1433,12 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                     "elapsed_seconds": round(result.elapsed, 6),
                     "tokens_generated": tokens,
                     "tokens_per_second": round(tps, 6) if tps is not None else None,
+                    "sample_ordinal": completed_samples,
+                    "num_samples": len(inputs),
+                    "total_elapsed_seconds": round(total_elapsed, 6),
+                    "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
+                    "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
+                    "eta_human": format_duration(eta_seconds),
                 },
                 "error": error,
             }
@@ -1300,10 +1450,16 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                 "benchmark": condition["benchmark"],
                 "sample_idx": sample.get("sample_id", local_idx),
                 "sample_id": sample.get("sample_id", local_idx),
+                "sample_ordinal": completed_samples,
+                "num_samples": len(inputs),
                 "decoding_config_name": condition["condition"],
                 "input": prompt,
                 "prediction": result.text,
                 "elapsed_seconds": round(result.elapsed, 6),
+                "total_elapsed_seconds": round(total_elapsed, 6),
+                "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
+                "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
+                "eta_human": format_duration(eta_seconds),
                 "tokens_per_second": round(tps, 6) if tps is not None else None,
                 "steps": int(condition["params"].get("gen_steps", condition["params"].get("gen_length", 128))),
                 "gen_length": int(condition["params"].get("gen_length", 128)),
@@ -1317,12 +1473,22 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
             }
             append_jsonl(summary_path, summary_row)
             write_trace_artifacts(out_dir, adapter, condition, sample, result)
+            progress.update(completed_samples, result.elapsed, avg_seconds or 0.0, eta_seconds, tps, error)
     finally:
+        progress.close()
         if telemetry is not None:
             telemetry.stop()
 
     elapsed_all = time.perf_counter() - started_all
-    manifest = {"status": "finished", "num_samples": len(inputs), "elapsed_seconds": round(elapsed_all, 3)}
+    avg_all = elapsed_all / completed_samples if completed_samples else None
+    manifest = {
+        "status": "finished",
+        "num_samples": len(inputs),
+        "completed_samples": completed_samples,
+        "elapsed_seconds": round(elapsed_all, 3),
+        "avg_seconds_per_sample": round(avg_all, 6) if avg_all is not None else None,
+        "progress_path": str(progress_path),
+    }
     write_json(out_dir / "output_manifest.json", manifest)
     if condition["params"].get("return_trace"):
         sample_idx = inputs[0].get("sample_id", 0) if inputs else 0
