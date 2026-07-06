@@ -272,6 +272,66 @@ def load_existing_or_prepared_inputs(config: Dict[str, Any], condition: Dict[str
     raise SystemExit(f"Unsupported benchmark `{benchmark}` in native_model.py")
 
 
+# ------------------------------- Prompt variants -----------------------------
+
+GSM8K_ONE_SHOT_GT_EXAMPLE = """Question: Mia has 3 red marbles and buys 4 more red marbles. How many red marbles does Mia have now?
+Answer: Mia has 3 + 4 = 7 red marbles. #### 7"""
+
+
+def _extract_gsm8k_question(prompt: Any) -> str:
+    """Extract only the current GSM8K question from the native prompt.
+
+    The native GSM8K prompt is instruction-like, which is not ideal for W1-Base.
+    For the one-shot base-model probe we convert it to a plain completion format:
+
+      Question: <demo>
+      Answer: <demo rationale> #### <demo answer>
+
+      Question: <current question>
+      Answer:
+    """
+    text = str(prompt or "")
+    if "Question:" in text:
+        text = text.split("Question:", 1)[1]
+    if "Answer:" in text:
+        text = text.split("Answer:", 1)[0]
+    return text.strip()
+
+
+def apply_prompt_variant(inputs: List[Dict[str, Any]], condition: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Apply prompt-only variants after loading original benchmark rows.
+
+    This deliberately does not change prepare_data.py or write new prepared files.
+    It keeps the original answer/metadata intact, only replacing sample['prompt'].
+    """
+    params = condition.get("params", {}) or {}
+    benchmark = str(condition.get("benchmark") or "")
+    style = str(params.get("prompt_style") or params.get("gsm8k_prompt_style") or "").strip().lower()
+    if benchmark != "gsm8k" or style in {"", "none", "default", "zero_shot"}:
+        return inputs
+    if style not in {"gsm8k_one_shot_gt", "one_shot_gt", "1shot_gt", "single_shot_gt", "singleshot_gt"}:
+        raise SystemExit(f"Unsupported GSM8K prompt_style `{style}`. Use gsm8k_one_shot_gt.")
+
+    out: List[Dict[str, Any]] = []
+    for sample in inputs:
+        new_sample = deepcopy(sample)
+        original_prompt = str(new_sample.get("prompt") or "")
+        question = _extract_gsm8k_question(original_prompt)
+        new_sample["prompt"] = (
+            GSM8K_ONE_SHOT_GT_EXAMPLE
+            + "\n\n"
+            + "Question: " + question + "\n"
+            + "Answer:"
+        )
+        metadata = deepcopy(new_sample.get("metadata", {}) or {})
+        metadata["prompt_style"] = "gsm8k_one_shot_gt"
+        metadata["original_prompt"] = original_prompt
+        metadata["one_shot_example"] = GSM8K_ONE_SHOT_GT_EXAMPLE
+        new_sample["metadata"] = metadata
+        out.append(new_sample)
+    return out
+
+
 class GpuTelemetry:
     def __init__(self, path: Path, interval: float = 2.0):
         self.path = path
@@ -1177,13 +1237,21 @@ def _export_canonical_sample_trace(
     """
     params = condition.get("params", {}) or {}
     gen_length = int(params.get("gen_length", params.get("max_new_tokens", result.tokens_generated or 0)) or 0)
-    block_len = int(params.get("gen_blocksize", gen_length or 1) or (gen_length or 1))
-    block_len = max(1, block_len)
-    num_blocks = max(1, (max(gen_length, 1) + block_len - 1) // block_len)
+    is_w1_trace = bool(result.trace and str(result.trace.get("backend", "")).lower() == "w1_4b")
+    if is_w1_trace:
+        # W1's SamplingRunner generates one editable span.  It does not have the
+        # iLLaDA block-by-block mechanism.  gen_blocksize is kept in the shared
+        # config for iLLaDA compatibility, but must not be used to split W1 trace
+        # views into fake blocks.
+        block_len = max(1, int(gen_length or params.get("max_new_tokens") or result.tokens_generated or 1))
+        num_blocks = 1
+    else:
+        block_len = int(params.get("gen_blocksize", gen_length or 1) or (gen_length or 1))
+        block_len = max(1, block_len)
+        num_blocks = max(1, (max(gen_length, 1) + block_len - 1) // block_len)
 
-    # Cumulative commit state per block.  For W1 there is one logical generated
-    # span/block.  For iLLaDA, selected_positions are usually block-local when
-    # block_idx is present; the visualizer later converts to global positions.
+    # Cumulative commit state per block/span.  For W1 this is one logical
+    # generated span; for iLLaDA it can be multiple native generation blocks.
     committed: Dict[int, set[int]] = {b: set() for b in range(num_blocks)}
     step_rows: List[Dict[str, Any]] = []
     timeline_rows: List[Dict[str, Any]] = []
@@ -1629,8 +1697,10 @@ def main() -> int:
         try:
             for condition, input_path, out_dir in jobs:
                 inputs, source_path, source_label = load_existing_or_prepared_inputs(config, condition, input_path)
+                inputs = apply_prompt_variant(inputs, condition)
                 _PREPARED_SOURCE = source_path
-                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)} | inputs={source_label}", flush=True)
+                prompt_style = str((condition.get("params", {}) or {}).get("prompt_style") or (condition.get("params", {}) or {}).get("gsm8k_prompt_style") or "default")
+                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)} | inputs={source_label} | prompt_style={prompt_style}", flush=True)
                 result = run_condition(adapter, model_cfg, condition, inputs, out_dir, force=args.force)
                 manifest_rows.append({
                     "model": alias,

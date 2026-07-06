@@ -23,6 +23,8 @@ run:
     - context_double_8k_l64_tps
     - parallel_gsm8k_iLLaDA_s20
     - parallel_gsm8k_w1_s20
+    - parallel_gsm8k_w1_s20_1shot
+    - w1_trace_focus_gsm8k_1shot
     - parallel_mbpp_w1_s20
     - context_double_trace_probe
     - context_double_w1_2_4k
@@ -256,6 +258,46 @@ tasks:
           seed: 42
         sweep:
           w1_sampler: [gidd]
+          w1_steps: [256, 128, 64]
+
+  parallel_gsm8k_w1_s20_1shot:
+    description: "W1-4B GSM8K one-shot GT-format completion probe; same p=1/2/4 sweep as zero-shot GSM8K."
+    experiments:
+      - name: parallel_gsm8k_w1_s20_1shot
+        output_task: parallel_gsm8k_w1_s20_1shot
+        benchmark: gsm8k
+        models: [w1_4b]
+        params:
+          sample_limit: 20
+          gen_length: 256
+          max_new_tokens: 256
+          temperature: 0.0
+          prompt_style: gsm8k_one_shot_gt
+          return_trace: false
+          seed: 42
+        sweep:
+          w1_sampler: [gidd]
+          w1_steps: [256, 128, 64]
+
+  w1_trace_focus_gsm8k_1shot:
+    description: "W1-4B GSM8K one-shot GT-format single-sample trace focus; compares sampler/steps after base-friendly prompt wrapping."
+    experiments:
+      - name: w1_trace_focus_gsm8k_1shot
+        output_task: w1_trace_focus_gsm8k_1shot
+        benchmark: gsm8k
+        models: [w1_4b]
+        params:
+          sample_indices: [7]
+          gen_length: 256
+          max_new_tokens: 256
+          temperature: 0.0
+          prompt_style: gsm8k_one_shot_gt
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          seed: 42
+        sweep:
+          w1_sampler: [gidd, jump, standard]
           w1_steps: [256, 128, 64]
 
   parallel_mbpp_w1_s20:

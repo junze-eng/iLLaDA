@@ -1035,10 +1035,19 @@ def parse_complete_cell(x: Any) -> Tuple[float, float, float]:
 
 
 def count_masks_in_state(x: Any) -> int:
+    """Count remaining masks in a textual block snapshot.
+
+    iLLaDA traces often render masks as ``[MASK]`` while the W1 trace export
+    renders each still-masked token as the square placeholder ``□``.  The
+    previous visualizer only counted ``[MASK]`` and therefore inferred
+    ``block_len = 0`` for W1 snapshots such as ``□□□□□□□□□□□□□□□□``.  That made
+    per-condition trace plotting crash with division by zero.
+    """
     s = str(x)
     total = 0
     for m in re.finditer(r"\[MASK\](?:x(\d+))?", s):
         total += int(m.group(1) or 1)
+    total += s.count("□")
     return total
 
 
@@ -1061,7 +1070,11 @@ def block_completion_matrix(block_timeline: pd.DataFrame) -> Tuple[List[int], Li
         for c in state_cols:
             mask_counts = [count_masks_in_state(v) for v in block_timeline[c].tolist()]
             block_len = max(mask_counts) if mask_counts else 1
-            mat.append([max(0, block_len - mc) / block_len for mc in mask_counts])
+            if block_len <= 0:
+                # No mask markers found; avoid crashing and mark completion unknown.
+                mat.append([float("nan") for _ in mask_counts])
+            else:
+                mat.append([max(0, block_len - mc) / block_len for mc in mask_counts])
         return blocks, steps, mat
     return [], [], []
 
@@ -1097,6 +1110,10 @@ def normalize_step_events(df: pd.DataFrame, metrics: Dict[str, Any]) -> pd.DataF
             out["_mean_confidence"] = np.nan
     if completion_col:
         out["_completion"] = pd.to_numeric(out[completion_col], errors="coerce")
+        if out["_completion"].isna().all():
+            gen_length = to_float(metrics.get("gen_length"), float("nan"))
+            denom = gen_length if math.isfinite(gen_length) and gen_length > 0 else max(1.0, float(out["_selected_count"].sum()))
+            out["_completion"] = out["_selected_count"].cumsum() / denom
     else:
         gen_length = to_float(metrics.get("gen_length"), float("nan"))
         denom = gen_length if math.isfinite(gen_length) and gen_length > 0 else max(1.0, float(out["_selected_count"].sum()))
@@ -1298,6 +1315,66 @@ def load_trace_condition(cond_dir: Path, sample_idx: Optional[int]) -> Tuple[Dic
     return metrics, step_events, block_timeline, sample_dir
 
 
+
+def w1_single_span_completion_matrix(step_events: pd.DataFrame, metrics: Dict[str, Any]) -> Tuple[List[int], List[int], List[List[float]]]:
+    """Build a one-row completion matrix for W1, which has no iLLaDA-style blocks.
+
+    Older W1 trace exports accidentally split the generated span into fake
+    gen_blocksize chunks while all callbacks used block_idx=0.  This helper
+    reconstructs the only meaningful W1 chain: completion of the whole
+    generated span over generation steps.
+    """
+    if step_events.empty:
+        return [], [], []
+    steps = [to_int(v, i) for i, v in enumerate(step_events.get("_step", pd.Series(range(len(step_events)))).tolist())]
+    gen_len = to_int(metrics.get("gen_length"), 0)
+    if gen_len <= 0:
+        gen_len = to_int(metrics.get("tokens_generated"), 0)
+    values: List[float] = []
+    mask_after_col = choose_col(step_events, ["mask_count_after", "remaining_masks", "remain_after"])
+    if mask_after_col and gen_len > 0:
+        for v in step_events[mask_after_col].tolist():
+            remain = to_float(v, float("nan"))
+            if math.isfinite(remain):
+                values.append(max(0.0, min(1.0, 1.0 - remain / max(gen_len, 1))))
+            else:
+                values.append(float("nan"))
+    else:
+        committed: set[int] = set()
+        for _, row in step_events.iterrows():
+            for pos in parse_listish(row.get("selected_positions")):
+                ipos = to_int(pos, -1)
+                if ipos >= 0:
+                    committed.add(ipos)
+            denom = gen_len if gen_len > 0 else max(1, max(committed) + 1 if committed else 1)
+            values.append(len(committed) / max(denom, 1))
+    return [0], steps, [values]
+
+
+def looks_like_w1_single_span_trace(step_events: pd.DataFrame, metrics: Dict[str, Any]) -> bool:
+    if step_events.empty:
+        return False
+    model = str(metrics.get("model", "")).lower()
+    task = str(metrics.get("task", metrics.get("experiment", ""))).lower()
+    backend = str(metrics.get("backend", "")).lower()
+    if "w1" in model or "w1" in task or backend == "w1_4b":
+        return True
+    block_len = to_int(metrics.get("block_length", metrics.get("gen_blocksize")), 0)
+    if block_len <= 0:
+        return False
+    block_col = "_block" if "_block" in step_events.columns else choose_col(step_events, ["block_idx", "active_block_idx"])
+    if block_col is None:
+        return False
+    blocks = pd.to_numeric(step_events[block_col], errors="coerce").dropna().unique().tolist()
+    if len(blocks) != 1 or int(blocks[0]) != 0:
+        return False
+    max_pos = -1
+    if "selected_positions" in step_events.columns:
+        for x in step_events["selected_positions"].tolist():
+            for pos in parse_listish(x):
+                max_pos = max(max_pos, to_int(pos, -1))
+    return max_pos >= block_len
+
 def plot_generation_chain(step_events: pd.DataFrame, block_timeline: pd.DataFrame, metrics: Dict[str, Any], out_path: Path) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13.5, 8.0), gridspec_kw={"height_ratios": [1.55, 1.0]})
     title = (
@@ -1306,13 +1383,20 @@ def plot_generation_chain(step_events: pd.DataFrame, block_timeline: pd.DataFram
         f"p={to_float(metrics.get('planned_parallelism'), float('nan')):.2g}"
     )
     fig.suptitle(title, fontsize=12)
-    blocks, steps, mat = block_completion_matrix(block_timeline)
+    if looks_like_w1_single_span_trace(step_events, metrics):
+        blocks, steps, mat = w1_single_span_completion_matrix(step_events, metrics)
+        top_title = "W1 full generated-span completion (no iLLaDA blocks)"
+        y_label = "Generated span"
+    else:
+        blocks, steps, mat = block_completion_matrix(block_timeline)
+        top_title = "Within-block completion"
+        y_label = "Block index"
     ax = axes[0]
     if blocks and mat:
         im = ax.imshow(mat, aspect="auto", interpolation="nearest", vmin=0, vmax=1)
-        ax.set_ylabel("Block index")
+        ax.set_ylabel(y_label)
         ax.set_xlabel("Generation step")
-        ax.set_title("Within-block completion")
+        ax.set_title(top_title)
         ax.set_yticks(range(len(blocks)))
         ax.set_yticklabels([str(b) for b in blocks])
         if len(steps) <= 25:
@@ -1469,6 +1553,207 @@ def plot_token_order_grid(rows: pd.DataFrame, out_path: Path, max_panels: int = 
     print(f"[OK] wrote {out_path}")
 
 
+
+
+def _read_commit_order_csv(path_value: Any) -> pd.DataFrame:
+    if path_value is None:
+        return pd.DataFrame()
+    s = str(path_value)
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return pd.DataFrame()
+    return read_csv(Path(s))
+
+
+def _draw_commit_order_panel(ax, cdf: pd.DataFrame, row: pd.Series, title: str) -> None:
+    if cdf.empty or "global_position" not in cdf.columns or "step" not in cdf.columns:
+        ax.text(0.5, 0.5, "missing\ncommit_order", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return
+    x = pd.to_numeric(cdf["global_position"], errors="coerce")
+    y = pd.to_numeric(cdf["step"], errors="coerce")
+    conf = pd.to_numeric(cdf.get("confidence", pd.Series([np.nan] * len(cdf))), errors="coerce")
+    valid = x.notna() & y.notna()
+    x = x[valid]
+    y = y[valid]
+    conf = conf[valid]
+    if x.empty:
+        ax.text(0.5, 0.5, "empty\ncommit_order", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return
+
+    sizes = 10 + 24 * conf.fillna(0.5).clip(lower=0, upper=1)
+    ax.scatter(x, y, s=sizes, alpha=0.75, linewidths=0)
+
+    block = to_int(row.get("block_length", row.get("gen_blocksize")), 0)
+    gen_len = to_int(row.get("gen_length"), 0)
+    if block > 0 and gen_len > 0:
+        for b in range(block, gen_len, block):
+            ax.axvline(b, linestyle="--", linewidth=0.7, alpha=0.35)
+
+    tau = to_float(row.get("order_kendall_tau"), float("nan"))
+    inv = to_float(row.get("inversion_rate"), float("nan"))
+    prefix_gap = to_float(row.get("mean_prefix_gap"), float("nan"))
+    subtitle = title
+    extras = []
+    if math.isfinite(tau):
+        extras.append(f"τ={tau:.2f}")
+    if math.isfinite(inv):
+        extras.append(f"inv={inv:.2f}")
+    if math.isfinite(prefix_gap):
+        extras.append(f"gap={prefix_gap:.2f}")
+    if extras:
+        subtitle += "\n" + ", ".join(extras)
+    ax.set_title(subtitle, fontsize=9)
+    ax.set_xlabel("Token position", fontsize=8)
+    ax.set_ylabel("First commit step", fontsize=8)
+    ax.tick_params(axis="both", labelsize=8)
+    ax.grid(True, alpha=0.25)
+
+
+def plot_arness_order_metrics_by_parallelism(df: pd.DataFrame, out_path: Path) -> None:
+    """Show whether larger planned parallelism changes AR-like generation order."""
+    if df.empty or "planned_parallelism" not in df.columns:
+        return
+    specs = [
+        ("order_kendall_tau", "Kendall tau\n(higher = more left-to-right)"),
+        ("inversion_rate", "Inversion rate\n(lower = more left-to-right)"),
+        ("mean_prefix_gap", "Mean prefix gap\n(higher = more non-prefix fill)"),
+        ("left_to_right_score", "Left-to-right score\n(1 - inversion)"),
+    ]
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work["planned_parallelism"], errors="coerce")
+    group_cols = [c for c in ["benchmark", "task", "w1_sampler"] if c in work.columns]
+    if not group_cols:
+        work["series"] = work.get("condition", pd.Series(["trace"] * len(work))).astype(str)
+    else:
+        work["series"] = work[group_cols].astype(str).agg(" | ".join, axis=1)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.4))
+    plotted_any = False
+    for ax, (metric, ylabel) in zip(axes.ravel(), specs):
+        if metric not in work.columns:
+            ax.text(0.5, 0.5, f"No {metric}", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        local = work.copy()
+        local[metric] = pd.to_numeric(local[metric], errors="coerce")
+        local = local.dropna(subset=["planned_parallelism", metric])
+        if local.empty:
+            ax.text(0.5, 0.5, f"No numeric {metric}", ha="center", va="center")
+            continue
+        for name, g in local.groupby("series", dropna=False):
+            # Average duplicated sample/condition rows for clean trend lines.
+            g = g.groupby("planned_parallelism", as_index=False)[metric].mean().sort_values("planned_parallelism")
+            if g.empty:
+                continue
+            plotted_any = True
+            ax.plot(g["planned_parallelism"], g[metric], marker="o", linewidth=1.8, label=str(name))
+        ax.set_xlabel("Planned parallelism = gen_length / steps")
+        ax.set_ylabel(ylabel)
+        ax.set_title(metric)
+        ax.grid(True, alpha=0.3)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        axes[0, 0].legend(fontsize=7)
+    fig.suptitle("Trace order metrics vs planned parallelism", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if plotted_any:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=220)
+        print(f"[OK] wrote {out_path}")
+    plt.close(fig)
+
+
+def plot_token_order_by_parallelism(df: pd.DataFrame, out_dir: Path, max_cols: int = 6) -> List[Path]:
+    """Create direct position-vs-commit-step grids grouped by benchmark/task/sampler.
+
+    Each panel is one condition.  If parallelism increases and the points become
+    flatter / less diagonal, the generation is becoming less autoregressive.
+    """
+    if df.empty or "commit_order_csv" not in df.columns:
+        return []
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work.get("planned_parallelism"), errors="coerce")
+    work = work.dropna(subset=["planned_parallelism"])
+    work = work[work["commit_order_csv"].astype(str).str.len() > 0]
+    if work.empty:
+        return []
+
+    group_cols = [c for c in ["benchmark", "task", "w1_sampler"] if c in work.columns]
+    if not group_cols:
+        work["_group"] = "trace"
+        group_cols = ["_group"]
+
+    written: List[Path] = []
+    for keys, g in work.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        # Prefer one row for each planned parallelism / steps pair.
+        sort_cols = [c for c in ["planned_parallelism", "gen_steps", "condition"] if c in g.columns]
+        g = g.sort_values(sort_cols)
+        # Keep grids readable while preserving the p=1/2/4 comparison.
+        if len(g) > max_cols:
+            g = g.groupby("planned_parallelism", dropna=False, group_keys=False).head(1).head(max_cols)
+        n = len(g)
+        if n <= 0:
+            continue
+        cols = min(max_cols, n)
+        rows_n = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows_n, cols, figsize=(4.4 * cols, max(3.2, 3.0 * rows_n)), squeeze=False)
+        for ax in axes.ravel()[n:]:
+            ax.set_axis_off()
+        for ax, (_, row) in zip(axes.ravel(), g.iterrows()):
+            cdf = _read_commit_order_csv(row.get("commit_order_csv"))
+            p = to_float(row.get("planned_parallelism"), float("nan"))
+            steps = to_int(row.get("gen_steps", row.get("effective_steps")), 0)
+            title = f"p={p:g}, steps={steps}" if math.isfinite(p) else f"steps={steps}"
+            _draw_commit_order_panel(ax, cdf, row, title)
+        group_name = "_".join(safe_name(k) for k in keys)
+        out_path = out_dir / f"token_order_by_parallelism_{group_name}.png"
+        fig.suptitle("Token position vs first commit step | effect of parallelism", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=220)
+        plt.close(fig)
+        written.append(out_path)
+        print(f"[OK] wrote {out_path}")
+    return written
+
+
+def plot_token_order_focus_grid(df: pd.DataFrame, out_path: Path, max_panels: int = 18) -> None:
+    """A compact all-in-one grid for direct autoregressiveness inspection."""
+    if df.empty or "commit_order_csv" not in df.columns:
+        return
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work.get("planned_parallelism"), errors="coerce")
+    sort_cols = [c for c in ["benchmark", "task", "w1_sampler", "planned_parallelism", "condition"] if c in work.columns]
+    work = work.sort_values(sort_cols)
+    if len(work) > max_panels:
+        work = work.groupby([c for c in ["benchmark", "task", "w1_sampler", "planned_parallelism"] if c in work.columns], dropna=False, group_keys=False).head(1).head(max_panels)
+    if work.empty:
+        return
+    n = len(work)
+    cols = min(3, n)
+    rows_n = int(math.ceil(n / cols))
+    fig, axes = plt.subplots(rows_n, cols, figsize=(5.0 * cols, 3.3 * rows_n), squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.set_axis_off()
+    for ax, (_, row) in zip(axes.ravel(), work.iterrows()):
+        cdf = _read_commit_order_csv(row.get("commit_order_csv"))
+        p = to_float(row.get("planned_parallelism"), float("nan"))
+        sampler = str(row.get("w1_sampler", ""))
+        title = f"{row.get('benchmark','')} | p={p:g}" if math.isfinite(p) else str(row.get("benchmark", ""))
+        if sampler and sampler.lower() not in {"nan", "none"}:
+            title += f" | {sampler}"
+        _draw_commit_order_panel(ax, cdf, row, title)
+    fig.suptitle("Autoregressiveness check: token position vs first commit step", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {out_path}")
+
+
 def run_arness(root: Path, out_dir: Path, models: Optional[Sequence[str]], sample_idx: Optional[int], overview_only: bool) -> pd.DataFrame:
     cond_dirs = discover_trace_dirs(root)
     if not cond_dirs:
@@ -1522,6 +1807,31 @@ def run_arness(root: Path, out_dir: Path, models: Optional[Sequence[str]], sampl
     save_markdown(df[[c for c in ["model", "task", "benchmark", "condition", "sample_idx", "gen_length", "gen_steps", "w1_sampler", "planned_parallelism", "score_pct", "actual_parallelism", "order_kendall_tau", "inversion_rate", "mean_prefix_gap", "visual_output_dir"] if c in df.columns]], out_dir / "arness_trace_overview.md")
     plot_arness_overview(df, out_dir / "arness_overview.png")
     plot_token_order_grid(df, out_dir / "token_order_grid.png")
+    plot_arness_order_metrics_by_parallelism(df, out_dir / "arness_order_metrics_by_parallelism.png")
+    plot_token_order_focus_grid(df, out_dir / "token_order_focus_grid.png")
+    order_dir = out_dir / "token_order_by_parallelism"
+    written_order_grids = plot_token_order_by_parallelism(df, order_dir)
+    report = [
+        "native_visual arness trace report",
+        "",
+        f"Trace rows: {len(df)}",
+        f"Token-order by-parallelism grids: {len(written_order_grids)}",
+        "",
+        "How to read token-order plots:",
+        "- x-axis: token position in the generated continuation.",
+        "- y-axis: first generation step that committed the token.",
+        "- More diagonal/upward = more left-to-right / autoregressive-like.",
+        "- Flatter clouds or large early x-position commits = more parallel/non-prefix generation.",
+        "",
+        "Files:",
+        "- arness_trace_overview.csv/md",
+        "- arness_overview.png",
+        "- arness_order_metrics_by_parallelism.png",
+        "- token_order_focus_grid.png",
+        "- token_order_grid.png",
+        "- token_order_by_parallelism/*.png",
+    ]
+    write_text(out_dir / "arness_trace_report.txt", "\n".join(report) + "\n")
     print(f"[DONE] arness trace rows: {len(df)} -> {out_dir}")
     return df
 
