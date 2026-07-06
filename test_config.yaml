@@ -412,6 +412,23 @@ tasks:
           gen_steps: [64, 128, 256]
           token_selection_confidence_threshold: [0.8, 0.9]
 
+  gsm8k_overprovision_rescue:
+    description: "Task 8: mirrors Task 7's overprovision-rescue test on gsm8k instead of MBPP. Motivation: MBPP needs full structural completeness (any unresolved masked position tends to break the whole sample -- task7 saw final_mask_count still ~175-326/512 even at gen_steps=128, and 0% pass across all 6 steps x threshold combos regardless of steps). GSM8K only needs the final numeric answer right, so the same threshold+min_transfer_tokens=1 fallback collapse may respond very differently to partial completion than MBPP's all-or-nothing code execution. Keeps block_length=256 fixed (gsm8k's native gen_length, matching task1_gsm8k_ar_like/mild/strong_parallel's block size). gen_steps=32 is the known-collapsed baseline (task1_gsm8k_strong_parallel used min_transfer_tokens=8 with no threshold and still got 22% accuracy; here min_transfer_tokens=1 fallback + real threshold gating is expected to collapse completion_rate at the same step count). 64/128 test whether more steps rescues completion_rate and/or accuracy, same doubling pattern as Task 7 (64->128->256 there, 32->64->128 here since gsm8k's gen_length here is half of MBPP's)."
+    output_path: outputs/gsm8k_overprovision_rescue
+    experiments:
+      - name: task8_gsm8k_overprovision_rescue
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          temperature: 0.0
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [32, 64, 128]
+          token_selection_confidence_threshold: [0.8, 0.9]
+
   baseline:
     description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
     output_path: outputs/baseline
