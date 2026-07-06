@@ -1,5 +1,5 @@
 run:
-  tasks: [arness]
+  tasks: [context_double]
   experiments: []
 
 execution:
@@ -62,6 +62,79 @@ defaults:
   needle_position: null
 
 tasks:
+
+  context_double:
+    description: "Task 2b: 8K RULER NIAH double-key context retrieval, testing front-middle/front-back/middle-back under 1/2/4 token-per-step decoding."
+    output_path: outputs/context_double
+    experiments:
+      - name: context_double_8k_front_middle
+        benchmark: ruler_niah_double
+        output_path: outputs/context_double/front_middle
+        params:
+          decoding_config_name: context_double_8k_front_middle
+          arness: 1
+          sample_limit: null
+          num_samples: 10
+          context_length: 8192
+          max_seq_len: 8192
+          gen_length: 128
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: false
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          needle_positions: [front, middle]
+        sweep:
+          gen_steps: [128, 64, 32]
+
+      - name: context_double_8k_front_back
+        benchmark: ruler_niah_double
+        output_path: outputs/context_double/front_back
+        params:
+          decoding_config_name: context_double_8k_front_back
+          arness: 1
+          sample_limit: null
+          num_samples: 10
+          context_length: 8192
+          max_seq_len: 8192
+          gen_length: 128
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: false
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          needle_positions: [front, back]
+        sweep:
+          gen_steps: [128, 64, 32]
+
+      - name: context_double_8k_middle_back
+        benchmark: ruler_niah_double
+        output_path: outputs/context_double/middle_back
+        params:
+          decoding_config_name: context_double_8k_middle_back
+          arness: 1
+          sample_limit: null
+          num_samples: 10
+          context_length: 8192
+          max_seq_len: 8192
+          gen_length: 128
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          token_selection_confidence_threshold: null
+          temperature: 0.0
+          cfg: 0.0
+          return_trace: false
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+          needle_positions: [middle, back]
+        sweep:
+          gen_steps: [128, 64, 32]
   parallel:
     description: "Task 1: GSM8K/MBPP parallel token restoration sweep."
     output_path: outputs/parallel
@@ -191,6 +264,21 @@ tasks:
           gen_steps: [512, 256, 128]
           token_selection_confidence_threshold: [null, 0.6, 0.8]
 
+      - name: arness_trace_mbpp_sample6_steps1024
+        benchmark: mbpp
+        output_path: outputs/arness/arness_trace_mbpp_sample6
+        params:
+          sample_indices: [6]
+          gen_length: 1024
+          gen_blocksize: 32
+          min_transfer_tokens: 1
+          return_trace: true
+          trace_token_snapshots: false
+          trace_decode_snapshots: false
+        sweep:
+          gen_steps: [1024]
+          token_selection_confidence_threshold: [null, 0.6, 0.8]
+          
   temp_threshold_study:
     description: "Task 4: temperature x confidence-threshold x steps ablation, to test whether sampling randomness and/or threshold filtering prevent the strong/mild-parallel degenerate collapse (e.g. the sample7 all-'0' collapse)."
     output_path: outputs/temp_threshold_study

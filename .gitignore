@@ -6,11 +6,15 @@ __pycache__/
 .ipynb_checkpoints/
 
 outputs/
+model_outputs/
+*_outputs/
 work_dirs/
 opencompass/outputs/
 opencompass/work_dirs/
 data/prepared/
 visual/
+*visual/
+*eval/
 
 .venv/
 venv/

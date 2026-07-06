@@ -1,8 +1,35 @@
+#!/usr/bin/env python3
+"""
+Compact full runner for iLLaDA/OpenCompass experiments.
+
+This keeps the original one-shot run_test.py workflow, but shortens both the
+experiment folder and the per-condition folder while preserving the artifacts
+needed by the ARness visualizer:
+
+  outputs/<task>/<compact_exp>/<param_label>/
+    oc_config.py
+    run.json
+    outputs.jsonl
+    summary.jsonl
+    trace.jsonl
+    gpu.csv
+    visual_command.txt
+    <opencompass_timestamp>/...
+
+Example:
+  outputs/arness/mbpp_s6/mbpp_sample6_len512_block16_steps512_thr0p6/
+"""
+
+from __future__ import annotations
+
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -10,8 +37,7 @@ import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
-
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 ROOT = Path(__file__).resolve().parent
 OPENCOMPASS_DIR = ROOT / "opencompass"
@@ -35,22 +61,87 @@ BENCHMARKS = {
     },
 }
 
-CUSTOM_BENCHMARKS = set()
+CUSTOM_BENCHMARKS: Set[str] = set()
 DATASET_PARAM_KEYS = {"context_length", "needle_position", "num_samples", "depth_percents"}
 EXPERIMENT_ONLY_KEYS = {"sample_limit", "sample_indices", "seed", "speed_schedule_label"} | DATASET_PARAM_KEYS
-
 MODEL_TYPES = {
     "instruct": "LLaDAModel",
     "base": "LLaDABaseModel",
 }
 
+CONTROL_ARGS_WITH_VALUE = {"-m", "--mode", "-w", "--work-dir", "-r", "--reuse"}
+CONTROL_ARGS_NO_VALUE = {"--dry-run"}
+
+BENCH_ALIASES = {
+    "gsm8k": "gsm8k",
+    "mbpp": "mbpp",
+    "humaneval": "he",
+    "mmlu_pro": "mmlup",
+    "mmlu": "mmlu",
+    "arc_c": "arcc",
+    "arc": "arc",
+    "hellaswag": "hs",
+    "piqa": "piqa",
+    "math": "math",
+    "ruler_niah_single_1": "niah1",
+    "custom_math": "cmath",
+}
+
+PARAM_ALIASES = {
+    "sample_indices": "s",
+    "sample_limit": "n",
+    "context_length": "ctx",
+    "needle_position": "pos",
+    "num_samples": "n",
+    "gen_length": "l",
+    "gen_blocksize": "b",
+    "gen_steps": "st",
+    "min_transfer_tokens": "mt",
+    "token_selection_confidence_threshold": "thr",
+    "token_selection_confidence_threshold_schedule": "thrs",
+    "threshold_schedule_label": "thrs",
+    "steps_per_block_schedule": "sch",
+    "speed_schedule_name": "spd",
+    "speed_schedule_label": "spd",
+    "seed": "seed",
+}
+
+NAMELESS_KEYS = {
+    "return_trace",
+    "trace_token_snapshots",
+    "trace_decode_snapshots",
+    "benchmark",
+    "profile_sample_indices",
+}
+
+PREFERRED_NAME_KEYS = [
+    "sample_indices",
+    "context_length",
+    "needle_position",
+    "num_samples",
+    "sample_limit",
+    "gen_length",
+    "gen_blocksize",
+    "gen_steps",
+    "token_selection_confidence_threshold",
+    "speed_schedule_name",
+    "speed_schedule_label",
+    "steps_per_block_schedule",
+    "token_selection_confidence_threshold_schedule",
+    "threshold_schedule_label",
+    "seed",
+]
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 def load_yaml(path: Path) -> Dict[str, Any]:
     try:
-        import yaml
-    except ImportError as exc:
+        import yaml  # type: ignore
+    except ImportError:
         return load_simple_yaml(path)
-
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
@@ -72,8 +163,8 @@ def _strip_yaml_comment(line: str) -> str:
 
 
 def _split_inline_list(value: str) -> List[str]:
-    items = []
-    current = []
+    items: List[str] = []
+    current: List[str] = []
     in_single = False
     in_double = False
     for char in value:
@@ -121,7 +212,7 @@ def _parse_yaml_scalar(value: str) -> Any:
 
 
 def load_simple_yaml(path: Path) -> Dict[str, Any]:
-    raw_lines = []
+    raw_lines: List[tuple[int, str]] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             clean = _strip_yaml_comment(line).rstrip()
@@ -129,9 +220,7 @@ def load_simple_yaml(path: Path) -> Dict[str, Any]:
                 raw_lines.append((len(clean) - len(clean.lstrip(" ")), clean.strip()))
 
     def parse_block(index: int, indent: int):
-        if index >= len(raw_lines):
-            return {}, index
-        if raw_lines[index][0] < indent:
+        if index >= len(raw_lines) or raw_lines[index][0] < indent:
             return {}, index
         is_list = raw_lines[index][0] == indent and raw_lines[index][1].startswith("- ")
         if is_list:
@@ -155,7 +244,7 @@ def load_simple_yaml(path: Path) -> Dict[str, Any]:
                     result.append(_parse_yaml_scalar(item_text))
             return result, index
 
-        result = {}
+        result: Dict[str, Any] = {}
         while index < len(raw_lines) and raw_lines[index][0] == indent and not raw_lines[index][1].startswith("- "):
             text = raw_lines[index][1]
             if ":" not in text:
@@ -205,7 +294,6 @@ def expand_matrix(experiment: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     if not sweep:
         yield params
         return
-
     keys = list(sweep.keys())
     values = [as_list(sweep[key]) for key in keys]
     for combo in itertools.product(*values):
@@ -215,7 +303,7 @@ def expand_matrix(experiment: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         yield item
 
 
-def collect_experiments(config: Dict[str, Any], selected: set) -> List[Dict[str, Any]]:
+def collect_experiments(config: Dict[str, Any], selected: Set[str]) -> List[Dict[str, Any]]:
     tasks_cfg = config.get("tasks")
     if not tasks_cfg:
         experiments = config.get("experiments", []) or []
@@ -227,24 +315,16 @@ def collect_experiments(config: Dict[str, Any], selected: set) -> List[Dict[str,
     configured_tasks = set(as_list(run_cfg.get("tasks")))
     configured_experiments = set(as_list(run_cfg.get("experiments")))
     if not selected and not configured_tasks and not configured_experiments:
-        raise SystemExit("No task selected. Set `run.tasks` in config or pass `--only <task_or_experiment>`.")
+        raise SystemExit("No task selected. Set `run.tasks` in config or pass `--only`.")
 
     selected_all = "all" in selected or "all" in configured_tasks
-    active = []
+    active: List[Dict[str, Any]] = []
     for task_name, task_def in tasks_cfg.items():
         task_experiments = task_def.get("experiments", []) or []
-        task_selected = (
-            selected_all
-            or task_name in selected
-            or (not selected and task_name in configured_tasks)
-        )
+        task_selected = selected_all or task_name in selected or (not selected and task_name in configured_tasks)
         for experiment in task_experiments:
             exp_name = experiment.get("name")
-            exp_selected = (
-                selected_all
-                or exp_name in selected
-                or (not selected and exp_name in configured_experiments)
-            )
+            exp_selected = selected_all or exp_name in selected or (not selected and exp_name in configured_experiments)
             if not task_selected and not exp_selected:
                 continue
             if experiment.get("enabled", True) is False and not selected and not configured_experiments:
@@ -258,10 +338,76 @@ def collect_experiments(config: Dict[str, Any], selected: set) -> List[Dict[str,
 
 
 def safe_name(value: str) -> str:
-    keep = []
-    for char in value.lower():
+    keep: List[str] = []
+    for char in str(value).lower():
         keep.append(char if char.isalnum() else "_")
     return "_".join("".join(keep).split("_"))
+
+
+def short_slug(text: str, max_len: int = 60) -> str:
+    slug = safe_name(str(text)).strip("_") or "run"
+    if len(slug) <= max_len:
+        return slug
+    digest = hashlib.sha1(slug.encode("utf-8")).hexdigest()[:8]
+    head = slug[: max_len - len(digest) - 1].rstrip("_-")
+    return f"{head}_{digest}"
+
+
+def compact_task_name(task: Any) -> str:
+    return short_slug(str(task or "runs"), max_len=24)
+
+
+def _bench_alias(name: str) -> str:
+    lowered = safe_name(name).lower()
+    if lowered in BENCH_ALIASES:
+        return BENCH_ALIASES[lowered]
+    for old, new in BENCH_ALIASES.items():
+        if old in lowered:
+            return new
+    return short_slug(lowered or name, max_len=16)
+
+
+def _first_benchmark(value: Any) -> str:
+    items = as_list(value)
+    return str(items[0]) if items else ""
+
+
+def compact_experiment_name(experiment: Dict[str, Any], benchmark: Optional[str] = None) -> str:
+    raw = str(experiment.get("name") or "experiment")
+    lower = safe_name(raw).lower()
+    sample_match = re.search(
+        r"(?P<bench>ruler_niah_single_1|gsm8k|mbpp|humaneval|mmlu_pro|mmlu|arc_c|arc|hellaswag|piqa|math|custom_math)[_-]*sample(?P<idx>\d+)",
+        lower,
+    )
+    if sample_match:
+        bench = _bench_alias(sample_match.group("bench"))
+        return short_slug(f"{bench}_s{sample_match.group('idx')}", max_len=32)
+
+    bench = _bench_alias(str(benchmark or _first_benchmark(experiment.get("benchmark")) or ""))
+    compact = lower
+    compact = re.sub(r"^task\d+[_-]*", "", compact)
+    compact = re.sub(r"^(arness[_-]*)?trace[_-]*", "", compact)
+    compact = re.sub(r"^(context[_-]*)?trace[_-]*", "", compact)
+    compact = re.sub(r"[_-]+", "_", compact).strip("_")
+    if bench and bench not in compact:
+        compact = f"{bench}_{compact}" if compact else bench
+    return short_slug(compact or raw, max_len=48)
+
+
+def experiment_output_dir(base_output_dir: Path, experiment: Dict[str, Any]) -> Path:
+    raw = experiment.get("output_path")
+    if raw is None and experiment.get("_task_output_path") is not None:
+        raw = Path(str(experiment.get("_task_output_path"))) / str(experiment.get("name"))
+    if raw is None:
+        task = safe_name(str(experiment.get("task") or "runs"))
+        return base_output_dir / task
+    path = Path(raw)
+    path = path if path.is_absolute() else ROOT / path
+    return path.parent
+
+
+def compact_experiment_output_dir(base_output_dir: Path, experiment: Dict[str, Any], compact_exp_name: str) -> Path:
+    return experiment_output_dir(base_output_dir, experiment) / compact_exp_name
 
 
 def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
@@ -274,6 +420,13 @@ def ruler_prepared_condition_id(params: Dict[str, Any]) -> str:
         f"samples{params.get('num_samples', 20)}_"
         f"seed{seed}"
     )
+
+
+def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any]) -> Path:
+    prepared_dir = Path(data_cfg.get("prepared_dir", "data/prepared"))
+    if not prepared_dir.is_absolute():
+        prepared_dir = ROOT / prepared_dir
+    return prepared_dir / "ruler_niah_single_1" / f"{ruler_prepared_condition_id(params)}.jsonl"
 
 
 def schedule_label(value: Any) -> str:
@@ -289,15 +442,11 @@ def threshold_schedule_label(value: Any) -> str:
         return ""
     labels = []
     for item in items:
-        if item is None:
-            labels.append("none")
-        else:
-            labels.append(str(item).replace(".", "p"))
+        labels.append("none" if item is None else str(item).replace(".", "p"))
     return "thrsch" + "_".join(labels)
 
 
 def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], idx: int) -> str:
-    """Name a run by the actual config values, with idx only as a fallback."""
     parts = [exp_name, benchmark]
     if params.get("sample_indices") is not None:
         sample_label = "_".join(str(item) for item in as_list(params.get("sample_indices")))
@@ -308,11 +457,7 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
         parts.append(f"ctx{params.get('context_length')}")
     if params.get("needle_position") is not None:
         parts.append(f"pos{params.get('needle_position')}")
-    for key, label in (
-        ("gen_length", "len"),
-        ("gen_blocksize", "block"),
-        ("gen_steps", "steps"),
-    ):
+    for key, label in (("gen_length", "len"), ("gen_blocksize", "block"), ("gen_steps", "steps")):
         if params.get(key) is not None:
             parts.append(f"{label}{params.get(key)}")
     if params.get("speed_schedule_name") is not None:
@@ -327,31 +472,12 @@ def condition_run_name(exp_name: str, benchmark: str, params: Dict[str, Any], id
         parts.append(threshold_schedule_label(params.get("token_selection_confidence_threshold_schedule")))
     if "token_selection_confidence_threshold" in params:
         threshold = params.get("token_selection_confidence_threshold")
-        threshold_label = "none" if threshold is None else str(threshold).replace(".", "p")
+        threshold_text = "none" if threshold is None else str(threshold).replace(".", "p")
         if params.get("threshold_schedule_label") is None and params.get("token_selection_confidence_threshold_schedule") is None:
-            parts.append(f"thr{threshold_label}")
+            parts.append(f"thr{threshold_text}")
     if len(parts) <= 2:
         parts.append(str(idx))
     return safe_name("_".join(str(part) for part in parts))
-
-
-def experiment_output_dir(base_output_dir: Path, experiment: Dict[str, Any]) -> Path:
-    """Resolve root output dir for an experiment from exp/task/base config."""
-    raw = experiment.get("output_path")
-    if raw is None and experiment.get("_task_output_path") is not None:
-        raw = Path(str(experiment.get("_task_output_path"))) / str(experiment.get("name"))
-    if raw is None:
-        task = safe_name(str(experiment.get("task") or "runs"))
-        return base_output_dir / task
-    path = Path(raw)
-    return path if path.is_absolute() else ROOT / path
-
-
-def ruler_prepared_path(data_cfg: Dict[str, Any], params: Dict[str, Any]) -> Path:
-    prepared_dir = Path(data_cfg.get("prepared_dir", "data/prepared"))
-    if not prepared_dir.is_absolute():
-        prepared_dir = ROOT / prepared_dir
-    return prepared_dir / "ruler_niah_single_1" / f"{ruler_prepared_condition_id(params)}.jsonl"
 
 
 def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchmark: str, run_name: str) -> Dict[str, Any]:
@@ -359,7 +485,6 @@ def build_model_cfg(global_model: Dict[str, Any], params: Dict[str, Any], benchm
     model_type = model_cfg.pop("type", "instruct")
     if model_type not in MODEL_TYPES:
         raise SystemExit(f"Unsupported model.type `{model_type}`. Choose one of: {', '.join(MODEL_TYPES)}")
-
     model_cfg.setdefault("abbr", f"{Path(str(model_cfg.get('path', 'model'))).name}-{benchmark}")
     model_cfg["abbr"] = safe_name(f"{model_cfg['abbr']}_{run_name}")
     model_cfg["type"] = MODEL_TYPES[model_type]
@@ -386,21 +511,23 @@ def render_opencompass_config(
 ) -> str:
     if benchmark not in BENCHMARKS:
         raise SystemExit(f"Unknown benchmark `{benchmark}`. Available: {', '.join(sorted(BENCHMARKS))}")
-
     bench = BENCHMARKS[benchmark]
     model_type = model_cfg.pop("type")
-    imports = ["from mmengine.config import read_base", ""]
-    imports.append("with read_base():")
-    imports.append(f"    from {bench['module']} import {bench['var']}")
+    lines: List[str] = []
+    lines.append("from mmengine.config import read_base")
+    lines.append("")
+    lines.append("with read_base():")
+    lines.append(f"    from {bench['module']} import {bench['var']}")
     if "summary_module" in bench:
-        imports.append(f"    from {bench['summary_module']} import {bench['summary_var']}")
-    imports.append("")
-    imports.append(f"from opencompass.models import {model_type}")
-    imports.append("from opencompass.partitioners import NumWorkerPartitioner")
-    imports.append("from opencompass.runners import LocalRunner")
-    imports.append("from opencompass.tasks import OpenICLInferTask")
-    imports.append("")
-    imports.append(f"datasets = {bench['var']}")
+        lines.append(f"    from {bench['summary_module']} import {bench['summary_var']}")
+    lines.append("")
+    lines.append(f"from opencompass.models import {model_type}")
+    lines.append("from opencompass.partitioners import NumWorkerPartitioner")
+    lines.append("from opencompass.runners import LocalRunner")
+    lines.append("from opencompass.tasks import OpenICLInferTask")
+    lines.append("")
+    lines.append(f"datasets = {bench['var']}")
+
     if sample_indices is not None:
         indices = [int(item) for item in as_list(sample_indices)]
         if not indices:
@@ -411,23 +538,23 @@ def render_opencompass_config(
             test_range = f"[{sorted_indices[0]}:{sorted_indices[-1] + 1}]"
         else:
             test_range = "indices:" + ",".join(str(index) for index in indices)
-        imports.append(f"_sample_test_range = {python_literal(test_range)}")
-        imports.append("for _dataset in datasets:")
-        imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
+        lines.append(f"_sample_test_range = {python_literal(test_range)}")
+        lines.append("for _dataset in datasets:")
+        lines.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
     elif sample_limit is not None:
-        if isinstance(sample_limit, int):
-            test_range = f"[:{sample_limit}]"
-        else:
-            test_range = sample_limit
-        imports.append(f"_sample_test_range = {python_literal(test_range)}")
-        imports.append("for _dataset in datasets:")
-        imports.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
+        test_range = f"[:{sample_limit}]" if isinstance(sample_limit, int) else sample_limit
+        lines.append(f"_sample_test_range = {python_literal(test_range)}")
+        lines.append("for _dataset in datasets:")
+        lines.append("    _dataset.setdefault('reader_cfg', {})['test_range'] = _sample_test_range")
+
     if "summary_var" in bench:
-        imports.append(f"summarizer = dict(summary_groups={bench['summary_var']})")
+        lines.append(f"summarizer = dict(summary_groups={bench['summary_var']})")
+
     if benchmark == "custom_math":
         custom_math_path = ROOT / "data" / "custom_math"
-        imports.append("for _dataset in datasets:")
-        imports.append(f"    _dataset['path'] = {python_literal(str(custom_math_path))}")
+        lines.append("for _dataset in datasets:")
+        lines.append(f"    _dataset['path'] = {python_literal(str(custom_math_path))}")
+
     if benchmark == "ruler_niah_single_1":
         experiment_params = experiment_params or {}
         context_length = experiment_params.get("context_length")
@@ -436,32 +563,30 @@ def render_opencompass_config(
         tokens_to_generate = model_cfg.get("gen_length")
         prepared_path = ruler_prepared_path(data_cfg or {}, experiment_params)
         depth_by_position = {"front": [0], "middle": [50], "back": [100], "end": [100]}
-        imports.append("for _dataset in datasets:")
-        imports.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
+        lines.append("for _dataset in datasets:")
+        lines.append(f"    _dataset['prepared_file_path'] = {python_literal(str(prepared_path))}")
         if context_length is not None:
-            imports.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
+            lines.append(f"    _dataset['max_seq_length'] = {python_literal(int(context_length))}")
         if tokens_to_generate is not None:
-            imports.append(f"    _dataset['tokens_to_generate'] = {python_literal(int(tokens_to_generate))}")
-            imports.append("    _dataset.setdefault('infer_cfg', {}).setdefault('inferencer', {})['max_out_len'] = _dataset['tokens_to_generate']")
+            lines.append(f"    _dataset['tokens_to_generate'] = {python_literal(int(tokens_to_generate))}")
+            lines.append("    _dataset.setdefault('infer_cfg', {}).setdefault('inferencer', {})['max_out_len'] = _dataset['tokens_to_generate']")
         if num_samples is not None:
-            imports.append(f"    _dataset['num_samples'] = {python_literal(int(num_samples))}")
+            lines.append(f"    _dataset['num_samples'] = {python_literal(int(num_samples))}")
         if needle_position is not None:
-            depths = depth_by_position.get(str(needle_position), None)
+            depths = depth_by_position.get(str(needle_position))
             if depths is None:
                 raise SystemExit(f"Unsupported needle_position `{needle_position}` for ruler_niah_single_1.")
-            imports.append(f"    _dataset['depth_percents'] = {python_literal(depths)}")
+            lines.append(f"    _dataset['depth_percents'] = {python_literal(depths)}")
 
-    model_entries = ",\n        ".join(
-        f"{key}={python_literal(value)}" for key, value in model_cfg.items()
-    )
-    imports.append("models = [")
-    imports.append("    dict(")
-    imports.append(f"        type={model_type},")
+    model_entries = ",\n        ".join(f"{key}={python_literal(value)}" for key, value in model_cfg.items())
+    lines.append("models = [")
+    lines.append("    dict(")
+    lines.append(f"        type={model_type},")
     if model_entries:
-        imports.append(f"        {model_entries},")
-    imports.append("    )")
-    imports.append("]")
-    imports.append("")
+        lines.append(f"        {model_entries},")
+    lines.append("    )")
+    lines.append("]")
+    lines.append("")
 
     partitioner = runner_cfg.get("partitioner", {}) or {}
     runner = runner_cfg.get("runner", {}) or {}
@@ -470,26 +595,209 @@ def render_opencompass_config(
     min_task_size = int(partitioner.get("min_task_size", 16))
     max_num_workers = int(runner.get("max_num_workers", max(1, num_worker)))
     retry = int(runner.get("retry", 1))
-    imports.append("infer = dict(")
-    imports.append("    partitioner=dict(")
-    imports.append("        type=NumWorkerPartitioner,")
-    imports.append(f"        num_worker={num_worker},")
-    imports.append(f"        num_split={python_literal(num_split)},")
-    imports.append(f"        min_task_size={min_task_size},")
-    imports.append("    ),")
-    imports.append("    runner=dict(")
-    imports.append("        type=LocalRunner,")
-    imports.append(f"        max_num_workers={max_num_workers},")
-    imports.append("        task=dict(type=OpenICLInferTask),")
-    imports.append(f"        retry={retry},")
-    imports.append("    ),")
-    imports.append(")")
-    imports.append("")
-    return "\n".join(imports)
+    lines.append("infer = dict(")
+    lines.append("    partitioner=dict(")
+    lines.append("        type=NumWorkerPartitioner,")
+    lines.append(f"        num_worker={num_worker},")
+    lines.append(f"        num_split={python_literal(num_split)},")
+    lines.append(f"        min_task_size={min_task_size},")
+    lines.append("    ),")
+    lines.append("    runner=dict(")
+    lines.append("        type=LocalRunner,")
+    lines.append(f"        max_num_workers={max_num_workers},")
+    lines.append("        task=dict(type=OpenICLInferTask),")
+    lines.append(f"        retry={retry},")
+    lines.append("    ),")
+    lines.append(")")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def is_custom_benchmark(benchmark: str) -> bool:
     return benchmark in CUSTOM_BENCHMARKS
+
+
+def canonical_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [canonical_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [canonical_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: canonical_value(value[k]) for k in sorted(value)}
+    return value
+
+
+def varying_param_keys(param_list: List[Dict[str, Any]]) -> List[str]:
+    all_keys: List[str] = []
+    for params in param_list:
+        for key in params:
+            if key not in all_keys:
+                all_keys.append(key)
+    varying: List[str] = []
+    for key in all_keys:
+        if key in NAMELESS_KEYS:
+            continue
+        values = {json.dumps(canonical_value(params.get(key)), sort_keys=True, ensure_ascii=False) for params in param_list}
+        if len(values) > 1:
+            varying.append(key)
+    return varying
+
+
+def value_to_label(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float):
+        return ("%.6g" % value).replace(".", "p").replace("-", "m")
+    if isinstance(value, (list, tuple)):
+        return "-".join(value_to_label(v) for v in value)
+    if isinstance(value, dict):
+        return "-".join(f"{short_slug(str(k), 8)}{value_to_label(v)}" for k, v in sorted(value.items()))
+    return short_slug(str(value).replace(".", "p"), max_len=32)
+
+
+def param_piece(key: str, value: Any) -> str:
+    return f"{PARAM_ALIASES.get(key, short_slug(key, max_len=10))}{value_to_label(value)}"
+
+
+def sample_already_in_exp_name(exp_dir: str) -> bool:
+    return re.search(r"(^|_)s\d+($|_)", exp_dir) is not None
+
+
+def compact_run_label(params: Dict[str, Any], include_keys: List[str], compact_exp_dir: str, idx: int) -> str:
+    keys: List[str] = []
+    for key in PREFERRED_NAME_KEYS + include_keys:
+        if key in params and key not in NAMELESS_KEYS and key not in keys:
+            keys.append(key)
+    pieces: List[str] = []
+    for key in keys:
+        if key == "sample_indices" and sample_already_in_exp_name(compact_exp_dir):
+            continue
+        pieces.append(param_piece(key, params.get(key)))
+    if not pieces:
+        pieces.append(f"r{idx:03d}")
+    return short_slug("_".join(pieces), max_len=96)
+
+
+def arness_visual_condition_label(benchmark: Any, params: Dict[str, Any]) -> Optional[str]:
+    """Return the condition directory name expected by visual_arness_trace.py.
+
+    The ARness visualizer keys conditions by benchmark/sample/length/block/steps/
+    threshold, so keep that name stable across the one-shot and split runners.
+    """
+    bench = safe_name(str(benchmark)).lower()
+    sample_indices = as_list(params.get("sample_indices"))
+    if bench not in {"gsm8k", "mbpp"} or len(sample_indices) != 1:
+        return None
+    required = ["gen_length", "gen_blocksize", "gen_steps"]
+    if any(params.get(key) is None for key in required):
+        return None
+    threshold = params.get("token_selection_confidence_threshold")
+    return safe_name(
+        f"{bench}_sample{int(sample_indices[0])}_"
+        f"len{int(params['gen_length'])}_"
+        f"block{int(params['gen_blocksize'])}_"
+        f"steps{int(params['gen_steps'])}_"
+        f"thr{value_to_label(threshold)}"
+    )
+
+
+def unique_label(label: str, used: Set[str], idx: int) -> str:
+    if label not in used:
+        used.add(label)
+        return label
+    candidate = short_slug(f"{label}_r{idx:03d}", max_len=100)
+    salt = 1
+    while candidate in used:
+        salt += 1
+        candidate = short_slug(f"{label}_r{idx:03d}_{salt}", max_len=100)
+    used.add(candidate)
+    return candidate
+
+
+def resolve_under_root(path_like: str | Path) -> Path:
+    path = Path(path_like)
+    return path if path.is_absolute() else ROOT / path
+
+
+def rel_to(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def rel_to_root(path: Path) -> str:
+    return rel_to(path, ROOT)
+
+
+def strip_opencompass_control_args(args: Sequence[Any] | None) -> List[str]:
+    cleaned: List[str] = []
+    items = [str(x) for x in (args or [])]
+    i = 0
+    while i < len(items):
+        item = items[i]
+        if item in CONTROL_ARGS_WITH_VALUE:
+            i += 2
+            continue
+        if any(item.startswith(flag + "=") for flag in CONTROL_ARGS_WITH_VALUE):
+            i += 1
+            continue
+        if item in CONTROL_ARGS_NO_VALUE:
+            i += 1
+            continue
+        cleaned.append(item)
+        i += 1
+    return cleaned
+
+
+def write_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_csv(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() and path.stat().st_size > 0
+    fieldnames = list(row.keys())
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_command(command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
+    print("$ " + " ".join(command), flush=True)
+    proc = subprocess.Popen(
+        list(command),
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+    return proc.wait()
+
+
+def build_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    pythonpath = [str(ROOT), str(OPENCOMPASS_DIR)]
+    if env.get("PYTHONPATH"):
+        pythonpath.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    return env
 
 
 def current_gpu_snapshot() -> Dict[str, Any]:
@@ -504,7 +812,7 @@ def current_gpu_snapshot() -> Dict[str, Any]:
         return {"available": False}
     if result.returncode != 0:
         return {"available": False, "error": result.stderr.strip()}
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) == 6:
@@ -528,17 +836,17 @@ class GpuTelemetry:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def start(self):
+    def start(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(2.0, self.interval_seconds * 2))
 
-    def _run(self):
+    def _run(self) -> None:
         fields = [
             "timestamp_utc",
             "gpu_index",
@@ -558,542 +866,315 @@ class GpuTelemetry:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             while not self._stop.is_set():
-                timestamp = datetime.now(timezone.utc).isoformat()
+                timestamp = utc_now()
                 try:
                     result = subprocess.run(query, capture_output=True, text=True, check=False, timeout=10)
                     if result.returncode == 0:
                         for line in result.stdout.splitlines():
                             parts = [part.strip() for part in line.split(",")]
                             if len(parts) == 7:
-                                writer.writerow({
-                                    "timestamp_utc": timestamp,
-                                    "gpu_index": parts[0],
-                                    "gpu_name": parts[1],
-                                    "utilization_gpu_percent": parts[2],
-                                    "memory_used_mb": parts[3],
-                                    "memory_total_mb": parts[4],
-                                    "power_draw_w": parts[5],
-                                    "temperature_gpu_c": parts[6],
-                                })
-                                f.flush()
+                                writer.writerow(
+                                    {
+                                        "timestamp_utc": timestamp,
+                                        "gpu_index": parts[0],
+                                        "gpu_name": parts[1],
+                                        "utilization_gpu_percent": parts[2],
+                                        "memory_used_mb": parts[3],
+                                        "memory_total_mb": parts[4],
+                                        "power_draw_w": parts[5],
+                                        "temperature_gpu_c": parts[6],
+                                    }
+                                )
                     else:
                         writer.writerow({"timestamp_utc": timestamp})
-                        f.flush()
+                    f.flush()
                 except (OSError, subprocess.TimeoutExpired):
                     writer.writerow({"timestamp_utc": timestamp})
                     f.flush()
                 self._stop.wait(self.interval_seconds)
 
 
-def read_jsonl(path: Optional[Path]) -> List[Dict[str, Any]]:
-    if path is None or not path.exists() or path.is_dir():
-        return []
-    records = []
+def opencompass_timestamp_dirs(work_dir: Path) -> Set[str]:
+    if not work_dir.exists():
+        return set()
+    return {child.name for child in work_dir.iterdir() if child.is_dir() and (child / "configs").exists()}
+
+
+def latest_opencompass_timestamp(work_dir: Path) -> Optional[str]:
+    names = sorted(opencompass_timestamp_dirs(work_dir))
+    return names[-1] if names else None
+
+
+def read_jsonl_count(path: Path) -> int:
+    if not path.exists() or path.is_dir():
+        return 0
+    count = 0
     with path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+            if line.strip():
+                count += 1
+    return count
 
 
-def numeric_values(records: List[Dict[str, Any]], key: str) -> List[float]:
-    values = []
-    for record in records:
-        value = record.get(key)
-        if isinstance(value, (int, float)):
-            values.append(float(value))
-    return values
+def copy_aliases_for_visualizer(outputs_jsonl: Path, summary_jsonl: Path) -> None:
+    if outputs_jsonl.exists() and not summary_jsonl.exists():
+        shutil.copy2(outputs_jsonl, summary_jsonl)
+    if summary_jsonl.exists() and not outputs_jsonl.exists():
+        shutil.copy2(summary_jsonl, outputs_jsonl)
 
 
-def mean(values: List[float]) -> Optional[float]:
-    return sum(values) / len(values) if values else None
+def write_visual_command(path: Path, run_dir: Path, params: Dict[str, Any]) -> None:
+    sample_idx = None
+    indices = params.get("sample_indices")
+    if isinstance(indices, list) and len(indices) == 1:
+        sample_idx = indices[0]
+    elif isinstance(indices, int):
+        sample_idx = indices
+    command = f'python visual_arness_trace.py "{rel_to_root(run_dir)}"'
+    if sample_idx is not None:
+        command += f" --sample-idx {sample_idx}"
+    path.write_text(command + "\n", encoding="utf-8")
 
 
-def percentile(values: List[float], p: float) -> Optional[float]:
-    if not values:
-        return None
-    ordered = sorted(values)
-    idx = int(round((len(ordered) - 1) * p))
-    return ordered[idx]
-
-
-def telemetry_summary(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    rows = []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-
-    def col(name: str) -> List[float]:
-        values = []
-        for row in rows:
-            try:
-                if row.get(name) not in (None, ""):
-                    values.append(float(row[name]))
-            except ValueError:
-                pass
-        return values
-
-    util = col("utilization_gpu_percent")
-    mem = col("memory_used_mb")
-    power = col("power_draw_w")
-    temp = col("temperature_gpu_c")
-    return {
-        "gpu_samples": len(rows),
-        "gpu_util_mean": mean(util),
-        "gpu_util_max": max(util) if util else None,
-        "gpu_memory_used_max_mb": max(mem) if mem else None,
-        "gpu_power_mean_w": mean(power),
-        "gpu_temperature_max_c": max(temp) if temp else None,
-    }
-
-
-def find_latest_opencompass_summary(work_dir: Path) -> Dict[str, Any]:
-    # OpenCompass writes into work_dir/<timestamp>/summary/*.csv, not work_dir/summary directly.
-    csv_files = sorted(work_dir.glob("*/summary/*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not csv_files:
-        return {}
-    latest = csv_files[0]
-    return {"opencompass_summary_csv": str(latest)}
-
-
-PRIMARY_METRIC_CANDIDATES = [
-    "accuracy",
-    "acc",
-    "pass@1",
-    "exact_match",
-    "em",
-    "score",
-]
-
-
-def _to_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("%"):
-        text = text[:-1]
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def parse_opencompass_primary_metric(work_dir: Path, benchmark: str) -> Dict[str, Any]:
-    summary = find_latest_opencompass_summary(work_dir)
-    path_text = summary.get("opencompass_summary_csv")
-    if not path_text:
-        return summary
-    path = Path(path_text)
-    rows = []
-    try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            rows = list(csv.DictReader(f))
-    except OSError:
-        return summary
-    if not rows:
-        return summary
-
-    def row_matches(row: Dict[str, Any]) -> bool:
-        haystack = " ".join(str(value).lower() for value in row.values() if value is not None)
-        return benchmark.lower() in haystack
-
-    candidate_rows = [row for row in rows if row_matches(row)] or rows
-
-    for metric_name in PRIMARY_METRIC_CANDIDATES:
-        for row in candidate_rows:
-            for key, value in row.items():
-                key_norm = (key or "").strip().lower()
-                if key_norm == metric_name:
-                    parsed = _to_float(value)
-                    if parsed is not None:
-                        return {
-                            **summary,
-                            "primary_metric_name": key,
-                            "primary_metric_value": parsed,
-                        }
-
-    for row in candidate_rows:
-        metric_label = None
-        for label_key in ("metric", "metrics", "name", "dataset"):
-            label = row.get(label_key)
-            if label and str(label).strip().lower() in PRIMARY_METRIC_CANDIDATES:
-                metric_label = str(label).strip()
-                break
-        if not metric_label:
-            continue
-        for key, value in row.items():
-            if key in ("metric", "metrics", "name", "dataset", "version", "mode"):
-                continue
-            parsed = _to_float(value)
-            if parsed is not None:
-                return {
-                    **summary,
-                    "primary_metric_name": metric_label,
-                    "primary_metric_value": parsed,
-                }
-
-    for metric_name in PRIMARY_METRIC_CANDIDATES:
-        for row in candidate_rows:
-            for key, value in row.items():
-                if metric_name in (str(key).lower() + " " + str(value).lower()):
-                    parsed = _to_float(value)
-                    if parsed is not None:
-                        return {
-                            **summary,
-                            "primary_metric_name": key,
-                            "primary_metric_value": parsed,
-                        }
-    return summary
-
-
-def upsert_csv_row(output_path: Path, row: Dict[str, Any]):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows: List[Dict[str, Any]] = []
-    fieldnames: List[str] = []
-    if output_path.exists():
-        with output_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            fieldnames = list(reader.fieldnames or [])
-            rows = list(reader)
-    for key in row.keys():
-        if key not in fieldnames:
-            fieldnames.append(key)
-    rows.append(row)
-    with output_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for existing in rows:
-            writer.writerow(existing)
-
-
-def write_run_summary(
-    output_path: Path,
-    run_name: str,
-    experiment: str,
-    benchmark: str,
-    params: Dict[str, Any],
-    per_sample_path: Optional[Path],
-    telemetry_path: Path,
-    work_dir: Path,
-    returncode: Optional[int],
-    elapsed_seconds: Optional[float],
-) -> Dict[str, Any]:
-    samples = read_jsonl(per_sample_path)
-    latencies = numeric_values(samples, "elapsed_seconds")
-    tps = numeric_values(samples, "tokens_per_second")
-    peak_alloc = numeric_values(samples, "cuda_max_memory_allocated_mb")
-    peak_reserved = numeric_values(samples, "cuda_max_memory_reserved_mb")
-    completion_rates = numeric_values(samples, "completion_rate")
-    actual_parallelism = numeric_values(samples, "actual_parallelism")
-    actual_arness = numeric_values(samples, "actual_arness")
-    planned_steps = numeric_values(samples, "planned_steps")
-    planned_parallelism = numeric_values(samples, "planned_parallelism")
-    threshold_pass_rates = numeric_values(samples, "threshold_pass_rate")
-    fallback_rates = numeric_values(samples, "fallback_rate")
-    effective_parallelism = numeric_values(samples, "effective_parallelism")
-    arness = numeric_values(samples, "arness")
-    peak_vram = max(peak_reserved or peak_alloc) if (peak_reserved or peak_alloc) else None
-    failure_types = [str(sample.get("failure_type")) for sample in samples if sample.get("failure_type")]
-
-    def failure_rate(name: str) -> Optional[float]:
-        if not samples:
-            return None
-        return sum(1 for item in failure_types if item == name) / len(samples)
-
-    row = {
-        "run_name": run_name,
-        "experiment": experiment,
-        "benchmark": benchmark,
-        "decoding_config_name": samples[0].get("decoding_config_name") if samples else run_name,
-        "returncode": returncode,
-        "elapsed_seconds": elapsed_seconds,
-        "num_samples": len(samples),
-        "format_failure_rate": failure_rate("format_failure"),
-        "retrieval_failure_rate": failure_rate("retrieval_failure"),
-        "task_failure_rate": failure_rate("task_failure"),
-        "unfinished_generation_rate": failure_rate("unfinished_generation"),
-        "truncation_failure_rate": failure_rate("truncation_failure"),
-        "empty_output_rate": failure_rate("empty_output"),
-        "latency_mean_s": mean(latencies),
-        "latency_p50_s": percentile(latencies, 0.5),
-        "latency_p95_s": percentile(latencies, 0.95),
-        "tokens_per_second_mean": mean(tps),
-        "tokens_per_second_p50": percentile(tps, 0.5),
-        "tokens_per_second_p95": percentile(tps, 0.95),
-        "peak_vram": peak_vram,
-        "cuda_max_memory_allocated_mb": max(peak_alloc) if peak_alloc else None,
-        "cuda_max_memory_reserved_mb": max(peak_reserved) if peak_reserved else None,
-        "completion_rate": mean(completion_rates),
-        "actual_parallelism": mean(actual_parallelism),
-        "actual_arness_mean": mean(actual_arness),
-        "planned_steps": mean(planned_steps),
-        "planned_parallelism_mean": mean(planned_parallelism),
-        "steps_per_block_schedule": samples[0].get("steps_per_block_schedule") if samples else None,
-        "speed_schedule_name": samples[0].get("speed_schedule_name") if samples else params.get("speed_schedule_name"),
-        "threshold_schedule_label": samples[0].get("threshold_schedule_label") if samples else params.get("threshold_schedule_label"),
-        "token_selection_confidence_threshold_schedule": samples[0].get("token_selection_confidence_threshold_schedule") if samples else params.get("token_selection_confidence_threshold_schedule"),
-        "visible_tokens_by_block": samples[0].get("visible_tokens_by_block") if samples else None,
-        "completion_rate_by_block": samples[0].get("completion_rate_by_block") if samples else None,
-        "threshold_pass_rate_mean": mean(threshold_pass_rates),
-        "fallback_rate_mean": mean(fallback_rates),
-        "effective_parallelism_mean": mean(effective_parallelism),
-        "arness_mean": mean(arness),
-        **telemetry_summary(telemetry_path),
-        **parse_opencompass_primary_metric(work_dir, benchmark),
-    }
-    for key, value in params.items():
-        row[f"param_{key}"] = value
-
-    upsert_csv_row(output_path, row)
-    return row
-
-
-def aggregate_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact table used for cross-run experiment reading."""
-    return {
-        "run_name": row.get("run_name"),
-        "experiment": row.get("experiment"),
-        "benchmark": row.get("benchmark"),
-        "decoding_config_name": row.get("decoding_config_name"),
-        "primary_metric_name": row.get("primary_metric_name"),
-        "primary_metric_value": row.get("primary_metric_value"),
-        "latency_mean": row.get("latency_mean_s"),
-        "tokens_per_second_mean": row.get("tokens_per_second_mean"),
-        "peak_vram": row.get("peak_vram"),
-        "actual_parallelism": row.get("actual_parallelism"),
-        "completion_rate": row.get("completion_rate"),
-        "gen_length": row.get("param_gen_length"),
-        "gen_steps": row.get("param_gen_steps"),
-        "gen_blocksize": row.get("param_gen_blocksize"),
-        "speed_schedule_label": row.get("param_speed_schedule_label"),
-        "speed_schedule_name": row.get("speed_schedule_name") or row.get("param_speed_schedule_name"),
-        "steps_per_block_schedule": row.get("steps_per_block_schedule") or row.get("param_steps_per_block_schedule"),
-        "planned_steps": row.get("planned_steps"),
-        "planned_parallelism": row.get("planned_parallelism_mean"),
-        "effective_parallelism": row.get("effective_parallelism_mean"),
-        "arness_mean": row.get("arness_mean"),
-        "actual_arness_mean": row.get("actual_arness_mean"),
-        "token_selection_confidence_threshold": row.get("param_token_selection_confidence_threshold"),
-        "threshold_schedule_label": row.get("threshold_schedule_label") or row.get("param_threshold_schedule_label"),
-        "token_selection_confidence_threshold_schedule": row.get("token_selection_confidence_threshold_schedule") or row.get("param_token_selection_confidence_threshold_schedule"),
-        "visible_tokens_by_block": row.get("visible_tokens_by_block"),
-        "completion_rate_by_block": row.get("completion_rate_by_block"),
-        "min_transfer_tokens": row.get("param_min_transfer_tokens"),
-        "context_length": row.get("param_context_length"),
-        "needle_position": row.get("param_needle_position"),
-        "num_samples": row.get("num_samples"),
-        "returncode": row.get("returncode"),
-    }
-
-
-def run_command(command: List[str], cwd: Path, env: Dict[str, str]) -> int:
-    print("$ " + " ".join(command), flush=True)
-    process = subprocess.Popen(command, cwd=str(cwd), env=env)
-    return process.wait()
-
-
-def cuda_stats_before(device):
-    try:
-        import torch
-    except ImportError:
-        return
-    if getattr(device, "type", None) == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-
-
-def cuda_stats_after(device) -> Dict[str, Any]:
-    try:
-        import torch
-    except ImportError:
-        return {}
-    if getattr(device, "type", None) != "cuda":
-        return {}
-    torch.cuda.synchronize(device)
-    return {
-        "cuda_max_memory_allocated_mb": round(torch.cuda.max_memory_allocated(device) / 1024 ** 2, 3),
-        "cuda_max_memory_reserved_mb": round(torch.cuda.max_memory_reserved(device) / 1024 ** 2, 3),
-    }
+def mode_commands(mode: str) -> List[Optional[str]]:
+    if mode == "all":
+        return [None]
+    if mode == "both":
+        return ["infer", "eval"]
+    return [mode]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run iLLaDA/LLaDA benchmark experiments from test_config.yaml.")
-    parser.add_argument("--config", default="test_config.yaml", help="Path to the YAML config.")
-    parser.add_argument("--dry-run", action="store_true", help="Generate configs and commands without running OpenCompass.")
-    parser.add_argument("--only", nargs="*", help="Run only these task sections or experiment names.")
+    parser = argparse.ArgumentParser(description="Run iLLaDA/OpenCompass experiments with compact output paths.")
+    parser.add_argument("--config", default="test_config.yaml")
+    parser.add_argument("--only", nargs="*", default=None, help="Task section or experiment name.")
+    parser.add_argument("--output-root", default="outputs")
+    parser.add_argument("--mode", choices=["all", "infer", "eval", "viz", "both"], default=None)
+    parser.add_argument("--legacy-names", action="store_true", help="Use old long output folders.")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    if not config_path.is_absolute():
-        config_path = ROOT / config_path
+    config_path = resolve_under_root(args.config)
     config = load_yaml(config_path)
-
     execution_cfg = config.get("execution", {}) or {}
-    base_output_dir = Path(execution_cfg.get("output_dir", "outputs/illada_runs"))
-    if not base_output_dir.is_absolute():
-        base_output_dir = ROOT / base_output_dir
-
-    dry_run = args.dry_run or bool(execution_cfg.get("dry_run", False))
-    telemetry_enabled = bool(execution_cfg.get("gpu_telemetry", {}).get("enabled", True))
-    telemetry_interval = float(execution_cfg.get("gpu_telemetry", {}).get("interval_seconds", 1.0))
     data_cfg = config.get("data", {}) or {}
     global_model = config.get("model", {}) or {}
     runner_cfg = config.get("runner", {}) or {}
     default_params = config.get("defaults", {}) or {}
+
     selected = set(args.only or [])
     experiments = collect_experiments(config, selected)
     if not experiments:
-        raise SystemExit("No experiments matched the selected task or experiment names.")
+        raise SystemExit("No experiments matched.")
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(OPENCOMPASS_DIR) + os.pathsep + env.get("PYTHONPATH", "")
-    manifest_paths = set()
+    output_root = resolve_under_root(args.output_root)
+    dry_run = args.dry_run or bool(execution_cfg.get("dry_run", False))
+    run_mode = args.mode or str(execution_cfg.get("mode", "all"))
+    extra_opencompass_args = strip_opencompass_control_args(execution_cfg.get("opencompass_args", []) or [])
+
+    telemetry_cfg = execution_cfg.get("gpu_telemetry", {}) or {}
+    telemetry_enabled = bool(telemetry_cfg.get("enabled", True))
+    telemetry_interval = float(telemetry_cfg.get("interval_seconds", 1.0))
+
+    env = build_env()
     planned = 0
 
     for experiment in experiments:
         exp_name = experiment.get("name")
         if not exp_name:
             raise SystemExit("Every experiment needs a `name`.")
-        output_dir = experiment_output_dir(base_output_dir, experiment)
-        generated_dir = output_dir / "generated_configs"
-        generated_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = output_dir / "run_manifest.jsonl"
-        manifest_paths.add(str(manifest_path))
+        benchmark_list = as_list(experiment.get("benchmark"))
+        first_benchmark = str(benchmark_list[0]) if benchmark_list else None
+        compact_exp_dir = compact_experiment_name(experiment, first_benchmark)
 
-        for benchmark in as_list(experiment.get("benchmark")):
-            if not benchmark:
-                raise SystemExit(f"Experiment `{exp_name}` is missing `benchmark`.")
+        if args.legacy_names:
+            exp_root = resolve_under_root(experiment.get("output_path") or (output_root / safe_name(str(experiment.get("task") or "runs")) / safe_name(str(exp_name))))
+        else:
+            exp_root = compact_experiment_output_dir(output_root, experiment, compact_exp_dir)
+        exp_root.mkdir(parents=True, exist_ok=True)
+
+        run_manifest = exp_root / ("run_manifest.jsonl" if args.legacy_names else "runs.jsonl")
+        run_csv = exp_root / ("run_manifest.csv" if args.legacy_names else "runs.csv")
+
+        expanded_params = [deep_merge(default_params, p) for p in expand_matrix(experiment)]
+        include_keys = varying_param_keys(expanded_params)
+        used_labels: Set[str] = set()
+
+        for benchmark in benchmark_list:
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 planned += 1
                 merged_params = deep_merge(default_params, params)
-                run_name = condition_run_name(exp_name, benchmark, merged_params, idx)
-                work_dir = output_dir / run_name
-                model_cfg = build_model_cfg(global_model, merged_params, benchmark, run_name)
+                full_run_name = condition_run_name(str(exp_name), str(benchmark), merged_params, idx)
+                if args.legacy_names:
+                    run_label = full_run_name
+                    run_dir = exp_root / full_run_name
+                    config_path_out = exp_root / "generated_configs" / f"{full_run_name}.py"
+                    run_json = run_dir / "config.json"
+                    outputs_jsonl = run_dir / "summary.jsonl"
+                    summary_jsonl = run_dir / "summary.jsonl"
+                    trace_jsonl = run_dir / "trace.jsonl"
+                    gpu_csv = run_dir / "gpu_telemetry.csv"
+                    oc_run_name = full_run_name
+                else:
+                    visual_label = arness_visual_condition_label(benchmark, merged_params)
+                    run_label = unique_label(
+                        visual_label or compact_run_label(merged_params, include_keys, compact_exp_dir, idx),
+                        used_labels,
+                        idx,
+                    )
+                    run_dir = exp_root / run_label
+                    config_path_out = run_dir / "oc_config.py"
+                    run_json = run_dir / "run.json"
+                    outputs_jsonl = run_dir / "outputs.jsonl"
+                    summary_jsonl = run_dir / "summary.jsonl"
+                    trace_jsonl = run_dir / "trace.jsonl"
+                    gpu_csv = run_dir / "gpu.csv"
+                    oc_run_name = run_label
+
+                run_dir.mkdir(parents=True, exist_ok=True)
+                config_path_out.parent.mkdir(parents=True, exist_ok=True)
+
+                model_cfg = build_model_cfg(deepcopy(global_model), merged_params, str(benchmark), oc_run_name)
                 model_cfg["task_id"] = experiment.get("task")
-                if model_cfg.get("arness_trace_output"):
-                    model_cfg["arness_trace_output"] = str(work_dir / "sample_traces")
-                if execution_cfg.get("collect_metrics", True) and not model_cfg.get("metrics_output"):
-                    model_cfg["per_sample_output"] = str(work_dir / "summary.jsonl")
-                    if model_cfg.get("return_trace") or model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
-                        model_cfg["step_trace_output"] = str(work_dir / "trace.jsonl")
-                    model_cfg["metrics_output"] = str(work_dir / "summary.jsonl")
-                generated_config = generated_dir / f"{run_name}.py"
+                model_cfg.setdefault("per_sample_output", str(outputs_jsonl))
+                model_cfg.setdefault("metrics_output", str(summary_jsonl))
+                if model_cfg.get("return_trace") or model_cfg.get("trace_token_snapshots") or model_cfg.get("trace_decode_snapshots"):
+                    model_cfg.setdefault("step_trace_output", str(trace_jsonl))
+                    model_cfg["arness_trace_output"] = str(run_dir / "sample_traces")
+
                 config_text = render_opencompass_config(
-                    benchmark,
-                    deepcopy(model_cfg),
-                    runner_cfg,
+                    benchmark=str(benchmark),
+                    model_cfg=deepcopy(model_cfg),
+                    runner_cfg=runner_cfg,
                     sample_limit=merged_params.get("sample_limit"),
                     sample_indices=merged_params.get("sample_indices"),
                     experiment_params=merged_params,
                     data_cfg=data_cfg,
                 )
-                generated_config.write_text(config_text, encoding="utf-8")
-                work_dir.mkdir(parents=True, exist_ok=True)
+                config_path_out.write_text(config_text, encoding="utf-8")
+
                 run_config = {
-                    "run_name": run_name,
+                    "mode": run_mode,
+                    "created_at": utc_now(),
+                    "source_config": str(config_path),
+                    "source_config_rel": rel_to_root(config_path),
                     "task": experiment.get("task"),
                     "experiment": exp_name,
+                    "compact_experiment": compact_exp_dir,
                     "benchmark": benchmark,
+                    "run_label": run_label,
+                    "run_name": full_run_name,
+                    "opencompass_run_name": oc_run_name,
                     "params": merged_params,
                     "model": model_cfg,
                     "runner": runner_cfg,
-                    "source_config": str(config_path),
-                    "generated_opencompass_config": str(generated_config),
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-                (work_dir / "config.json").write_text(
-                    json.dumps(run_config, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-                command = [
-                    sys.executable,
-                    "run.py",
-                    str(generated_config),
-                    "-w",
-                    str(work_dir),
-                ]
-                extra_args = execution_cfg.get("opencompass_args", []) or []
-                command.extend(str(item) for item in extra_args)
-
-                manifest = {
-                    "run_name": run_name,
-                    "task": experiment.get("task"),
-                    "experiment": exp_name,
-                    "benchmark": benchmark,
-                    "params": merged_params,
-                    "model": model_cfg,
-                    "config": str(generated_config),
-                    "work_dir": str(work_dir),
-                    "command": command,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "dry_run": dry_run,
-                    "gpu_before": current_gpu_snapshot(),
-                    "artifacts": {
-                        "config_json": str(work_dir / "config.json"),
-                        "summary_jsonl": model_cfg.get("per_sample_output") or model_cfg.get("metrics_output"),
-                        "trace_jsonl": model_cfg.get("step_trace_output"),
-                        "gpu_telemetry_csv": str(work_dir / "gpu_telemetry.csv"),
-                        "aggregate_csv": str(work_dir / "aggregate.csv"),
+                    "layout": "legacy" if args.legacy_names else "compact_param",
+                    "output_files": {
+                        "outputs_jsonl": str(outputs_jsonl),
+                        "summary_jsonl": str(summary_jsonl),
+                        "trace_jsonl": str(trace_jsonl),
+                        "gpu_csv": str(gpu_csv),
                     },
                 }
-                print(f"[{run_name}] config: {generated_config}")
-                print(f"[{run_name}] work_dir: {work_dir}")
+                write_json(run_json, run_config)
+                write_visual_command(run_dir / "visual_command.txt", run_dir, merged_params)
+
+                before_timestamps = opencompass_timestamp_dirs(run_dir)
+                returncode: Optional[int] = None
+                elapsed_total = 0.0
+                commands: List[List[str]] = []
+
+                for mode_item in mode_commands(run_mode):
+                    command = [sys.executable, str(OPENCOMPASS_DIR / "run.py"), str(config_path_out), "-w", str(run_dir)]
+                    if mode_item is not None:
+                        command.extend(["-m", mode_item])
+                    command.extend(extra_opencompass_args)
+                    commands.append(command)
+
+                record: Dict[str, Any] = {
+                    "created_at": utc_now(),
+                    "mode": run_mode,
+                    "dry_run": dry_run,
+                    "task": experiment.get("task"),
+                    "experiment": exp_name,
+                    "compact_experiment": compact_exp_dir,
+                    "benchmark": benchmark,
+                    "run_label": run_label,
+                    "run_name": full_run_name,
+                    "config": str(config_path_out),
+                    "config_rel": rel_to(config_path_out, exp_root),
+                    "work_dir": str(run_dir),
+                    "work_dir_rel": rel_to(run_dir, exp_root),
+                    "outputs_jsonl": str(outputs_jsonl),
+                    "summary_jsonl": str(summary_jsonl),
+                    "trace_jsonl": str(trace_jsonl),
+                    "gpu_csv": str(gpu_csv),
+                    "visual_command": (run_dir / "visual_command.txt").read_text(encoding="utf-8").strip(),
+                    "params": merged_params,
+                    "commands": commands,
+                    "gpu_before": current_gpu_snapshot(),
+                }
+
+                print(f"\n[run:{run_label}] run_name: {full_run_name}")
+                print(f"[run:{run_label}] dir: {run_dir}")
+                print(f"[run:{run_label}] visual: {record['visual_command']}")
+
                 if dry_run:
-                    print(f"[{run_name}] dry-run: {' '.join(command)}")
-                    manifest["returncode"] = None
+                    for command in commands:
+                        print("[dry-run] " + " ".join(command))
+                    record.update({"returncode": None, "elapsed_seconds": None})
                 else:
-                    telemetry = None
+                    telemetry: Optional[GpuTelemetry] = None
                     if telemetry_enabled:
-                        telemetry = GpuTelemetry(work_dir / "gpu_telemetry.csv", interval_seconds=telemetry_interval)
+                        telemetry = GpuTelemetry(gpu_csv, interval_seconds=telemetry_interval)
                         telemetry.start()
-                    start = time.perf_counter()
+                    started = time.perf_counter()
                     try:
-                        returncode = run_command(command, OPENCOMPASS_DIR, env)
+                        for command in commands:
+                            returncode = run_command(command, OPENCOMPASS_DIR, env)
+                            if returncode != 0:
+                                break
                     finally:
                         if telemetry is not None:
                             telemetry.stop()
-                    elapsed_seconds = round(time.perf_counter() - start, 3)
-                    manifest["elapsed_seconds"] = elapsed_seconds
-                    manifest["returncode"] = returncode
-                    manifest["gpu_after"] = current_gpu_snapshot()
-                    run_summary = write_run_summary(
-                        output_path=work_dir / "run_summary.csv",
-                        run_name=run_name,
-                        experiment=exp_name,
-                        benchmark=benchmark,
-                        params=merged_params,
-                        per_sample_path=Path(model_cfg["per_sample_output"]) if model_cfg.get("per_sample_output") else None,
-                        telemetry_path=work_dir / "gpu_telemetry.csv",
-                        work_dir=work_dir,
-                        returncode=returncode,
-                        elapsed_seconds=elapsed_seconds,
+                    elapsed_total = round(time.perf_counter() - started, 3)
+                    copy_aliases_for_visualizer(outputs_jsonl, summary_jsonl)
+                    after_timestamps = opencompass_timestamp_dirs(run_dir)
+                    new_timestamps = sorted(after_timestamps - before_timestamps)
+                    reuse_timestamp = new_timestamps[-1] if new_timestamps else latest_opencompass_timestamp(run_dir)
+                    record.update(
+                        {
+                            "returncode": returncode,
+                            "elapsed_seconds": elapsed_total,
+                            "opencompass_reuse_timestamp": reuse_timestamp,
+                            "gpu_after": current_gpu_snapshot(),
+                            "num_output_records": read_jsonl_count(outputs_jsonl),
+                            "num_summary_records": read_jsonl_count(summary_jsonl),
+                            "trace_exists": trace_jsonl.exists(),
+                        }
                     )
-                    compact_summary = aggregate_row(run_summary)
-                    upsert_csv_row(work_dir / "aggregate.csv", compact_summary)
-                    upsert_csv_row(output_dir / "aggregate.csv", compact_summary)
-                    upsert_csv_row(output_dir / "summary_all.csv", run_summary)
-                    with manifest_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(manifest, ensure_ascii=False) + "\n")
                     if returncode != 0 and execution_cfg.get("stop_on_error", True):
-                        print(f"[{run_name}] failed with return code {returncode}", file=sys.stderr)
-                        return returncode
-                if dry_run:
-                    with manifest_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(manifest, ensure_ascii=False) + "\n")
+                        append_jsonl(run_manifest, record)
+                        return int(returncode or 1)
 
-    if planned == 0:
-        raise SystemExit("No enabled experiments matched the selection.")
-    manifests = ", ".join(sorted(manifest_paths))
-    print(f"Planned {planned} run(s). Manifest(s): {manifests}")
+                append_jsonl(run_manifest, record)
+                append_csv(
+                    run_csv,
+                    {
+                        "created_at": record["created_at"],
+                        "mode": run_mode,
+                        "run_label": run_label,
+                        "run_name": full_run_name,
+                        "benchmark": benchmark,
+                        "returncode": "" if record.get("returncode") is None else record.get("returncode"),
+                        "elapsed_seconds": "" if record.get("elapsed_seconds") is None else record.get("elapsed_seconds"),
+                        "work_dir": str(run_dir),
+                        "visual_command": record["visual_command"],
+                    },
+                )
+
+    print(f"\nPlanned {planned} run(s).")
+    print(f"Outputs root: {output_root}")
     return 0
 
 

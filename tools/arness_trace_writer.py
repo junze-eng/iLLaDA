@@ -248,7 +248,7 @@ def write_live_sample_artifacts(
         f"thr{_safe_name(record.get('token_selection_confidence_threshold'))}",
         f"block{_num(record.get('block_length'), _num(record.get('gen_blocksize'), 0))}",
     ])
-    if (root.parent / "config.json").exists():
+    if (root.parent / "config.json").exists() or (root.parent / "run.json").exists():
         sample_dir = root / f"sample_{sample_idx:04d}"
     else:
         sample_dir = root / benchmark / f"sample_{sample_idx:04d}" / condition
