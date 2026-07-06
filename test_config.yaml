@@ -446,6 +446,23 @@ tasks:
         sweep:
           token_selection_confidence_threshold: [0.5, 0.6, 0.7]
 
+  gsm8k_overprovision_rescue_scaled:
+    description: "Task 10: larger-sample rerun of Task 8's steps-doubling rescue grid (gen_steps=32 [8 tok/step, 8x parallel] vs 64 [4 tok/step, 4x parallel], x threshold 0.8/0.9) to get a statistically firmer read on whether accuracy actually rises with more steps, not just completion_rate -- Task 8 only had n=5 per cell (one cell had an incidental n=10 from a partial earlier run), which was too noisy to trust the accuracy deltas (20/40/60/80% across cells) on their own. Quadruples sample_limit to 20 for a much tighter accuracy estimate on the same 2x2 grid."
+    output_path: outputs/gsm8k_overprovision_rescue_scaled
+    experiments:
+      - name: task10_gsm8k_overprovision_rescue_scaled
+        benchmark: gsm8k
+        params:
+          sample_limit: 20
+          gen_length: 256
+          gen_blocksize: 256
+          temperature: 0.0
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [32, 64]
+          token_selection_confidence_threshold: [0.8, 0.9]
+
   baseline:
     description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
     output_path: outputs/baseline
