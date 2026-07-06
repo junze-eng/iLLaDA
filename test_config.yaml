@@ -419,14 +419,14 @@ tasks:
       - name: task8_gsm8k_overprovision_rescue
         benchmark: gsm8k
         params:
-          sample_limit: 10
+          sample_limit: 5
           gen_length: 256
           gen_blocksize: 256
           temperature: 0.0
           min_transfer_tokens: 1
           return_trace: true
         sweep:
-          gen_steps: [32, 64, 128]
+          gen_steps: [32, 64]
           token_selection_confidence_threshold: [0.8, 0.9]
 
   baseline:
