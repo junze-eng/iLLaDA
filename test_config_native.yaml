@@ -23,6 +23,7 @@ run:
     - context_double_8k_l64_tps
     - parallel_gsm8k_iLLaDA_s20
     - parallel_gsm8k_w1_s20
+    - parallel_mbpp_w1_s20
     - context_double_trace_probe
     - context_double_w1_2_4k
     - w1_trace_focus
