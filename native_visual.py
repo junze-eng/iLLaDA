@@ -410,6 +410,347 @@ def plot_parallel_combined(df: pd.DataFrame, path: Path) -> None:
     print(f"[OK] wrote {path}")
 
 
+def is_trueish(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    return s in {"true", "1", "yes", "y", "pass", "passed"}
+
+
+def shorten_text(text: Any, limit: int = 220) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s if len(s) <= limit else s[: max(0, limit - 3)] + "..."
+
+
+def sample_key(x: Any) -> str:
+    try:
+        return str(int(x))
+    except Exception:
+        return str(x)
+
+
+def try_float(x: Any) -> float:
+    try:
+        if x is None:
+            return float("nan")
+        s = str(x).strip()
+        if s == "" or s.lower() in {"nan", "none", "null"}:
+            return float("nan")
+        return float(s)
+    except Exception:
+        return float("nan")
+
+
+def safe_rel_error(pred: Any, gold: Any) -> float:
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p) or math.isnan(g):
+        return float("nan")
+    denom = max(abs(g), 1e-9)
+    return abs(p - g) / denom
+
+
+def safe_abs_error(pred: Any, gold: Any) -> float:
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p) or math.isnan(g):
+        return float("nan")
+    return abs(p - g)
+
+
+def gsm8k_failure_mode(pred: Any, gold: Any, correct: Any) -> str:
+    if is_trueish(correct):
+        return "correct"
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p):
+        return "no_numeric_answer"
+    if math.isnan(g):
+        return "unknown_gold"
+    if g == 0:
+        return "wrong_numeric"
+    ratio = abs(p) / max(abs(g), 1e-9)
+    if ratio >= 10 or ratio <= 0.1:
+        return "order_of_magnitude_error"
+    if (p > 0 > g) or (p < 0 < g):
+        return "sign_error"
+    rel = abs(p - g) / max(abs(g), 1e-9)
+    if rel <= 0.2 or abs(p - g) <= 2:
+        return "near_miss"
+    return "wrong_numeric"
+
+
+def load_scores_outputs(out_dir: Path) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+    scores = read_csv(out_dir / "scores.csv")
+    outputs = read_jsonl(out_dir / "outputs.jsonl")
+    out_by_sample: Dict[str, Dict[str, Any]] = {}
+    for o in outputs:
+        out_by_sample[sample_key(o.get("sample_id", o.get("dataset_index", len(out_by_sample))))] = o
+    return scores, out_by_sample
+
+
+def resolve_output_dir(root: Path, row: pd.Series) -> Path:
+    raw = Path(str(row.get("output_dir") or ""))
+    if raw.exists():
+        return raw
+    cand = root / str(row.get("model") or "") / str(row.get("task") or "") / str(row.get("benchmark") or "") / str(row.get("condition") or "")
+    if cand.exists():
+        return cand
+    return raw
+
+
+def plot_gsm8k_failure_modes(summary_df: pd.DataFrame, path: Path) -> None:
+    if summary_df.empty:
+        return
+    work = summary_df.copy()
+    work["count"] = pd.to_numeric(work["count"], errors="coerce").fillna(0)
+    modes = [m for m in ["order_of_magnitude_error", "wrong_numeric", "near_miss", "no_numeric_answer", "sign_error"] if m in set(work["failure_mode"].astype(str))]
+    if not modes:
+        modes = sorted(work["failure_mode"].astype(str).unique().tolist())
+    pivot = work.pivot_table(index="condition_label", columns="failure_mode", values="count", aggfunc="sum", fill_value=0)
+    cols = [c for c in modes if c in pivot.columns] + [c for c in pivot.columns if c not in modes]
+    pivot = pivot[cols]
+    fig_w = max(8.5, 1.3 * len(pivot.index) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.2))
+    bottom = np.zeros(len(pivot.index))
+    x = np.arange(len(pivot.index))
+    for col in pivot.columns:
+        vals = pivot[col].to_numpy(dtype=float)
+        ax.bar(x, vals, bottom=bottom, label=str(col))
+        bottom = bottom + vals
+    ax.set_xticks(x, pivot.index.tolist(), rotation=25, ha="right")
+    ax.set_ylabel("Failure count")
+    ax.set_xlabel("Condition")
+    ax.set_title("GSM8K main failure reasons")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def plot_gsm8k_pred_vs_gold(examples_df: pd.DataFrame, path: Path) -> None:
+    if examples_df.empty:
+        return
+    work = examples_df.copy()
+    work["gold_num"] = work["gold_answer"].map(try_float)
+    work["pred_num"] = work["prediction_answer"].map(try_float)
+    work = work.dropna(subset=["gold_num", "pred_num"])
+    if work.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    for label, g in work.groupby("condition_label", dropna=False):
+        ax.scatter(g["gold_num"], g["pred_num"], label=str(label), s=42, alpha=0.75)
+    lo = min(work["gold_num"].min(), work["pred_num"].min())
+    hi = max(work["gold_num"].max(), work["pred_num"].max())
+    lo = max(lo, 1e-3)
+    hi = max(hi, lo * 10)
+    ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.2)
+    ax.set_xscale("symlog", linthresh=1)
+    ax.set_yscale("symlog", linthresh=1)
+    ax.set_xlabel("Ground-truth answer")
+    ax.set_ylabel("Predicted extracted answer")
+    ax.set_title("GSM8K prediction vs ground truth")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def analyze_gsm8k_errors(root: Path, table: pd.DataFrame, out_dir: Path, max_examples_per_condition: int = 5) -> Dict[str, Any]:
+    rows = table[table["benchmark"].astype(str) == "gsm8k"].copy()
+    if rows.empty:
+        return {"conditions": 0, "examples": 0}
+    example_records: List[Dict[str, Any]] = []
+    summary_records: List[Dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        out_dir_row = resolve_output_dir(root, row)
+        scores, out_by_sample = load_scores_outputs(out_dir_row)
+        if scores.empty:
+            continue
+        condition_label = f"p={to_float(row.get('planned_parallelism'), float('nan')):g}" if pd.notna(row.get("planned_parallelism")) else str(row.get("condition"))
+        scores = scores.copy()
+        scores["sample_key"] = scores.get("sample_id", pd.Series(range(len(scores)))).map(sample_key)
+        scores["failure_mode"] = [gsm8k_failure_mode(r.get("prediction_answer"), r.get("gold_answer"), r.get("correct")) for _, r in scores.iterrows()]
+        scores["abs_error"] = [safe_abs_error(r.get("prediction_answer"), r.get("gold_answer")) for _, r in scores.iterrows()]
+        scores["rel_error"] = [safe_rel_error(r.get("prediction_answer"), r.get("gold_answer")) for _, r in scores.iterrows()]
+        sub = scores[~scores["correct"].map(is_trueish)].copy() if "correct" in scores.columns else scores.copy()
+        if not sub.empty:
+            mode_counts = sub["failure_mode"].value_counts().to_dict()
+            total_fail = len(sub)
+            for mode, count in mode_counts.items():
+                summary_records.append({
+                    "model": row.get("model"),
+                    "task": row.get("task"),
+                    "benchmark": row.get("benchmark"),
+                    "condition": row.get("condition"),
+                    "condition_label": condition_label,
+                    "planned_parallelism": row.get("planned_parallelism"),
+                    "failure_mode": mode,
+                    "count": int(count),
+                    "ratio": round(count / max(total_fail, 1), 4),
+                })
+            # Prioritize largest relative errors then longest outputs.
+            sub = sub.sort_values(["rel_error", "abs_error"], ascending=[False, False], na_position="last").head(max_examples_per_condition)
+            for _, srow in sub.iterrows():
+                out = out_by_sample.get(sample_key(srow.get("sample_id")), {})
+                prompt = str(out.get("prompt") or "")
+                q = prompt.split("Question:", 1)[-1] if "Question:" in prompt else prompt
+                q = q.split("Answer:", 1)[0].strip()
+                raw = out.get("raw_output") or out.get("prediction") or ""
+                example_records.append({
+                    "model": row.get("model"),
+                    "task": row.get("task"),
+                    "condition": row.get("condition"),
+                    "condition_label": condition_label,
+                    "planned_parallelism": row.get("planned_parallelism"),
+                    "sample_id": srow.get("sample_id"),
+                    "failure_mode": srow.get("failure_mode"),
+                    "prediction_answer": srow.get("prediction_answer"),
+                    "gold_answer": srow.get("gold_answer"),
+                    "abs_error": srow.get("abs_error"),
+                    "rel_error": srow.get("rel_error"),
+                    "question_preview": shorten_text(q, 280),
+                    "raw_output_preview": shorten_text(raw, 520),
+                    "groundtruth_preview": shorten_text(out.get("answer") or "", 220),
+                    "output_dir": str(out_dir_row),
+                })
+    summary_df = pd.DataFrame(summary_records)
+    examples_df = pd.DataFrame(example_records)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["planned_parallelism", "count"], ascending=[True, False])
+        summary_df.to_csv(out_dir / "gsm8k_error_summary.csv", index=False)
+        save_markdown(summary_df, out_dir / "gsm8k_error_summary.md")
+        plot_gsm8k_failure_modes(summary_df, out_dir / "gsm8k_error_summary.png")
+    if not examples_df.empty:
+        examples_df = examples_df.sort_values(["planned_parallelism", "rel_error"], ascending=[True, False], na_position="last")
+        examples_df.to_csv(out_dir / "gsm8k_failure_examples.csv", index=False)
+        save_markdown(examples_df, out_dir / "gsm8k_failure_examples.md")
+        with (out_dir / "gsm8k_failure_examples.jsonl").open("w", encoding="utf-8") as f:
+            for rec in examples_df.to_dict(orient="records"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        plot_gsm8k_pred_vs_gold(examples_df, out_dir / "gsm8k_pred_vs_gold.png")
+    return {
+        "conditions": len(rows),
+        "examples": len(examples_df),
+        "summary_rows": len(summary_df),
+    }
+
+
+def plot_mbpp_error_breakdown(summary_df: pd.DataFrame, path: Path) -> None:
+    if summary_df.empty:
+        return
+    work = summary_df.copy()
+    work["count"] = pd.to_numeric(work["count"], errors="coerce").fillna(0)
+    preferred = ["syntax_error", "failed", "wrong_answer", "timeout", "runtime_error", "name_error_or_missing_function", "pass", "unknown"]
+    pivot = work.pivot_table(index="condition_label", columns="error_type", values="count", aggfunc="sum", fill_value=0)
+    cols = [c for c in preferred if c in pivot.columns] + [c for c in pivot.columns if c not in preferred]
+    pivot = pivot[cols]
+    fig_w = max(8.5, 1.3 * len(pivot.index) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.2))
+    bottom = np.zeros(len(pivot.index))
+    x = np.arange(len(pivot.index))
+    for col in pivot.columns:
+        vals = pivot[col].to_numpy(dtype=float)
+        ax.bar(x, vals, bottom=bottom, label=str(col))
+        bottom = bottom + vals
+    ax.set_xticks(x, pivot.index.tolist(), rotation=25, ha="right")
+    ax.set_ylabel("Sample count")
+    ax.set_xlabel("Condition")
+    ax.set_title("MBPP error-type breakdown")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def analyze_mbpp_errors(root: Path, table: pd.DataFrame, out_dir: Path, max_examples_per_condition: int = 5) -> Dict[str, Any]:
+    rows = table[table["benchmark"].astype(str) == "mbpp"].copy()
+    if rows.empty:
+        return {"conditions": 0, "examples": 0}
+    summary_records: List[Dict[str, Any]] = []
+    example_records: List[Dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        out_dir_row = resolve_output_dir(root, row)
+        scores, out_by_sample = load_scores_outputs(out_dir_row)
+        if scores.empty:
+            continue
+        condition_label = f"p={to_float(row.get('planned_parallelism'), float('nan')):g}" if pd.notna(row.get("planned_parallelism")) else str(row.get("condition"))
+        scores = scores.copy()
+        if "error_type" not in scores.columns:
+            scores["error_type"] = np.where(scores.get("correct", False).map(is_trueish), "pass", "unknown")
+        scores["error_type"] = scores["error_type"].fillna("unknown").astype(str)
+        mode_counts = scores["error_type"].value_counts().to_dict()
+        total = len(scores)
+        for mode, count in mode_counts.items():
+            summary_records.append({
+                "model": row.get("model"),
+                "task": row.get("task"),
+                "benchmark": row.get("benchmark"),
+                "condition": row.get("condition"),
+                "condition_label": condition_label,
+                "planned_parallelism": row.get("planned_parallelism"),
+                "error_type": mode,
+                "count": int(count),
+                "ratio": round(count / max(total, 1), 4),
+            })
+        fails = scores[~scores.get("correct", pd.Series([False] * len(scores))).map(is_trueish)].copy() if "correct" in scores.columns else scores.copy()
+        fails = fails.sort_values("error_type")
+        top_types = fails["error_type"].value_counts().index.tolist()
+        picked: List[pd.DataFrame] = []
+        for et in top_types:
+            picked.append(fails[fails["error_type"] == et].head(max(1, math.ceil(max_examples_per_condition / max(len(top_types), 1)))))
+        sub = pd.concat(picked, ignore_index=True).head(max_examples_per_condition) if picked else fails.head(max_examples_per_condition)
+        for _, srow in sub.iterrows():
+            out = out_by_sample.get(sample_key(srow.get("sample_id")), {})
+            prompt = str(out.get("prompt") or "")
+            problem = prompt.split("Problem:", 1)[-1].strip() if "Problem:" in prompt else prompt
+            raw = out.get("raw_output") or out.get("prediction") or ""
+            example_records.append({
+                "model": row.get("model"),
+                "task": row.get("task"),
+                "condition": row.get("condition"),
+                "condition_label": condition_label,
+                "planned_parallelism": row.get("planned_parallelism"),
+                "sample_id": srow.get("sample_id"),
+                "error_type": srow.get("error_type"),
+                "problem_preview": shorten_text(problem, 240),
+                "gold_code_preview": shorten_text(out.get("answer") or "", 300),
+                "extracted_code_preview": shorten_text(srow.get("extracted_code") or "", 300),
+                "raw_output_preview": shorten_text(raw, 420),
+                "output_dir": str(out_dir_row),
+            })
+    summary_df = pd.DataFrame(summary_records)
+    examples_df = pd.DataFrame(example_records)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["planned_parallelism", "count"], ascending=[True, False])
+        summary_df.to_csv(out_dir / "mbpp_error_summary.csv", index=False)
+        save_markdown(summary_df, out_dir / "mbpp_error_summary.md")
+        plot_mbpp_error_breakdown(summary_df, out_dir / "mbpp_error_summary.png")
+    if not examples_df.empty:
+        examples_df = examples_df.sort_values(["planned_parallelism", "error_type", "sample_id"], na_position="last")
+        examples_df.to_csv(out_dir / "mbpp_failure_examples.csv", index=False)
+        save_markdown(examples_df, out_dir / "mbpp_failure_examples.md")
+        with (out_dir / "mbpp_failure_examples.jsonl").open("w", encoding="utf-8") as f:
+            for rec in examples_df.to_dict(orient="records"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return {
+        "conditions": len(rows),
+        "examples": len(examples_df),
+        "summary_rows": len(summary_df),
+    }
+
+
 def run_parallel(root: Path, out_dir: Path, models: Optional[Sequence[str]]) -> pd.DataFrame:
     df = load_native_manifest(root, models=models)
     df = df[~df.apply(is_context_row, axis=1)].copy()
@@ -428,6 +769,26 @@ def run_parallel(root: Path, out_dir: Path, models: Optional[Sequence[str]]) -> 
     save_markdown(table, out_dir / "native_parallel_table.md")
     plot_parallel_combined(df, out_dir / "parallel_combined.png")
     plot_lines(df, "avg_latency_sec", "score_pct", "series", out_dir / "parallel_speed_quality.png", "Speed-quality tradeoff", "Latency / sample (s)", "Score / accuracy")
+    gsm8k_info = analyze_gsm8k_errors(root, table, out_dir)
+    mbpp_info = analyze_mbpp_errors(root, table, out_dir)
+    report = [
+        "native_visual parallel report",
+        "",
+        f"Rows: {len(table)}",
+        f"GSM8K conditions: {gsm8k_info.get('conditions', 0)}, example failures: {gsm8k_info.get('examples', 0)}",
+        f"MBPP conditions: {mbpp_info.get('conditions', 0)}, example failures: {mbpp_info.get('examples', 0)}",
+        "",
+        "Files:",
+        "- native_parallel_table.csv/md",
+        "- parallel_combined.png",
+        "- parallel_speed_quality.png",
+        "- gsm8k_error_summary.csv/md/png",
+        "- gsm8k_failure_examples.csv/md/jsonl",
+        "- gsm8k_pred_vs_gold.png",
+        "- mbpp_error_summary.csv/md/png",
+        "- mbpp_failure_examples.csv/md/jsonl",
+    ]
+    write_text(out_dir / "parallel_report.txt", "\n".join(report) + "\n")
     print(f"[DONE] parallel rows: {len(table)} -> {out_dir}")
     return table
 
