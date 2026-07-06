@@ -257,6 +257,23 @@ tasks:
           w1_sampler: [gidd]
           w1_steps: [256, 128, 64]
 
+parallel_mbpp_w1_s20:
+  description: "W1-4B MBPP small-batch parallel code-generation quality/speed test; planned parallelism 1/2/4 via max_new_tokens / w1_steps."
+  experiments:
+    - name: parallel_mbpp_w1_s20
+      output_task: parallel_mbpp_w1_s20
+      benchmark: mbpp
+      models: [w1_4b]
+      params:
+        sample_limit: 20
+        gen_length: 512
+        max_new_tokens: 512
+        temperature: 0.0
+        return_trace: false
+        seed: 42
+      sweep:
+        w1_sampler: [gidd]
+        w1_steps: [512, 256, 128]
   # 2) W1 context test:
   #    Measures 2K/4K double-needle retrieval and how planned parallelism
   #    affects exact_order_acc / set_acc / slot accuracy / latency / TPS.
