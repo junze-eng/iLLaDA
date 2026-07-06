@@ -410,6 +410,347 @@ def plot_parallel_combined(df: pd.DataFrame, path: Path) -> None:
     print(f"[OK] wrote {path}")
 
 
+def is_trueish(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    return s in {"true", "1", "yes", "y", "pass", "passed"}
+
+
+def shorten_text(text: Any, limit: int = 220) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s if len(s) <= limit else s[: max(0, limit - 3)] + "..."
+
+
+def sample_key(x: Any) -> str:
+    try:
+        return str(int(x))
+    except Exception:
+        return str(x)
+
+
+def try_float(x: Any) -> float:
+    try:
+        if x is None:
+            return float("nan")
+        s = str(x).strip()
+        if s == "" or s.lower() in {"nan", "none", "null"}:
+            return float("nan")
+        return float(s)
+    except Exception:
+        return float("nan")
+
+
+def safe_rel_error(pred: Any, gold: Any) -> float:
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p) or math.isnan(g):
+        return float("nan")
+    denom = max(abs(g), 1e-9)
+    return abs(p - g) / denom
+
+
+def safe_abs_error(pred: Any, gold: Any) -> float:
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p) or math.isnan(g):
+        return float("nan")
+    return abs(p - g)
+
+
+def gsm8k_failure_mode(pred: Any, gold: Any, correct: Any) -> str:
+    if is_trueish(correct):
+        return "correct"
+    p = try_float(pred)
+    g = try_float(gold)
+    if math.isnan(p):
+        return "no_numeric_answer"
+    if math.isnan(g):
+        return "unknown_gold"
+    if g == 0:
+        return "wrong_numeric"
+    ratio = abs(p) / max(abs(g), 1e-9)
+    if ratio >= 10 or ratio <= 0.1:
+        return "order_of_magnitude_error"
+    if (p > 0 > g) or (p < 0 < g):
+        return "sign_error"
+    rel = abs(p - g) / max(abs(g), 1e-9)
+    if rel <= 0.2 or abs(p - g) <= 2:
+        return "near_miss"
+    return "wrong_numeric"
+
+
+def load_scores_outputs(out_dir: Path) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+    scores = read_csv(out_dir / "scores.csv")
+    outputs = read_jsonl(out_dir / "outputs.jsonl")
+    out_by_sample: Dict[str, Dict[str, Any]] = {}
+    for o in outputs:
+        out_by_sample[sample_key(o.get("sample_id", o.get("dataset_index", len(out_by_sample))))] = o
+    return scores, out_by_sample
+
+
+def resolve_output_dir(root: Path, row: pd.Series) -> Path:
+    raw = Path(str(row.get("output_dir") or ""))
+    if raw.exists():
+        return raw
+    cand = root / str(row.get("model") or "") / str(row.get("task") or "") / str(row.get("benchmark") or "") / str(row.get("condition") or "")
+    if cand.exists():
+        return cand
+    return raw
+
+
+def plot_gsm8k_failure_modes(summary_df: pd.DataFrame, path: Path) -> None:
+    if summary_df.empty:
+        return
+    work = summary_df.copy()
+    work["count"] = pd.to_numeric(work["count"], errors="coerce").fillna(0)
+    modes = [m for m in ["order_of_magnitude_error", "wrong_numeric", "near_miss", "no_numeric_answer", "sign_error"] if m in set(work["failure_mode"].astype(str))]
+    if not modes:
+        modes = sorted(work["failure_mode"].astype(str).unique().tolist())
+    pivot = work.pivot_table(index="condition_label", columns="failure_mode", values="count", aggfunc="sum", fill_value=0)
+    cols = [c for c in modes if c in pivot.columns] + [c for c in pivot.columns if c not in modes]
+    pivot = pivot[cols]
+    fig_w = max(8.5, 1.3 * len(pivot.index) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.2))
+    bottom = np.zeros(len(pivot.index))
+    x = np.arange(len(pivot.index))
+    for col in pivot.columns:
+        vals = pivot[col].to_numpy(dtype=float)
+        ax.bar(x, vals, bottom=bottom, label=str(col))
+        bottom = bottom + vals
+    ax.set_xticks(x, pivot.index.tolist(), rotation=25, ha="right")
+    ax.set_ylabel("Failure count")
+    ax.set_xlabel("Condition")
+    ax.set_title("GSM8K main failure reasons")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def plot_gsm8k_pred_vs_gold(examples_df: pd.DataFrame, path: Path) -> None:
+    if examples_df.empty:
+        return
+    work = examples_df.copy()
+    work["gold_num"] = work["gold_answer"].map(try_float)
+    work["pred_num"] = work["prediction_answer"].map(try_float)
+    work = work.dropna(subset=["gold_num", "pred_num"])
+    if work.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    for label, g in work.groupby("condition_label", dropna=False):
+        ax.scatter(g["gold_num"], g["pred_num"], label=str(label), s=42, alpha=0.75)
+    lo = min(work["gold_num"].min(), work["pred_num"].min())
+    hi = max(work["gold_num"].max(), work["pred_num"].max())
+    lo = max(lo, 1e-3)
+    hi = max(hi, lo * 10)
+    ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.2)
+    ax.set_xscale("symlog", linthresh=1)
+    ax.set_yscale("symlog", linthresh=1)
+    ax.set_xlabel("Ground-truth answer")
+    ax.set_ylabel("Predicted extracted answer")
+    ax.set_title("GSM8K prediction vs ground truth")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def analyze_gsm8k_errors(root: Path, table: pd.DataFrame, out_dir: Path, max_examples_per_condition: int = 5) -> Dict[str, Any]:
+    rows = table[table["benchmark"].astype(str) == "gsm8k"].copy()
+    if rows.empty:
+        return {"conditions": 0, "examples": 0}
+    example_records: List[Dict[str, Any]] = []
+    summary_records: List[Dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        out_dir_row = resolve_output_dir(root, row)
+        scores, out_by_sample = load_scores_outputs(out_dir_row)
+        if scores.empty:
+            continue
+        condition_label = f"p={to_float(row.get('planned_parallelism'), float('nan')):g}" if pd.notna(row.get("planned_parallelism")) else str(row.get("condition"))
+        scores = scores.copy()
+        scores["sample_key"] = scores.get("sample_id", pd.Series(range(len(scores)))).map(sample_key)
+        scores["failure_mode"] = [gsm8k_failure_mode(r.get("prediction_answer"), r.get("gold_answer"), r.get("correct")) for _, r in scores.iterrows()]
+        scores["abs_error"] = [safe_abs_error(r.get("prediction_answer"), r.get("gold_answer")) for _, r in scores.iterrows()]
+        scores["rel_error"] = [safe_rel_error(r.get("prediction_answer"), r.get("gold_answer")) for _, r in scores.iterrows()]
+        sub = scores[~scores["correct"].map(is_trueish)].copy() if "correct" in scores.columns else scores.copy()
+        if not sub.empty:
+            mode_counts = sub["failure_mode"].value_counts().to_dict()
+            total_fail = len(sub)
+            for mode, count in mode_counts.items():
+                summary_records.append({
+                    "model": row.get("model"),
+                    "task": row.get("task"),
+                    "benchmark": row.get("benchmark"),
+                    "condition": row.get("condition"),
+                    "condition_label": condition_label,
+                    "planned_parallelism": row.get("planned_parallelism"),
+                    "failure_mode": mode,
+                    "count": int(count),
+                    "ratio": round(count / max(total_fail, 1), 4),
+                })
+            # Prioritize largest relative errors then longest outputs.
+            sub = sub.sort_values(["rel_error", "abs_error"], ascending=[False, False], na_position="last").head(max_examples_per_condition)
+            for _, srow in sub.iterrows():
+                out = out_by_sample.get(sample_key(srow.get("sample_id")), {})
+                prompt = str(out.get("prompt") or "")
+                q = prompt.split("Question:", 1)[-1] if "Question:" in prompt else prompt
+                q = q.split("Answer:", 1)[0].strip()
+                raw = out.get("raw_output") or out.get("prediction") or ""
+                example_records.append({
+                    "model": row.get("model"),
+                    "task": row.get("task"),
+                    "condition": row.get("condition"),
+                    "condition_label": condition_label,
+                    "planned_parallelism": row.get("planned_parallelism"),
+                    "sample_id": srow.get("sample_id"),
+                    "failure_mode": srow.get("failure_mode"),
+                    "prediction_answer": srow.get("prediction_answer"),
+                    "gold_answer": srow.get("gold_answer"),
+                    "abs_error": srow.get("abs_error"),
+                    "rel_error": srow.get("rel_error"),
+                    "question_preview": shorten_text(q, 280),
+                    "raw_output_preview": shorten_text(raw, 520),
+                    "groundtruth_preview": shorten_text(out.get("answer") or "", 220),
+                    "output_dir": str(out_dir_row),
+                })
+    summary_df = pd.DataFrame(summary_records)
+    examples_df = pd.DataFrame(example_records)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["planned_parallelism", "count"], ascending=[True, False])
+        summary_df.to_csv(out_dir / "gsm8k_error_summary.csv", index=False)
+        save_markdown(summary_df, out_dir / "gsm8k_error_summary.md")
+        plot_gsm8k_failure_modes(summary_df, out_dir / "gsm8k_error_summary.png")
+    if not examples_df.empty:
+        examples_df = examples_df.sort_values(["planned_parallelism", "rel_error"], ascending=[True, False], na_position="last")
+        examples_df.to_csv(out_dir / "gsm8k_failure_examples.csv", index=False)
+        save_markdown(examples_df, out_dir / "gsm8k_failure_examples.md")
+        with (out_dir / "gsm8k_failure_examples.jsonl").open("w", encoding="utf-8") as f:
+            for rec in examples_df.to_dict(orient="records"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        plot_gsm8k_pred_vs_gold(examples_df, out_dir / "gsm8k_pred_vs_gold.png")
+    return {
+        "conditions": len(rows),
+        "examples": len(examples_df),
+        "summary_rows": len(summary_df),
+    }
+
+
+def plot_mbpp_error_breakdown(summary_df: pd.DataFrame, path: Path) -> None:
+    if summary_df.empty:
+        return
+    work = summary_df.copy()
+    work["count"] = pd.to_numeric(work["count"], errors="coerce").fillna(0)
+    preferred = ["syntax_error", "failed", "wrong_answer", "timeout", "runtime_error", "name_error_or_missing_function", "pass", "unknown"]
+    pivot = work.pivot_table(index="condition_label", columns="error_type", values="count", aggfunc="sum", fill_value=0)
+    cols = [c for c in preferred if c in pivot.columns] + [c for c in pivot.columns if c not in preferred]
+    pivot = pivot[cols]
+    fig_w = max(8.5, 1.3 * len(pivot.index) + 2.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.2))
+    bottom = np.zeros(len(pivot.index))
+    x = np.arange(len(pivot.index))
+    for col in pivot.columns:
+        vals = pivot[col].to_numpy(dtype=float)
+        ax.bar(x, vals, bottom=bottom, label=str(col))
+        bottom = bottom + vals
+    ax.set_xticks(x, pivot.index.tolist(), rotation=25, ha="right")
+    ax.set_ylabel("Sample count")
+    ax.set_xlabel("Condition")
+    ax.set_title("MBPP error-type breakdown")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {path}")
+
+
+def analyze_mbpp_errors(root: Path, table: pd.DataFrame, out_dir: Path, max_examples_per_condition: int = 5) -> Dict[str, Any]:
+    rows = table[table["benchmark"].astype(str) == "mbpp"].copy()
+    if rows.empty:
+        return {"conditions": 0, "examples": 0}
+    summary_records: List[Dict[str, Any]] = []
+    example_records: List[Dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        out_dir_row = resolve_output_dir(root, row)
+        scores, out_by_sample = load_scores_outputs(out_dir_row)
+        if scores.empty:
+            continue
+        condition_label = f"p={to_float(row.get('planned_parallelism'), float('nan')):g}" if pd.notna(row.get("planned_parallelism")) else str(row.get("condition"))
+        scores = scores.copy()
+        if "error_type" not in scores.columns:
+            scores["error_type"] = np.where(scores.get("correct", False).map(is_trueish), "pass", "unknown")
+        scores["error_type"] = scores["error_type"].fillna("unknown").astype(str)
+        mode_counts = scores["error_type"].value_counts().to_dict()
+        total = len(scores)
+        for mode, count in mode_counts.items():
+            summary_records.append({
+                "model": row.get("model"),
+                "task": row.get("task"),
+                "benchmark": row.get("benchmark"),
+                "condition": row.get("condition"),
+                "condition_label": condition_label,
+                "planned_parallelism": row.get("planned_parallelism"),
+                "error_type": mode,
+                "count": int(count),
+                "ratio": round(count / max(total, 1), 4),
+            })
+        fails = scores[~scores.get("correct", pd.Series([False] * len(scores))).map(is_trueish)].copy() if "correct" in scores.columns else scores.copy()
+        fails = fails.sort_values("error_type")
+        top_types = fails["error_type"].value_counts().index.tolist()
+        picked: List[pd.DataFrame] = []
+        for et in top_types:
+            picked.append(fails[fails["error_type"] == et].head(max(1, math.ceil(max_examples_per_condition / max(len(top_types), 1)))))
+        sub = pd.concat(picked, ignore_index=True).head(max_examples_per_condition) if picked else fails.head(max_examples_per_condition)
+        for _, srow in sub.iterrows():
+            out = out_by_sample.get(sample_key(srow.get("sample_id")), {})
+            prompt = str(out.get("prompt") or "")
+            problem = prompt.split("Problem:", 1)[-1].strip() if "Problem:" in prompt else prompt
+            raw = out.get("raw_output") or out.get("prediction") or ""
+            example_records.append({
+                "model": row.get("model"),
+                "task": row.get("task"),
+                "condition": row.get("condition"),
+                "condition_label": condition_label,
+                "planned_parallelism": row.get("planned_parallelism"),
+                "sample_id": srow.get("sample_id"),
+                "error_type": srow.get("error_type"),
+                "problem_preview": shorten_text(problem, 240),
+                "gold_code_preview": shorten_text(out.get("answer") or "", 300),
+                "extracted_code_preview": shorten_text(srow.get("extracted_code") or "", 300),
+                "raw_output_preview": shorten_text(raw, 420),
+                "output_dir": str(out_dir_row),
+            })
+    summary_df = pd.DataFrame(summary_records)
+    examples_df = pd.DataFrame(example_records)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["planned_parallelism", "count"], ascending=[True, False])
+        summary_df.to_csv(out_dir / "mbpp_error_summary.csv", index=False)
+        save_markdown(summary_df, out_dir / "mbpp_error_summary.md")
+        plot_mbpp_error_breakdown(summary_df, out_dir / "mbpp_error_summary.png")
+    if not examples_df.empty:
+        examples_df = examples_df.sort_values(["planned_parallelism", "error_type", "sample_id"], na_position="last")
+        examples_df.to_csv(out_dir / "mbpp_failure_examples.csv", index=False)
+        save_markdown(examples_df, out_dir / "mbpp_failure_examples.md")
+        with (out_dir / "mbpp_failure_examples.jsonl").open("w", encoding="utf-8") as f:
+            for rec in examples_df.to_dict(orient="records"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return {
+        "conditions": len(rows),
+        "examples": len(examples_df),
+        "summary_rows": len(summary_df),
+    }
+
+
 def run_parallel(root: Path, out_dir: Path, models: Optional[Sequence[str]]) -> pd.DataFrame:
     df = load_native_manifest(root, models=models)
     df = df[~df.apply(is_context_row, axis=1)].copy()
@@ -428,6 +769,26 @@ def run_parallel(root: Path, out_dir: Path, models: Optional[Sequence[str]]) -> 
     save_markdown(table, out_dir / "native_parallel_table.md")
     plot_parallel_combined(df, out_dir / "parallel_combined.png")
     plot_lines(df, "avg_latency_sec", "score_pct", "series", out_dir / "parallel_speed_quality.png", "Speed-quality tradeoff", "Latency / sample (s)", "Score / accuracy")
+    gsm8k_info = analyze_gsm8k_errors(root, table, out_dir)
+    mbpp_info = analyze_mbpp_errors(root, table, out_dir)
+    report = [
+        "native_visual parallel report",
+        "",
+        f"Rows: {len(table)}",
+        f"GSM8K conditions: {gsm8k_info.get('conditions', 0)}, example failures: {gsm8k_info.get('examples', 0)}",
+        f"MBPP conditions: {mbpp_info.get('conditions', 0)}, example failures: {mbpp_info.get('examples', 0)}",
+        "",
+        "Files:",
+        "- native_parallel_table.csv/md",
+        "- parallel_combined.png",
+        "- parallel_speed_quality.png",
+        "- gsm8k_error_summary.csv/md/png",
+        "- gsm8k_failure_examples.csv/md/jsonl",
+        "- gsm8k_pred_vs_gold.png",
+        "- mbpp_error_summary.csv/md/png",
+        "- mbpp_failure_examples.csv/md/jsonl",
+    ]
+    write_text(out_dir / "parallel_report.txt", "\n".join(report) + "\n")
     print(f"[DONE] parallel rows: {len(table)} -> {out_dir}")
     return table
 
@@ -674,10 +1035,19 @@ def parse_complete_cell(x: Any) -> Tuple[float, float, float]:
 
 
 def count_masks_in_state(x: Any) -> int:
+    """Count remaining masks in a textual block snapshot.
+
+    iLLaDA traces often render masks as ``[MASK]`` while the W1 trace export
+    renders each still-masked token as the square placeholder ``□``.  The
+    previous visualizer only counted ``[MASK]`` and therefore inferred
+    ``block_len = 0`` for W1 snapshots such as ``□□□□□□□□□□□□□□□□``.  That made
+    per-condition trace plotting crash with division by zero.
+    """
     s = str(x)
     total = 0
     for m in re.finditer(r"\[MASK\](?:x(\d+))?", s):
         total += int(m.group(1) or 1)
+    total += s.count("□")
     return total
 
 
@@ -700,7 +1070,11 @@ def block_completion_matrix(block_timeline: pd.DataFrame) -> Tuple[List[int], Li
         for c in state_cols:
             mask_counts = [count_masks_in_state(v) for v in block_timeline[c].tolist()]
             block_len = max(mask_counts) if mask_counts else 1
-            mat.append([max(0, block_len - mc) / block_len for mc in mask_counts])
+            if block_len <= 0:
+                # No mask markers found; avoid crashing and mark completion unknown.
+                mat.append([float("nan") for _ in mask_counts])
+            else:
+                mat.append([max(0, block_len - mc) / block_len for mc in mask_counts])
         return blocks, steps, mat
     return [], [], []
 
@@ -736,6 +1110,10 @@ def normalize_step_events(df: pd.DataFrame, metrics: Dict[str, Any]) -> pd.DataF
             out["_mean_confidence"] = np.nan
     if completion_col:
         out["_completion"] = pd.to_numeric(out[completion_col], errors="coerce")
+        if out["_completion"].isna().all():
+            gen_length = to_float(metrics.get("gen_length"), float("nan"))
+            denom = gen_length if math.isfinite(gen_length) and gen_length > 0 else max(1.0, float(out["_selected_count"].sum()))
+            out["_completion"] = out["_selected_count"].cumsum() / denom
     else:
         gen_length = to_float(metrics.get("gen_length"), float("nan"))
         denom = gen_length if math.isfinite(gen_length) and gen_length > 0 else max(1.0, float(out["_selected_count"].sum()))
@@ -937,6 +1315,66 @@ def load_trace_condition(cond_dir: Path, sample_idx: Optional[int]) -> Tuple[Dic
     return metrics, step_events, block_timeline, sample_dir
 
 
+
+def w1_single_span_completion_matrix(step_events: pd.DataFrame, metrics: Dict[str, Any]) -> Tuple[List[int], List[int], List[List[float]]]:
+    """Build a one-row completion matrix for W1, which has no iLLaDA-style blocks.
+
+    Older W1 trace exports accidentally split the generated span into fake
+    gen_blocksize chunks while all callbacks used block_idx=0.  This helper
+    reconstructs the only meaningful W1 chain: completion of the whole
+    generated span over generation steps.
+    """
+    if step_events.empty:
+        return [], [], []
+    steps = [to_int(v, i) for i, v in enumerate(step_events.get("_step", pd.Series(range(len(step_events)))).tolist())]
+    gen_len = to_int(metrics.get("gen_length"), 0)
+    if gen_len <= 0:
+        gen_len = to_int(metrics.get("tokens_generated"), 0)
+    values: List[float] = []
+    mask_after_col = choose_col(step_events, ["mask_count_after", "remaining_masks", "remain_after"])
+    if mask_after_col and gen_len > 0:
+        for v in step_events[mask_after_col].tolist():
+            remain = to_float(v, float("nan"))
+            if math.isfinite(remain):
+                values.append(max(0.0, min(1.0, 1.0 - remain / max(gen_len, 1))))
+            else:
+                values.append(float("nan"))
+    else:
+        committed: set[int] = set()
+        for _, row in step_events.iterrows():
+            for pos in parse_listish(row.get("selected_positions")):
+                ipos = to_int(pos, -1)
+                if ipos >= 0:
+                    committed.add(ipos)
+            denom = gen_len if gen_len > 0 else max(1, max(committed) + 1 if committed else 1)
+            values.append(len(committed) / max(denom, 1))
+    return [0], steps, [values]
+
+
+def looks_like_w1_single_span_trace(step_events: pd.DataFrame, metrics: Dict[str, Any]) -> bool:
+    if step_events.empty:
+        return False
+    model = str(metrics.get("model", "")).lower()
+    task = str(metrics.get("task", metrics.get("experiment", ""))).lower()
+    backend = str(metrics.get("backend", "")).lower()
+    if "w1" in model or "w1" in task or backend == "w1_4b":
+        return True
+    block_len = to_int(metrics.get("block_length", metrics.get("gen_blocksize")), 0)
+    if block_len <= 0:
+        return False
+    block_col = "_block" if "_block" in step_events.columns else choose_col(step_events, ["block_idx", "active_block_idx"])
+    if block_col is None:
+        return False
+    blocks = pd.to_numeric(step_events[block_col], errors="coerce").dropna().unique().tolist()
+    if len(blocks) != 1 or int(blocks[0]) != 0:
+        return False
+    max_pos = -1
+    if "selected_positions" in step_events.columns:
+        for x in step_events["selected_positions"].tolist():
+            for pos in parse_listish(x):
+                max_pos = max(max_pos, to_int(pos, -1))
+    return max_pos >= block_len
+
 def plot_generation_chain(step_events: pd.DataFrame, block_timeline: pd.DataFrame, metrics: Dict[str, Any], out_path: Path) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13.5, 8.0), gridspec_kw={"height_ratios": [1.55, 1.0]})
     title = (
@@ -945,13 +1383,20 @@ def plot_generation_chain(step_events: pd.DataFrame, block_timeline: pd.DataFram
         f"p={to_float(metrics.get('planned_parallelism'), float('nan')):.2g}"
     )
     fig.suptitle(title, fontsize=12)
-    blocks, steps, mat = block_completion_matrix(block_timeline)
+    if looks_like_w1_single_span_trace(step_events, metrics):
+        blocks, steps, mat = w1_single_span_completion_matrix(step_events, metrics)
+        top_title = "W1 full generated-span completion (no iLLaDA blocks)"
+        y_label = "Generated span"
+    else:
+        blocks, steps, mat = block_completion_matrix(block_timeline)
+        top_title = "Within-block completion"
+        y_label = "Block index"
     ax = axes[0]
     if blocks and mat:
         im = ax.imshow(mat, aspect="auto", interpolation="nearest", vmin=0, vmax=1)
-        ax.set_ylabel("Block index")
+        ax.set_ylabel(y_label)
         ax.set_xlabel("Generation step")
-        ax.set_title("Within-block completion")
+        ax.set_title(top_title)
         ax.set_yticks(range(len(blocks)))
         ax.set_yticklabels([str(b) for b in blocks])
         if len(steps) <= 25:
@@ -1108,6 +1553,207 @@ def plot_token_order_grid(rows: pd.DataFrame, out_path: Path, max_panels: int = 
     print(f"[OK] wrote {out_path}")
 
 
+
+
+def _read_commit_order_csv(path_value: Any) -> pd.DataFrame:
+    if path_value is None:
+        return pd.DataFrame()
+    s = str(path_value)
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return pd.DataFrame()
+    return read_csv(Path(s))
+
+
+def _draw_commit_order_panel(ax, cdf: pd.DataFrame, row: pd.Series, title: str) -> None:
+    if cdf.empty or "global_position" not in cdf.columns or "step" not in cdf.columns:
+        ax.text(0.5, 0.5, "missing\ncommit_order", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return
+    x = pd.to_numeric(cdf["global_position"], errors="coerce")
+    y = pd.to_numeric(cdf["step"], errors="coerce")
+    conf = pd.to_numeric(cdf.get("confidence", pd.Series([np.nan] * len(cdf))), errors="coerce")
+    valid = x.notna() & y.notna()
+    x = x[valid]
+    y = y[valid]
+    conf = conf[valid]
+    if x.empty:
+        ax.text(0.5, 0.5, "empty\ncommit_order", ha="center", va="center", fontsize=9)
+        ax.set_axis_off()
+        return
+
+    sizes = 10 + 24 * conf.fillna(0.5).clip(lower=0, upper=1)
+    ax.scatter(x, y, s=sizes, alpha=0.75, linewidths=0)
+
+    block = to_int(row.get("block_length", row.get("gen_blocksize")), 0)
+    gen_len = to_int(row.get("gen_length"), 0)
+    if block > 0 and gen_len > 0:
+        for b in range(block, gen_len, block):
+            ax.axvline(b, linestyle="--", linewidth=0.7, alpha=0.35)
+
+    tau = to_float(row.get("order_kendall_tau"), float("nan"))
+    inv = to_float(row.get("inversion_rate"), float("nan"))
+    prefix_gap = to_float(row.get("mean_prefix_gap"), float("nan"))
+    subtitle = title
+    extras = []
+    if math.isfinite(tau):
+        extras.append(f"τ={tau:.2f}")
+    if math.isfinite(inv):
+        extras.append(f"inv={inv:.2f}")
+    if math.isfinite(prefix_gap):
+        extras.append(f"gap={prefix_gap:.2f}")
+    if extras:
+        subtitle += "\n" + ", ".join(extras)
+    ax.set_title(subtitle, fontsize=9)
+    ax.set_xlabel("Token position", fontsize=8)
+    ax.set_ylabel("First commit step", fontsize=8)
+    ax.tick_params(axis="both", labelsize=8)
+    ax.grid(True, alpha=0.25)
+
+
+def plot_arness_order_metrics_by_parallelism(df: pd.DataFrame, out_path: Path) -> None:
+    """Show whether larger planned parallelism changes AR-like generation order."""
+    if df.empty or "planned_parallelism" not in df.columns:
+        return
+    specs = [
+        ("order_kendall_tau", "Kendall tau\n(higher = more left-to-right)"),
+        ("inversion_rate", "Inversion rate\n(lower = more left-to-right)"),
+        ("mean_prefix_gap", "Mean prefix gap\n(higher = more non-prefix fill)"),
+        ("left_to_right_score", "Left-to-right score\n(1 - inversion)"),
+    ]
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work["planned_parallelism"], errors="coerce")
+    group_cols = [c for c in ["benchmark", "task", "w1_sampler"] if c in work.columns]
+    if not group_cols:
+        work["series"] = work.get("condition", pd.Series(["trace"] * len(work))).astype(str)
+    else:
+        work["series"] = work[group_cols].astype(str).agg(" | ".join, axis=1)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 8.4))
+    plotted_any = False
+    for ax, (metric, ylabel) in zip(axes.ravel(), specs):
+        if metric not in work.columns:
+            ax.text(0.5, 0.5, f"No {metric}", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        local = work.copy()
+        local[metric] = pd.to_numeric(local[metric], errors="coerce")
+        local = local.dropna(subset=["planned_parallelism", metric])
+        if local.empty:
+            ax.text(0.5, 0.5, f"No numeric {metric}", ha="center", va="center")
+            continue
+        for name, g in local.groupby("series", dropna=False):
+            # Average duplicated sample/condition rows for clean trend lines.
+            g = g.groupby("planned_parallelism", as_index=False)[metric].mean().sort_values("planned_parallelism")
+            if g.empty:
+                continue
+            plotted_any = True
+            ax.plot(g["planned_parallelism"], g[metric], marker="o", linewidth=1.8, label=str(name))
+        ax.set_xlabel("Planned parallelism = gen_length / steps")
+        ax.set_ylabel(ylabel)
+        ax.set_title(metric)
+        ax.grid(True, alpha=0.3)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        axes[0, 0].legend(fontsize=7)
+    fig.suptitle("Trace order metrics vs planned parallelism", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if plotted_any:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=220)
+        print(f"[OK] wrote {out_path}")
+    plt.close(fig)
+
+
+def plot_token_order_by_parallelism(df: pd.DataFrame, out_dir: Path, max_cols: int = 6) -> List[Path]:
+    """Create direct position-vs-commit-step grids grouped by benchmark/task/sampler.
+
+    Each panel is one condition.  If parallelism increases and the points become
+    flatter / less diagonal, the generation is becoming less autoregressive.
+    """
+    if df.empty or "commit_order_csv" not in df.columns:
+        return []
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work.get("planned_parallelism"), errors="coerce")
+    work = work.dropna(subset=["planned_parallelism"])
+    work = work[work["commit_order_csv"].astype(str).str.len() > 0]
+    if work.empty:
+        return []
+
+    group_cols = [c for c in ["benchmark", "task", "w1_sampler"] if c in work.columns]
+    if not group_cols:
+        work["_group"] = "trace"
+        group_cols = ["_group"]
+
+    written: List[Path] = []
+    for keys, g in work.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        # Prefer one row for each planned parallelism / steps pair.
+        sort_cols = [c for c in ["planned_parallelism", "gen_steps", "condition"] if c in g.columns]
+        g = g.sort_values(sort_cols)
+        # Keep grids readable while preserving the p=1/2/4 comparison.
+        if len(g) > max_cols:
+            g = g.groupby("planned_parallelism", dropna=False, group_keys=False).head(1).head(max_cols)
+        n = len(g)
+        if n <= 0:
+            continue
+        cols = min(max_cols, n)
+        rows_n = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows_n, cols, figsize=(4.4 * cols, max(3.2, 3.0 * rows_n)), squeeze=False)
+        for ax in axes.ravel()[n:]:
+            ax.set_axis_off()
+        for ax, (_, row) in zip(axes.ravel(), g.iterrows()):
+            cdf = _read_commit_order_csv(row.get("commit_order_csv"))
+            p = to_float(row.get("planned_parallelism"), float("nan"))
+            steps = to_int(row.get("gen_steps", row.get("effective_steps")), 0)
+            title = f"p={p:g}, steps={steps}" if math.isfinite(p) else f"steps={steps}"
+            _draw_commit_order_panel(ax, cdf, row, title)
+        group_name = "_".join(safe_name(k) for k in keys)
+        out_path = out_dir / f"token_order_by_parallelism_{group_name}.png"
+        fig.suptitle("Token position vs first commit step | effect of parallelism", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=220)
+        plt.close(fig)
+        written.append(out_path)
+        print(f"[OK] wrote {out_path}")
+    return written
+
+
+def plot_token_order_focus_grid(df: pd.DataFrame, out_path: Path, max_panels: int = 18) -> None:
+    """A compact all-in-one grid for direct autoregressiveness inspection."""
+    if df.empty or "commit_order_csv" not in df.columns:
+        return
+    work = df.copy()
+    work["planned_parallelism"] = pd.to_numeric(work.get("planned_parallelism"), errors="coerce")
+    sort_cols = [c for c in ["benchmark", "task", "w1_sampler", "planned_parallelism", "condition"] if c in work.columns]
+    work = work.sort_values(sort_cols)
+    if len(work) > max_panels:
+        work = work.groupby([c for c in ["benchmark", "task", "w1_sampler", "planned_parallelism"] if c in work.columns], dropna=False, group_keys=False).head(1).head(max_panels)
+    if work.empty:
+        return
+    n = len(work)
+    cols = min(3, n)
+    rows_n = int(math.ceil(n / cols))
+    fig, axes = plt.subplots(rows_n, cols, figsize=(5.0 * cols, 3.3 * rows_n), squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.set_axis_off()
+    for ax, (_, row) in zip(axes.ravel(), work.iterrows()):
+        cdf = _read_commit_order_csv(row.get("commit_order_csv"))
+        p = to_float(row.get("planned_parallelism"), float("nan"))
+        sampler = str(row.get("w1_sampler", ""))
+        title = f"{row.get('benchmark','')} | p={p:g}" if math.isfinite(p) else str(row.get("benchmark", ""))
+        if sampler and sampler.lower() not in {"nan", "none"}:
+            title += f" | {sampler}"
+        _draw_commit_order_panel(ax, cdf, row, title)
+    fig.suptitle("Autoregressiveness check: token position vs first commit step", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    print(f"[OK] wrote {out_path}")
+
+
 def run_arness(root: Path, out_dir: Path, models: Optional[Sequence[str]], sample_idx: Optional[int], overview_only: bool) -> pd.DataFrame:
     cond_dirs = discover_trace_dirs(root)
     if not cond_dirs:
@@ -1161,6 +1807,31 @@ def run_arness(root: Path, out_dir: Path, models: Optional[Sequence[str]], sampl
     save_markdown(df[[c for c in ["model", "task", "benchmark", "condition", "sample_idx", "gen_length", "gen_steps", "w1_sampler", "planned_parallelism", "score_pct", "actual_parallelism", "order_kendall_tau", "inversion_rate", "mean_prefix_gap", "visual_output_dir"] if c in df.columns]], out_dir / "arness_trace_overview.md")
     plot_arness_overview(df, out_dir / "arness_overview.png")
     plot_token_order_grid(df, out_dir / "token_order_grid.png")
+    plot_arness_order_metrics_by_parallelism(df, out_dir / "arness_order_metrics_by_parallelism.png")
+    plot_token_order_focus_grid(df, out_dir / "token_order_focus_grid.png")
+    order_dir = out_dir / "token_order_by_parallelism"
+    written_order_grids = plot_token_order_by_parallelism(df, order_dir)
+    report = [
+        "native_visual arness trace report",
+        "",
+        f"Trace rows: {len(df)}",
+        f"Token-order by-parallelism grids: {len(written_order_grids)}",
+        "",
+        "How to read token-order plots:",
+        "- x-axis: token position in the generated continuation.",
+        "- y-axis: first generation step that committed the token.",
+        "- More diagonal/upward = more left-to-right / autoregressive-like.",
+        "- Flatter clouds or large early x-position commits = more parallel/non-prefix generation.",
+        "",
+        "Files:",
+        "- arness_trace_overview.csv/md",
+        "- arness_overview.png",
+        "- arness_order_metrics_by_parallelism.png",
+        "- token_order_focus_grid.png",
+        "- token_order_grid.png",
+        "- token_order_by_parallelism/*.png",
+    ]
+    write_text(out_dir / "arness_trace_report.txt", "\n".join(report) + "\n")
     print(f"[DONE] arness trace rows: {len(df)} -> {out_dir}")
     return df
 

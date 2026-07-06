@@ -1,7 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_trace.py v6
+export_trace.py v7
 
 ARness output manager + trace exporter.
 
@@ -22,6 +22,8 @@ What changed from the previous version
          generation_chain.csv
          metrics.json
          problem_groundtruth_prediction.txt
+6. Mask slots in generation_chain.csv are rendered as repeated □ placeholders,
+   never as compressed □xN/[MASK]xN runs.
 
 Recommended usage
 -----------------
@@ -58,6 +60,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tools.arness_trace_writer import build_block_artifacts
+
+TRACE_MASK_RENDERING = "square_uncompressed"
 
 
 # -----------------------------
@@ -460,23 +464,60 @@ def canonicalize_run_dirs(
 # Trace export
 # -----------------------------
 
+def expand_mask_runs(text: Any) -> str:
+    """Render all mask placeholders as one visible square per masked token.
+
+    Trace rows can contain pre-rendered mask spans inside selected_decoded_tokens,
+    for example "[MASK]x32" or "□x32".  Those strings are already inside a
+    committed slot, so render_slots() cannot fix them by only changing None
+    cells.  Normalize them here before writing any block cell.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+
+    def repl_bracket(m: re.Match[str]) -> str:
+        n = to_int(m.group(1), 1)
+        return "□" * max(1, n)
+
+    def repl_square(m: re.Match[str]) -> str:
+        n = to_int(m.group(1), 1)
+        return "□" * max(1, n)
+
+    # Compressed forms first: [MASK]x32 / [MASK]×32 / □x32 / □×32.
+    s = re.sub(r"\[MASK\]\s*[x×]\s*(\d+)", repl_bracket, s, flags=re.IGNORECASE)
+    s = re.sub(r"□\s*[x×]\s*(\d+)", repl_square, s)
+
+    # Single uncompressed placeholders.
+    s = re.sub(r"\[MASK\]", "□", s, flags=re.IGNORECASE)
+    return s
+
+
+def sanitize_mask_obj(obj: Any) -> Any:
+    """Recursively normalize mask strings before writing trace artifacts."""
+    if isinstance(obj, str):
+        return expand_mask_runs(obj)
+    if isinstance(obj, list):
+        return [sanitize_mask_obj(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(sanitize_mask_obj(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: sanitize_mask_obj(v) for k, v in obj.items()}
+    return obj
+
+
 def render_slots(slots: Sequence[Optional[str]], max_chars: int, compress_masks: bool) -> str:
-    if compress_masks:
-        parts: List[str] = []
-        run = 0
-        for tok in slots:
-            if tok is None:
-                run += 1
-            else:
-                if run:
-                    parts.append(f"[MASK]x{run}")
-                    run = 0
-                parts.append(str(tok))
-        if run:
-            parts.append(f"[MASK]x{run}")
-        s = "".join(parts)
-    else:
-        s = "".join("[MASK]" if tok is None else str(tok) for tok in slots)
+    # Keep one visible placeholder per masked position.
+    #
+    # Older exports used compressed strings like ``[MASK]x32`` when
+    # --compress-masks was set.  In W1 traces, the decoded token itself can
+    # also already contain compressed mask spans such as ``[MASK]x5``.  For
+    # trace inspection/visualization we want every masked position rendered as
+    # one square, so both empty slots and embedded mask spans become ``□`` runs.
+    # The compress_masks argument is kept for CLI compatibility but
+    # intentionally no longer compresses mask runs.
+    _ = compress_masks
+    s = "".join("□" if tok is None else expand_mask_runs(tok) for tok in slots)
 
     s = s.replace("\r", "\\r").replace("\n", "\\n")
     if max_chars > 0 and len(s) > max_chars:
@@ -505,7 +546,7 @@ def make_problem_text(record: Dict[str, Any]) -> str:
         f"{groundtruth}\n\n"
         "MODEL GENERATION\n"
         "================\n"
-        f"{prediction}\n\n"
+        f"{expand_mask_runs(prediction)}\n\n"
         "SCORE\n"
         "=====\n"
         f"{score}\n"
@@ -572,7 +613,7 @@ def build_generation_chain(
         for p, tok in zip(positions, tokens):
             lp = selected_to_local(to_int(p, -1), block_idx, block_length)
             if lp is not None and 0 <= lp < block_length:
-                block_slots[block_idx][lp] = str(tok)
+                block_slots[block_idx][lp] = expand_mask_runs(tok)
 
         block_selected_counts[block_idx].append(len(positions))
         for c in confidences:
@@ -711,8 +752,8 @@ def export_run_dir(
             "deduped_trace_records_for_sample": len(traces),
         })
 
-        write_csv(sample_dir / "generation_chain.csv", chain_rows)
-        write_json(sample_dir / "metrics.json", metrics)
+        write_csv(sample_dir / "generation_chain.csv", sanitize_mask_obj(chain_rows))
+        write_json(sample_dir / "metrics.json", sanitize_mask_obj(metrics))
         (sample_dir / "problem_groundtruth_prediction.txt").write_text(make_problem_text(rec), encoding="utf-8")
 
         # Research trace format used by the ARness case study.
@@ -721,12 +762,12 @@ def export_run_dir(
             {"step_stats": traces},
             batch_item_idx=to_int(rec.get("batch_item_idx"), 0),
         )
-        write_csv(sample_dir / "step_events.csv", step_events)
-        write_csv(sample_dir / "block_metrics.csv", block_metrics)
-        write_csv(sample_dir / "block_timeline.csv", block_timeline)
-        write_json(sample_dir / "sample_metrics.json", metrics)
+        write_csv(sample_dir / "step_events.csv", sanitize_mask_obj(step_events))
+        write_csv(sample_dir / "block_metrics.csv", sanitize_mask_obj(block_metrics))
+        write_csv(sample_dir / "block_timeline.csv", sanitize_mask_obj(block_timeline))
+        write_json(sample_dir / "sample_metrics.json", sanitize_mask_obj(metrics))
         (sample_dir / "final_prediction.txt").write_text(
-            str(get_field(rec, "prediction", "decoded_prediction", "prediction_preview", "output", default="")),
+            expand_mask_runs(get_field(rec, "prediction", "decoded_prediction", "prediction_preview", "output", default="")),
             encoding="utf-8",
         )
 
@@ -734,8 +775,8 @@ def export_run_dir(
         flat.pop("block_stats", None)
         all_metrics.append(flat)
 
-    write_jsonl(out_root / "trace_metrics.jsonl", all_metrics)
-    write_csv(out_root / "trace_metrics.csv", all_metrics)
+    write_jsonl(out_root / "trace_metrics.jsonl", sanitize_mask_obj(all_metrics))
+    write_csv(out_root / "trace_metrics.csv", sanitize_mask_obj(all_metrics))
     return all_metrics
 
 
@@ -766,7 +807,7 @@ def main() -> None:
     ap.add_argument("--overwrite", action="store_true", help="Overwrite sample_traces and canonical duplicate destinations.")
     ap.add_argument("--sample-traces-name", default="sample_traces")
     ap.add_argument("--max-cell-chars", type=int, default=0)
-    ap.add_argument("--compress-masks", action="store_true")
+    ap.add_argument("--compress-masks", action="store_true", help="Kept for backward compatibility; masks are always rendered as repeated □ placeholders, not compressed runs.")
     ap.add_argument("--write-task-index", action="store_true", help="Write root/task-level trace_index and trace_metrics_all files.")
     args = ap.parse_args()
 

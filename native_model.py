@@ -77,95 +77,6 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def append_csv_row(path: Path, row: Dict[str, Any], fieldnames: Optional[List[str]] = None) -> None:
-    """Append one CSV row and write the header on first use."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if fieldnames is None:
-        fieldnames = list(row.keys())
-    write_header = not path.exists() or path.stat().st_size == 0
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def format_duration(seconds: Optional[float]) -> str:
-    """Human-readable duration for console progress and CSV ETA fields."""
-    if seconds is None:
-        return "?"
-    try:
-        value = float(seconds)
-    except Exception:
-        return "?"
-    if value < 0:
-        value = 0.0
-    if value < 60:
-        return f"{value:.1f}s"
-    minutes, sec = divmod(int(round(value)), 60)
-    if minutes < 60:
-        return f"{minutes}m{sec:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m{sec:02d}s"
-
-
-def format_rate(value: Optional[float]) -> str:
-    if value is None:
-        return "?"
-    try:
-        return f"{float(value):.3f}"
-    except Exception:
-        return "?"
-
-
-class SampleProgressBar:
-    """Tiny dependency-free per-sample progress display.
-
-    tqdm is intentionally avoided because this script is often copied into a
-    minimal runpod/venv.  On a real TTY it updates one line in place; in logs it
-    prints one line per completed sample so the history is preserved.
-    """
-
-    def __init__(self, label: str, total: int, stream: Any = None, width: int = 28):
-        self.label = label
-        self.total = max(0, int(total))
-        self.stream = stream or sys.stderr
-        self.width = max(10, int(width))
-        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
-        self._last_len = 0
-
-    def _line(self, done: int, last_s: float, avg_s: float, eta_s: Optional[float], tps: Optional[float], status: str) -> str:
-        total = max(self.total, 1)
-        done = max(0, min(int(done), total))
-        frac = done / total
-        filled = int(round(frac * self.width))
-        bar = "█" * filled + "░" * (self.width - filled)
-        pct = 100.0 * frac
-        return (
-            f"[{self.label}] {done}/{self.total} {pct:5.1f}% |{bar}| "
-            f"last={format_duration(last_s)} avg={format_duration(avg_s)} "
-            f"eta={format_duration(eta_s)} tps={format_rate(tps)} {status}"
-        )
-
-    def update(self, done: int, last_s: float, avg_s: float, eta_s: Optional[float], tps: Optional[float], error: Optional[str] = None) -> None:
-        status = "ERR" if error else "OK"
-        line = self._line(done, last_s, avg_s, eta_s, tps, status)
-        if self.is_tty:
-            pad = " " * max(0, self._last_len - len(line))
-            self.stream.write("\r" + line + pad)
-            self.stream.flush()
-            self._last_len = len(line)
-        else:
-            self.stream.write(line + "\n")
-            self.stream.flush()
-
-    def close(self) -> None:
-        if self.is_tty and self._last_len:
-            self.stream.write("\n")
-            self.stream.flush()
-            self._last_len = 0
-
-
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -246,61 +157,16 @@ def normalize_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     return models
 
 
-def collect_native_experiments(config: Dict[str, Any], selected: Set[str]) -> List[Dict[str, Any]]:
-    """Collect experiments for native scripts.
-
-    Unlike the older run_test helper, an explicit --only selection should be
-    able to run any task/experiment present in test_config_native.yaml even when
-    run.tasks is set to a safe default such as [context_double_8k_tps].  When
-    --only is omitted, run.tasks/run.experiments still act as the default plan.
-    """
-    selected = {str(x) for x in (selected or set()) if str(x)}
-    explicit_selection = bool(selected)
-    tasks = config.get("tasks", {}) or {}
-    run_cfg = config.get("run", {}) or {}
-    run_tasks = {str(x) for x in as_list(run_cfg.get("tasks"))}
-    run_exps = {str(x) for x in as_list(run_cfg.get("experiments"))}
-
-    out: List[Dict[str, Any]] = []
-    for task_name, task_def in tasks.items():
-        if not isinstance(task_def, dict):
-            continue
-        if not explicit_selection:
-            if run_tasks and "all" not in run_tasks and str(task_name) not in run_tasks:
-                continue
-        for exp in task_def.get("experiments", []) or []:
-            if not isinstance(exp, dict):
-                continue
-            exp_name = str(exp.get("name") or "")
-            if not explicit_selection:
-                if run_exps and "all" not in run_exps and exp_name not in run_exps:
-                    continue
-            if explicit_selection and "all" not in selected and str(task_name) not in selected and exp_name not in selected:
-                continue
-            item = deepcopy(exp)
-            item.setdefault("task", task_name)
-            item.setdefault("task_output_path", task_def.get("output_path"))
-            out.append(item)
-    return out
-
-
 def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict[str, Any]]:
     defaults = config.get("defaults", {}) or {}
-    for experiment in collect_native_experiments(config, selected):
+    for experiment in collect_experiments(config, selected):
         task = experiment.get("task") or "runs"
-        output_task = (
-            experiment.get("output_task")
-            or experiment.get("output_task_name")
-            or experiment.get("output_name")
-            or task
-        )
         exp_models = set(str(x) for x in as_list(experiment.get("models"))) if experiment.get("models") is not None else None
         for benchmark in as_list(experiment.get("benchmark")):
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 merged = deep_merge(defaults, params)
                 yield {
                     "task": task,
-                    "output_task": output_task,
                     "experiment": experiment.get("name"),
                     "benchmark": str(benchmark),
                     "params": merged,
@@ -310,12 +176,8 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
                 }
 
 
-def task_dir_name(condition: Dict[str, Any]) -> str:
-    return safe_name(str(condition.get("output_task") or condition.get("task") or "runs"))
-
-
 def output_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return root / safe_model_name(model_name) / task_dir_name(condition) / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / safe_model_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def write_model_manifests(output_root: Path, stem: str, rows: List[Dict[str, Any]], write_global: bool = False) -> List[Path]:
@@ -408,6 +270,66 @@ def load_existing_or_prepared_inputs(config: Dict[str, Any], condition: Dict[str
         return prep.prepare_custom_math(condition, ROOT / "data"), None, "original:data/custom_math"
 
     raise SystemExit(f"Unsupported benchmark `{benchmark}` in native_model.py")
+
+
+# ------------------------------- Prompt variants -----------------------------
+
+GSM8K_ONE_SHOT_GT_EXAMPLE = """Question: Mia has 3 red marbles and buys 4 more red marbles. How many red marbles does Mia have now?
+Answer: Mia has 3 + 4 = 7 red marbles. #### 7"""
+
+
+def _extract_gsm8k_question(prompt: Any) -> str:
+    """Extract only the current GSM8K question from the native prompt.
+
+    The native GSM8K prompt is instruction-like, which is not ideal for W1-Base.
+    For the one-shot base-model probe we convert it to a plain completion format:
+
+      Question: <demo>
+      Answer: <demo rationale> #### <demo answer>
+
+      Question: <current question>
+      Answer:
+    """
+    text = str(prompt or "")
+    if "Question:" in text:
+        text = text.split("Question:", 1)[1]
+    if "Answer:" in text:
+        text = text.split("Answer:", 1)[0]
+    return text.strip()
+
+
+def apply_prompt_variant(inputs: List[Dict[str, Any]], condition: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Apply prompt-only variants after loading original benchmark rows.
+
+    This deliberately does not change prepare_data.py or write new prepared files.
+    It keeps the original answer/metadata intact, only replacing sample['prompt'].
+    """
+    params = condition.get("params", {}) or {}
+    benchmark = str(condition.get("benchmark") or "")
+    style = str(params.get("prompt_style") or params.get("gsm8k_prompt_style") or "").strip().lower()
+    if benchmark != "gsm8k" or style in {"", "none", "default", "zero_shot"}:
+        return inputs
+    if style not in {"gsm8k_one_shot_gt", "one_shot_gt", "1shot_gt", "single_shot_gt", "singleshot_gt"}:
+        raise SystemExit(f"Unsupported GSM8K prompt_style `{style}`. Use gsm8k_one_shot_gt.")
+
+    out: List[Dict[str, Any]] = []
+    for sample in inputs:
+        new_sample = deepcopy(sample)
+        original_prompt = str(new_sample.get("prompt") or "")
+        question = _extract_gsm8k_question(original_prompt)
+        new_sample["prompt"] = (
+            GSM8K_ONE_SHOT_GT_EXAMPLE
+            + "\n\n"
+            + "Question: " + question + "\n"
+            + "Answer:"
+        )
+        metadata = deepcopy(new_sample.get("metadata", {}) or {})
+        metadata["prompt_style"] = "gsm8k_one_shot_gt"
+        metadata["original_prompt"] = original_prompt
+        metadata["one_shot_example"] = GSM8K_ONE_SHOT_GT_EXAMPLE
+        new_sample["metadata"] = metadata
+        out.append(new_sample)
+    return out
 
 
 class GpuTelemetry:
@@ -1000,9 +922,75 @@ def build_adapter(cfg: Dict[str, Any]) -> BaseAdapter:
     raise SystemExit(f"Unsupported model backend `{backend}` for model {cfg.get('name')}")
 
 
+TRACE_MASK_RENDERING = "square_uncompressed"
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        s = str(value).strip()
+        if s == "" or s.lower() in {"none", "null", "nan"}:
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+
+def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        s = str(value).strip()
+        if s == "" or s.lower() in {"none", "null", "nan"}:
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def _mean(values: Sequence[Any]) -> Optional[float]:
+    vals = []
+    for value in values:
+        v = _to_float(value, None)
+        if v is not None:
+            vals.append(v)
+    return sum(vals) / len(vals) if vals else None
+
+
+def _expand_mask_runs(text: Any) -> str:
+    """Render all literal/compressed mask placeholders as one □ per mask."""
+    if text is None:
+        return ""
+    s = str(text)
+
+    def repl(m: re.Match[str]) -> str:
+        n = _to_int(m.group(1), 1)
+        return "□" * max(1, n)
+
+    # Normalize both old literal trace forms and already-boxed compressed forms.
+    s = re.sub(r"\[MASK\]\s*[x×]\s*(\d+)", repl, s, flags=re.IGNORECASE)
+    s = re.sub(r"□\s*[x×]\s*(\d+)", repl, s)
+    s = re.sub(r"\[MASK\]", "□", s, flags=re.IGNORECASE)
+    return s
+
+
+def _sanitize_mask_obj(obj: Any) -> Any:
+    """Recursively normalize mask placeholders in trace artifacts only."""
+    if isinstance(obj, str):
+        return _expand_mask_runs(obj)
+    if isinstance(obj, list):
+        return [_sanitize_mask_obj(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_sanitize_mask_obj(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_mask_obj(v) for k, v in obj.items()}
+    return obj
+
+
 def _json_cell(value: Any) -> str:
     """CSV cell helper: keep list/dict columns parseable by visualizers."""
-    return json.dumps(value, ensure_ascii=False, default=json_default)
+    return json.dumps(_sanitize_mask_obj(value), ensure_ascii=False, default=json_default)
 
 
 VISIBLE_BOX = "■"
@@ -1094,6 +1082,142 @@ def _threshold_label(value: Any) -> str:
     return s.replace(".", "p")
 
 
+def _render_trace_slots(slots: Sequence[Optional[str]], max_chars: int = 0) -> str:
+    """Render a generation-chain block with visible tokens and □ for masks."""
+    s = "".join(MASK_BOX if tok is None else _expand_mask_runs(tok) for tok in slots)
+    s = s.replace("\r", "\\r").replace("\n", "\\n")
+    if max_chars > 0 and len(s) > max_chars:
+        return s[:max_chars] + "...<truncated>"
+    return s
+
+
+def _trace_local_pos(pos: int, block_idx: int, block_len: int) -> Optional[int]:
+    start = block_idx * block_len
+    if start <= pos < start + block_len:
+        return pos - start
+    if 0 <= pos < block_len:
+        return pos
+    return None
+
+
+def _add_generation_chain_block_columns(
+    out: Dict[str, Any],
+    block_slots: Dict[int, List[Optional[str]]],
+    num_blocks: int,
+) -> None:
+    for b in range(num_blocks):
+        visible = sum(x is not None for x in block_slots[b])
+        total = len(block_slots[b])
+        out[f"block_{b:02d}"] = _render_trace_slots(block_slots[b])
+        out[f"block_{b:02d}_complete"] = f"{visible}/{total}"
+
+
+def _build_generation_chain_rows(
+    rows: List[Dict[str, Any]],
+    gen_length: int,
+    block_len: int,
+    num_blocks: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Build export_trace-style generation_chain.csv rows directly in native_model."""
+    block_slots: Dict[int, List[Optional[str]]] = {}
+    for b in range(num_blocks):
+        start = b * block_len
+        if gen_length:
+            this_len = max(1, min(block_len, max(gen_length, block_len) - start))
+        else:
+            this_len = block_len
+        block_slots[b] = [None] * this_len
+
+    local_round_counter: Dict[int, int] = {b: 0 for b in range(num_blocks)}
+    block_selected_counts: Dict[int, List[int]] = {b: [] for b in range(num_blocks)}
+    block_confidences: Dict[int, List[float]] = {b: [] for b in range(num_blocks)}
+    block_reasons: Dict[int, List[str]] = {b: [] for b in range(num_blocks)}
+
+    chain_rows: List[Dict[str, Any]] = []
+    initial: Dict[str, Any] = {
+        "generation_step": -1,
+        "active_block": "",
+        "block_local_round": -1,
+        "selected_count": 0,
+        "transfer_reason": "initial_all_mask",
+    }
+    _add_generation_chain_block_columns(initial, block_slots, num_blocks)
+    chain_rows.append(initial)
+
+    for order, row in enumerate(rows):
+        block_idx = _to_int(row.get("block_idx"), 0)
+        block_idx = max(0, min(block_idx, num_blocks - 1))
+        local_round = local_round_counter.get(block_idx, 0)
+        local_round_counter[block_idx] = local_round + 1
+
+        positions = _as_int_list(row.get("selected_positions"))
+        tokens = row.get("selected_decoded_tokens") or []
+        if not isinstance(tokens, list):
+            tokens = [tokens]
+        confidences = row.get("selected_confidences") or []
+        reason = str(row.get("transfer_reason", ""))
+
+        for pos, tok in zip(positions, tokens):
+            lp = _trace_local_pos(_to_int(pos, -1), block_idx, block_len)
+            if lp is not None and 0 <= lp < len(block_slots[block_idx]):
+                block_slots[block_idx][lp] = _expand_mask_runs(tok)
+
+        selected_count = len(positions)
+        block_selected_counts.setdefault(block_idx, []).append(selected_count)
+        for c in confidences if isinstance(confidences, list) else []:
+            cf = _to_float(c, None)
+            if cf is not None:
+                block_confidences.setdefault(block_idx, []).append(cf)
+        if reason:
+            block_reasons.setdefault(block_idx, []).append(reason)
+
+        out: Dict[str, Any] = {
+            "generation_step": _to_int(row.get("step_idx"), order),
+            "active_block": block_idx,
+            "block_local_round": local_round,
+            "selected_count": selected_count,
+            "transfer_reason": reason,
+        }
+        _add_generation_chain_block_columns(out, block_slots, num_blocks)
+        chain_rows.append(out)
+
+    final_visible_by_block = {
+        f"block_{b:02d}_final_complete": f"{sum(x is not None for x in block_slots[b])}/{len(block_slots[b])}"
+        for b in range(num_blocks)
+    }
+
+    block_stats: List[Dict[str, Any]] = []
+    for b in range(num_blocks):
+        visible = sum(x is not None for x in block_slots[b])
+        total = len(block_slots[b])
+        reasons = block_reasons.get(b, [])
+        block_stats.append({
+            "block_idx": b,
+            "complete": f"{visible}/{total}",
+            "is_complete": visible == total,
+            "local_rounds": local_round_counter.get(b, 0),
+            "selected_tokens_total": sum(block_selected_counts.get(b, [])),
+            "mean_selected_count": _mean(block_selected_counts.get(b, [])),
+            "mean_confidence": _mean(block_confidences.get(b, [])),
+            "fallback_steps": sum(1 for x in reasons if "fallback" in str(x)),
+            "threshold_pass_steps": sum(1 for x in reasons if str(x) == "threshold_pass"),
+        })
+
+    return chain_rows, block_stats, final_visible_by_block
+
+
+def _write_trace_metric_indexes(trace_root: Path, metrics: Dict[str, Any]) -> None:
+    """Maintain sample_traces/trace_metrics.jsonl and .csv during native runs."""
+    trace_root.mkdir(parents=True, exist_ok=True)
+    metric_path = trace_root / "trace_metrics.jsonl"
+    append_jsonl(metric_path, _sanitize_mask_obj(metrics))
+    try:
+        all_rows = read_jsonl(metric_path)
+    except Exception:
+        all_rows = [_sanitize_mask_obj(metrics)]
+    write_csv(trace_root / "trace_metrics.csv", _sanitize_mask_obj(all_rows))
+
+
 def _export_canonical_sample_trace(
     out_dir: Path,
     sample_dir: Path,
@@ -1113,13 +1237,21 @@ def _export_canonical_sample_trace(
     """
     params = condition.get("params", {}) or {}
     gen_length = int(params.get("gen_length", params.get("max_new_tokens", result.tokens_generated or 0)) or 0)
-    block_len = int(params.get("gen_blocksize", gen_length or 1) or (gen_length or 1))
-    block_len = max(1, block_len)
-    num_blocks = max(1, (max(gen_length, 1) + block_len - 1) // block_len)
+    is_w1_trace = bool(result.trace and str(result.trace.get("backend", "")).lower() == "w1_4b")
+    if is_w1_trace:
+        # W1's SamplingRunner generates one editable span.  It does not have the
+        # iLLaDA block-by-block mechanism.  gen_blocksize is kept in the shared
+        # config for iLLaDA compatibility, but must not be used to split W1 trace
+        # views into fake blocks.
+        block_len = max(1, int(gen_length or params.get("max_new_tokens") or result.tokens_generated or 1))
+        num_blocks = 1
+    else:
+        block_len = int(params.get("gen_blocksize", gen_length or 1) or (gen_length or 1))
+        block_len = max(1, block_len)
+        num_blocks = max(1, (max(gen_length, 1) + block_len - 1) // block_len)
 
-    # Cumulative commit state per block.  For W1 there is one logical generated
-    # span/block.  For iLLaDA, selected_positions are usually block-local when
-    # block_idx is present; the visualizer later converts to global positions.
+    # Cumulative commit state per block/span.  For W1 this is one logical
+    # generated span; for iLLaDA it can be multiple native generation blocks.
     committed: Dict[int, set[int]] = {b: set() for b in range(num_blocks)}
     step_rows: List[Dict[str, Any]] = []
     timeline_rows: List[Dict[str, Any]] = []
@@ -1212,6 +1344,13 @@ def _export_canonical_sample_trace(
             "mean_confidence": (sum(conf) / len(conf)) if conf else "",
         })
 
+    generation_chain_rows, chain_block_stats, final_visible_by_block = _build_generation_chain_rows(
+        rows,
+        gen_length=gen_length,
+        block_len=block_len,
+        num_blocks=num_blocks,
+    )
+
     metrics = {
         "model": getattr(result, "model", None),
         "benchmark": condition.get("benchmark"),
@@ -1232,17 +1371,44 @@ def _export_canonical_sample_trace(
         "fallback_rate": result.trace.get("fallback_rate") if result.trace else None,
         "prediction": result.text,
         "answer": sample.get("answer"),
+        "elapsed_seconds": result.elapsed,
+        "tokens_generated": result.tokens_generated,
+        "trace_step_rows": len(rows),
+        "generation_chain_rows": len(generation_chain_rows),
+        "block_stats": chain_block_stats,
+        "sample_dir": str(sample_dir),
+        "run_dir": str(out_dir),
     }
+    metrics.update(final_visible_by_block)
+    gen_steps_value = _to_float(metrics.get("gen_steps"), None)
+    if gen_steps_value and gen_steps_value != 0:
+        metrics["planned_parallelism"] = gen_length / gen_steps_value if gen_length else None
+        metrics["nominal_arness"] = gen_steps_value / gen_length if gen_length else None
+    else:
+        metrics["planned_parallelism"] = None
+        metrics["nominal_arness"] = None
 
-    write_csv(sample_dir / "step_events.csv", step_rows)
-    write_csv(sample_dir / "block_timeline.csv", timeline_rows)
-    write_csv(sample_dir / "block_metrics.csv", block_rows)
-    write_json(sample_dir / "sample_metrics.json", metrics)
-    (sample_dir / "final_prediction.txt").write_text(result.text or "", encoding="utf-8")
+    sanitized_step_rows = _sanitize_mask_obj(step_rows)
+    sanitized_timeline_rows = _sanitize_mask_obj(timeline_rows)
+    sanitized_block_rows = _sanitize_mask_obj(block_rows)
+    sanitized_generation_chain_rows = _sanitize_mask_obj(generation_chain_rows)
+    sanitized_metrics = _sanitize_mask_obj(metrics)
+
+    write_csv(sample_dir / "generation_chain.csv", sanitized_generation_chain_rows)
+    write_csv(sample_dir / "step_events.csv", sanitized_step_rows)
+    write_csv(sample_dir / "block_timeline.csv", sanitized_timeline_rows)
+    write_csv(sample_dir / "block_metrics.csv", sanitized_block_rows)
+    write_json(sample_dir / "metrics.json", sanitized_metrics)
+    write_json(sample_dir / "sample_metrics.json", sanitized_metrics)
+    (sample_dir / "final_prediction.txt").write_text(_expand_mask_runs(result.text or ""), encoding="utf-8")
     (sample_dir / "problem_groundtruth_prediction.txt").write_text(
-        "PROMPT:\n" + str(sample.get("prompt", "")) + "\n\nGROUND TRUTH:\n" + str(sample.get("answer", "")) + "\n\nPREDICTION:\n" + str(result.text or ""),
+        "PROMPT:\n" + str(sample.get("prompt", "")) + "\n\nGROUND TRUTH:\n" + str(sample.get("answer", "")) + "\n\nPREDICTION:\n" + _expand_mask_runs(result.text or ""),
         encoding="utf-8",
     )
+
+    flat_metrics = dict(sanitized_metrics)
+    flat_metrics.pop("block_stats", None)
+    _write_trace_metric_indexes(out_dir / "sample_traces", flat_metrics)
 
 
 def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[str, Any], sample: Dict[str, Any], result: GenerationResult) -> None:
@@ -1281,7 +1447,7 @@ def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[s
             "selected_count": len(positions),
             "selected_positions": positions,
             "selected_token_ids": selected_ids,
-            "selected_decoded_tokens": decoded,
+            "selected_decoded_tokens": _sanitize_mask_obj(decoded),
             "selected_confidences": step.get("selected_confidences") or [],
             "changed_positions": step.get("changed_positions") or positions,
             "changed_count": step.get("changed_count", step.get("w1_selected_count", len(positions))),
@@ -1300,23 +1466,23 @@ def write_trace_artifacts(out_dir: Path, adapter: BaseAdapter, condition: Dict[s
             "w1_metadata": step.get("w1_metadata"),
         }
         rows.append(row)
+    rows = _sanitize_mask_obj(rows)
     for row in rows:
         append_jsonl(trace_path, row)
 
     sample_dir = out_dir / "sample_traces" / f"sample_{int(sample.get('sample_id', 0)):04d}"
     sample_dir.mkdir(parents=True, exist_ok=True)
-    write_json(sample_dir / "trace.json", trace)
-    write_json(sample_dir / "sample.json", {"sample": sample, "prediction": result.text, "condition": condition})
-    (sample_dir / "prediction.txt").write_text(result.text, encoding="utf-8")
+    write_json(sample_dir / "trace.json", _sanitize_mask_obj(trace))
+    write_json(sample_dir / "sample.json", _sanitize_mask_obj({"sample": sample, "prediction": result.text, "condition": condition}))
+    (sample_dir / "prediction.txt").write_text(_expand_mask_runs(result.text), encoding="utf-8")
     _export_canonical_sample_trace(out_dir, sample_dir, condition, sample, result, rows)
 
 def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Dict[str, Any], inputs: List[Dict[str, Any]], out_dir: Path, force: bool) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs_path = out_dir / "outputs.jsonl"
     summary_path = out_dir / "summary.jsonl"
-    progress_path = out_dir / "sample_progress.csv"
     if force:
-        for path in [outputs_path, summary_path, out_dir / "trace.jsonl", progress_path]:
+        for path in [outputs_path, summary_path, out_dir / "trace.jsonl"]:
             if path.exists():
                 path.unlink()
         sample_traces = out_dir / "sample_traces"
@@ -1333,48 +1499,20 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
         "model": model_cfg,
         "model_alias": adapter.alias,
         "task": condition["task"],
-        "output_task": condition.get("output_task", condition["task"]),
         "experiment": condition["experiment"],
         "benchmark": condition["benchmark"],
         "condition": condition["condition"],
         "params": condition["params"],
         "num_samples": len(inputs),
-        "progress_path": str(progress_path),
     })
 
-    progress_fields = [
-        "timestamp",
-        "model",
-        "task",
-        "experiment",
-        "benchmark",
-        "condition",
-        "sample_id",
-        "dataset_index",
-        "sample_ordinal",
-        "num_samples",
-        "sample_elapsed_seconds",
-        "total_elapsed_seconds",
-        "avg_seconds_per_sample",
-        "eta_seconds",
-        "eta_human",
-        "tokens_generated",
-        "tokens_per_second",
-        "error",
-    ]
-
     telemetry = None
-    progress = SampleProgressBar(
-        label=f"{adapter.alias} | {condition['experiment']} | {condition['condition']}",
-        total=len(inputs),
-    )
-    completed_samples = 0
+    if model_cfg.get("gpu_telemetry", True):
+        telemetry = GpuTelemetry(out_dir / "gpu.csv", interval=float(model_cfg.get("gpu_telemetry_interval", 5)))
+        telemetry.start()
+
     started_all = time.perf_counter()
     try:
-        if model_cfg.get("gpu_telemetry", True):
-            telemetry = GpuTelemetry(out_dir / "gpu.csv", interval=float(model_cfg.get("gpu_telemetry_interval", 5)))
-            telemetry.start()
-
         for local_idx, sample in enumerate(inputs):
             prompt = str(sample["prompt"])
             started = time.perf_counter()
@@ -1386,35 +1524,8 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                 result = GenerationResult(text="", elapsed=elapsed, tokens_generated=None, trace=None)
                 error = repr(exc)
 
-            completed_samples = local_idx + 1
-            total_elapsed = time.perf_counter() - started_all
-            avg_seconds = total_elapsed / completed_samples if completed_samples else None
-            remaining = max(0, len(inputs) - completed_samples)
-            eta_seconds = (avg_seconds * remaining) if avg_seconds is not None else None
             tokens = result.tokens_generated
             tps = (tokens / result.elapsed) if tokens and result.elapsed > 0 else None
-            progress_row = {
-                "timestamp": utc_now(),
-                "model": adapter.alias,
-                "task": condition["task"],
-                "experiment": condition["experiment"],
-                "benchmark": condition["benchmark"],
-                "condition": condition["condition"],
-                "sample_id": sample.get("sample_id", local_idx),
-                "dataset_index": sample.get("dataset_index"),
-                "sample_ordinal": completed_samples,
-                "num_samples": len(inputs),
-                "sample_elapsed_seconds": round(result.elapsed, 6),
-                "total_elapsed_seconds": round(total_elapsed, 6),
-                "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
-                "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
-                "eta_human": format_duration(eta_seconds),
-                "tokens_generated": tokens,
-                "tokens_per_second": round(tps, 6) if tps is not None else None,
-                "error": error,
-            }
-            append_csv_row(progress_path, progress_row, progress_fields)
-
             out_row = {
                 "model": adapter.alias,
                 "task": condition["task"],
@@ -1433,12 +1544,6 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                     "elapsed_seconds": round(result.elapsed, 6),
                     "tokens_generated": tokens,
                     "tokens_per_second": round(tps, 6) if tps is not None else None,
-                    "sample_ordinal": completed_samples,
-                    "num_samples": len(inputs),
-                    "total_elapsed_seconds": round(total_elapsed, 6),
-                    "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
-                    "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
-                    "eta_human": format_duration(eta_seconds),
                 },
                 "error": error,
             }
@@ -1450,16 +1555,10 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
                 "benchmark": condition["benchmark"],
                 "sample_idx": sample.get("sample_id", local_idx),
                 "sample_id": sample.get("sample_id", local_idx),
-                "sample_ordinal": completed_samples,
-                "num_samples": len(inputs),
                 "decoding_config_name": condition["condition"],
                 "input": prompt,
                 "prediction": result.text,
                 "elapsed_seconds": round(result.elapsed, 6),
-                "total_elapsed_seconds": round(total_elapsed, 6),
-                "avg_seconds_per_sample": round(avg_seconds, 6) if avg_seconds is not None else None,
-                "eta_seconds": round(eta_seconds, 6) if eta_seconds is not None else None,
-                "eta_human": format_duration(eta_seconds),
                 "tokens_per_second": round(tps, 6) if tps is not None else None,
                 "steps": int(condition["params"].get("gen_steps", condition["params"].get("gen_length", 128))),
                 "gen_length": int(condition["params"].get("gen_length", 128)),
@@ -1473,22 +1572,12 @@ def run_condition(adapter: BaseAdapter, model_cfg: Dict[str, Any], condition: Di
             }
             append_jsonl(summary_path, summary_row)
             write_trace_artifacts(out_dir, adapter, condition, sample, result)
-            progress.update(completed_samples, result.elapsed, avg_seconds or 0.0, eta_seconds, tps, error)
     finally:
-        progress.close()
         if telemetry is not None:
             telemetry.stop()
 
     elapsed_all = time.perf_counter() - started_all
-    avg_all = elapsed_all / completed_samples if completed_samples else None
-    manifest = {
-        "status": "finished",
-        "num_samples": len(inputs),
-        "completed_samples": completed_samples,
-        "elapsed_seconds": round(elapsed_all, 3),
-        "avg_seconds_per_sample": round(avg_all, 6) if avg_all is not None else None,
-        "progress_path": str(progress_path),
-    }
+    manifest = {"status": "finished", "num_samples": len(inputs), "elapsed_seconds": round(elapsed_all, 3)}
     write_json(out_dir / "output_manifest.json", manifest)
     if condition["params"].get("return_trace"):
         sample_idx = inputs[0].get("sample_id", 0) if inputs else 0
@@ -1608,13 +1697,14 @@ def main() -> int:
         try:
             for condition, input_path, out_dir in jobs:
                 inputs, source_path, source_label = load_existing_or_prepared_inputs(config, condition, input_path)
+                inputs = apply_prompt_variant(inputs, condition)
                 _PREPARED_SOURCE = source_path
-                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)} | inputs={source_label}", flush=True)
+                prompt_style = str((condition.get("params", {}) or {}).get("prompt_style") or (condition.get("params", {}) or {}).get("gsm8k_prompt_style") or "default")
+                print(f"[RUN] {alias} | {condition['experiment']} | {condition['condition']} | n={len(inputs)} | inputs={source_label} | prompt_style={prompt_style}", flush=True)
                 result = run_condition(adapter, model_cfg, condition, inputs, out_dir, force=args.force)
                 manifest_rows.append({
                     "model": alias,
                     "task": condition["task"],
-                    "output_task": condition.get("output_task", condition["task"]),
                     "experiment": condition["experiment"],
                     "benchmark": condition["benchmark"],
                     "condition": condition["condition"],

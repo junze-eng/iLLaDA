@@ -45,16 +45,25 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
-    from run_test import ROOT, as_list, collect_experiments, deep_merge, expand_matrix, load_yaml, safe_name
+    from run_test import ROOT, OPENCOMPASS_DIR, as_list, collect_experiments, deep_merge, expand_matrix, load_yaml, safe_name
 except Exception:  # pragma: no cover
     ROOT = Path(__file__).resolve().parent
+    OPENCOMPASS_DIR = ROOT / "opencompass"
     from prepare_data import as_list, deep_merge, load_yaml, safe_name, collect_experiments, expand_matrix  # type: ignore
+
+# Make local OpenCompass checkout importable when using native offline outputs.
+try:
+    if OPENCOMPASS_DIR and str(OPENCOMPASS_DIR) not in sys.path:
+        sys.path.insert(0, str(OPENCOMPASS_DIR))
+except Exception:
+    pass
 
 from prepare_data import bench_alias, condition_name, read_jsonl, write_jsonl, json_default
 from native_model import model_alias, model_selected, normalize_models, output_dir_for, safe_model_name
@@ -62,17 +71,17 @@ from native_model import model_alias, model_selected, normalize_models, output_d
 
 EVAL_POLICY: Dict[str, Dict[str, Any]] = {
     "gsm8k": {
-        "backend": "legacy_opencompass_compatible",
-        "compatibility": "same_policy_as_previous_iLLaDA",
+        "backend": "opencompass_evaluator_direct",
+        "compatibility": "same_evaluator_source_as_OpenCompass_without_CLI_reuse",
         "metric": "exact_match",
-        "source": "GSM8K numeric exact-match convention used by the previous OpenCompass path: extract the final numeric answer, normalize commas/fractions, compare exact value.",
+        "source": "Directly imports OpenCompass GSM8K postprocessors and Gsm8kEvaluator, then applies them to saved native outputs.",
         "custom_native": False,
     },
     "mbpp": {
-        "backend": "legacy_opencompass_compatible",
-        "compatibility": "same_policy_as_previous_iLLaDA",
+        "backend": "opencompass_evaluator_direct",
+        "compatibility": "same_evaluator_source_as_OpenCompass_without_CLI_reuse",
         "metric": "pass_at_1",
-        "source": "MBPP code-generation convention used by the previous OpenCompass path: extract Python code, append the sample tests, run in a subprocess with timeout.",
+        "source": "Directly imports OpenCompass MBPPEvaluator and applies it to saved native outputs.",
         "custom_native": False,
     },
     "ruler_niah_single_1": {
@@ -149,61 +158,16 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def collect_native_experiments(config: Dict[str, Any], selected: Set[str]) -> List[Dict[str, Any]]:
-    """Collect experiments for native scripts.
-
-    Unlike the older run_test helper, an explicit --only selection should be
-    able to run any task/experiment present in test_config_native.yaml even when
-    run.tasks is set to a safe default such as [context_double_8k_tps].  When
-    --only is omitted, run.tasks/run.experiments still act as the default plan.
-    """
-    selected = {str(x) for x in (selected or set()) if str(x)}
-    explicit_selection = bool(selected)
-    tasks = config.get("tasks", {}) or {}
-    run_cfg = config.get("run", {}) or {}
-    run_tasks = {str(x) for x in as_list(run_cfg.get("tasks"))}
-    run_exps = {str(x) for x in as_list(run_cfg.get("experiments"))}
-
-    out: List[Dict[str, Any]] = []
-    for task_name, task_def in tasks.items():
-        if not isinstance(task_def, dict):
-            continue
-        if not explicit_selection:
-            if run_tasks and "all" not in run_tasks and str(task_name) not in run_tasks:
-                continue
-        for exp in task_def.get("experiments", []) or []:
-            if not isinstance(exp, dict):
-                continue
-            exp_name = str(exp.get("name") or "")
-            if not explicit_selection:
-                if run_exps and "all" not in run_exps and exp_name not in run_exps:
-                    continue
-            if explicit_selection and "all" not in selected and str(task_name) not in selected and exp_name not in selected:
-                continue
-            item = deepcopy(exp)
-            item.setdefault("task", task_name)
-            item.setdefault("task_output_path", task_def.get("output_path"))
-            out.append(item)
-    return out
-
-
 def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict[str, Any]]:
     defaults = config.get("defaults", {}) or {}
-    for experiment in collect_native_experiments(config, selected):
+    for experiment in collect_experiments(config, selected):
         task = experiment.get("task") or "runs"
-        output_task = (
-            experiment.get("output_task")
-            or experiment.get("output_task_name")
-            or experiment.get("output_name")
-            or task
-        )
         exp_models = set(str(x) for x in as_list(experiment.get("models"))) if experiment.get("models") is not None else None
         for benchmark in as_list(experiment.get("benchmark")):
             for idx, params in enumerate(expand_matrix(experiment), start=1):
                 merged = deep_merge(defaults, params)
                 yield {
                     "task": task,
-                    "output_task": output_task,
                     "experiment": experiment.get("name"),
                     "benchmark": str(benchmark),
                     "params": merged,
@@ -213,16 +177,12 @@ def iter_conditions(config: Dict[str, Any], selected: Set[str]) -> Iterable[Dict
                 }
 
 
-def task_dir_name(condition: Dict[str, Any]) -> str:
-    return safe_name(str(condition.get("output_task") or condition.get("task") or "runs"))
-
-
 def final_dir_for(root: Path, model_name: str, condition: Dict[str, Any]) -> Path:
-    return root / safe_model_name(model_name) / task_dir_name(condition) / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / safe_model_name(model_name) / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def compare_dir_for(root: Path, condition: Dict[str, Any]) -> Path:
-    return root / "_compare" / task_dir_name(condition) / bench_alias(condition["benchmark"]) / condition["condition"]
+    return root / "_compare" / safe_name(condition["task"] or "runs") / bench_alias(condition["benchmark"]) / condition["condition"]
 
 
 def write_model_manifests(output_root: Path, stem: str, rows: List[Dict[str, Any]], write_global: bool = False) -> List[Path]:
@@ -262,111 +222,184 @@ def normalize_text(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip()).lower()
 
 
-# ------------------------------- GSM8K -------------------------------------
+# ------------------------------- GSM8K / MBPP via OpenCompass ----------------
 
 
-def normalize_number(text: str) -> Optional[str]:
-    if text is None:
-        return None
-    text = str(text).replace(",", "")
-    nums = re.findall(r"[-+]?\d*\.?\d+(?:/[1-9]\d*)?", text)
-    if not nums:
-        return None
-    val = nums[-1]
-    if "/" in val:
-        try:
-            a, b = val.split("/", 1)
-            return str(float(a) / float(b)).rstrip("0").rstrip(".")
-        except Exception:
-            return val
+def _import_opencompass_gsm8k():
     try:
-        f = float(val)
-        if abs(f - int(f)) < 1e-9:
-            return str(int(f))
-        return ("%.10f" % f).rstrip("0").rstrip(".")
-    except Exception:
-        return val
+        from opencompass.datasets.gsm8k import (
+            Gsm8kEvaluator,
+            gsm8k_dataset_postprocess,
+            gsm8k_postprocess,
+        )
+        return Gsm8kEvaluator, gsm8k_dataset_postprocess, gsm8k_postprocess
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import OpenCompass GSM8K evaluator. Make sure the local "
+            "OpenCompass repo/package is available and its dependencies are installed. "
+            f"OPENCOMPASS_DIR={OPENCOMPASS_DIR}; error={exc}"
+        ) from exc
 
 
-def gsm8k_gold(answer: Any) -> Optional[str]:
-    text = str(answer or "")
-    if "####" in text:
-        text = text.split("####")[-1]
-    return normalize_number(text)
+def _import_opencompass_mbpp():
+    try:
+        from opencompass.datasets.mbpp import MBPPEvaluator
+        return MBPPEvaluator
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import OpenCompass MBPP evaluator. Make sure the local "
+            "OpenCompass repo/package is available and its dependencies are installed. "
+            f"OPENCOMPASS_DIR={OPENCOMPASS_DIR}; error={exc}"
+        ) from exc
+
+
+def _prediction_text(row: Dict[str, Any]) -> str:
+    return str(row.get("prediction") or row.get("raw_output") or row.get("output") or "")
 
 
 def score_gsm8k(row: Dict[str, Any]) -> Dict[str, Any]:
-    pred = normalize_number(row.get("prediction") or row.get("raw_output") or "")
-    gold = gsm8k_gold(row.get("answer"))
-    correct = pred is not None and gold is not None and pred == gold
-    return {"correct": bool(correct), "prediction_answer": pred, "gold_answer": gold, "score": 1.0 if correct else 0.0}
+    """Score one GSM8K row with OpenCompass' own postprocess + evaluator.
+
+    This avoids the old native hand-written numeric normalizer. The only adapter
+    here is mapping native outputs.jsonl fields to OpenCompass' expected
+    prediction/reference strings.
+    """
+    Gsm8kEvaluator, gsm8k_dataset_postprocess, gsm8k_postprocess = _import_opencompass_gsm8k()
+    raw_pred = _prediction_text(row)
+    raw_gold = str(row.get("answer") or row.get("gold") or row.get("target") or "")
+    pred = gsm8k_postprocess(raw_pred)
+    try:
+        gold = gsm8k_dataset_postprocess(raw_gold)
+    except Exception:
+        # Native prepared rows may already store the processed gold answer.
+        gold = raw_gold.replace(",", "").strip()
+    result = Gsm8kEvaluator().score([pred], [gold])
+    detail = (result.get("details") or [{}])[0]
+    correct = bool(detail.get("correct", False))
+    return {
+        "correct": correct,
+        "prediction_answer": pred,
+        "gold_answer": gold,
+        "score": 1.0 if correct else 0.0,
+        "opencompass_detail": detail,
+    }
 
 
-# -------------------------------- MBPP --------------------------------------
+def _mbpp_test_case(row: Dict[str, Any]) -> str:
+    metadata = row.get("metadata") or {}
+    tests = (
+        metadata.get("test_list_2")
+        or metadata.get("test_list")
+        or metadata.get("test_case")
+        or metadata.get("tests")
+        or row.get("test_list_2")
+        or row.get("test_list")
+        or row.get("test_case")
+        or row.get("tests")
+        or row.get("answer")
+        or row.get("gold")
+        or ""
+    )
+    if isinstance(tests, str):
+        text = tests
+        try:
+            parsed = json.loads(tests)
+            if isinstance(parsed, list):
+                text = "\n".join(str(t) for t in parsed)
+        except Exception:
+            pass
+        return text
+    if isinstance(tests, (list, tuple)):
+        return "\n".join(str(t) for t in tests)
+    return str(tests)
 
 
-def extract_code(raw: str) -> str:
-    raw = str(raw or "")
-    m = re.search(r"```(?:python)?\s*(.*?)```", raw, flags=re.S | re.I)
-    if m:
-        return m.group(1).strip()
-    lines = raw.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("def ") or stripped.startswith("import ") or stripped.startswith("from ") or stripped.startswith("class "):
-            start = i
-            break
-    return "\n".join(lines[start:]).strip() if start is not None else raw.strip()
+def _run_mbpp_program_windows_safe(programs: str, timeout: int = 10) -> Dict[str, Any]:
+    """Run MBPP candidate code without Unix-only SIGALRM.
 
-
-def run_python_tests(code: str, tests: Sequence[str], setup_code: str = "", timeout: int = 8) -> Dict[str, Any]:
-    program = "\n".join([setup_code or "", code, "", "\n".join(str(t) for t in tests)])
+    OpenCompass' MBPPEvaluator uses signal.setitimer/SIGALRM inside the child
+    process. That is Unix-only and fails on native Windows. The outer behavior
+    we need for MBPP is still simple: execute the assembled program in an
+    isolated Python process, cap wall-clock time, and map failures to the same
+    OpenCompass status names: pass / timeout / wrong_answer / failed.
+    """
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "candidate.py"
-        path.write_text(program, encoding="utf-8")
+        path.write_text(programs, encoding="utf-8")
         try:
             proc = subprocess.run(
-                ["python", str(path)],
+                [sys.executable, str(path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return {"passed": False, "error_type": "timeout", "stderr": "TimeoutExpired"}
-    if proc.returncode == 0:
-        return {"passed": True, "error_type": "pass", "stderr": ""}
+            return {"result": "timeout", "stderr": "TimeoutExpired"}
     stderr = proc.stderr or ""
-    if "SyntaxError" in stderr:
-        etype = "syntax_error"
-    elif "NameError" in stderr:
-        etype = "name_error_or_missing_function"
-    elif "AssertionError" in stderr:
-        etype = "wrong_answer"
+    if proc.returncode == 0:
+        return {"result": "pass", "stderr": ""}
+    if "AssertionError" in stderr:
+        return {"result": "wrong_answer", "stderr": stderr[-1200:]}
+    return {"result": "failed", "stderr": stderr[-1200:]}
+
+
+def _opencompass_mbpp_can_use_unix_alarm() -> bool:
+    return os.name != "nt" and hasattr(__import__("signal"), "SIGALRM") and hasattr(__import__("signal"), "setitimer")
+
+
+def score_mbpp(row: Dict[str, Any], timeout: int = 10) -> Dict[str, Any]:
+    """Score one MBPP row using OpenCompass answer/test processing.
+
+    On Linux/WSL, this calls OpenCompass MBPPEvaluator directly, which is the
+    strictest path. On native Windows, OpenCompass' execution harness depends on
+    SIGALRM, which the platform does not provide, so we keep OpenCompass'
+    _process_answer/_process_test logic and replace only the execution timeout
+    wrapper with a Windows-safe subprocess runner.
+    """
+    MBPPEvaluator = _import_opencompass_mbpp()
+    evaluator = MBPPEvaluator(metric="MBPP")
+    pred = _prediction_text(row)
+    test_case = _mbpp_test_case(row)
+    if not test_case.strip():
+        return {
+            "correct": None,
+            "score": None,
+            "error_type": "no_tests",
+            "extracted_code": "",
+        }
+
+    if _opencompass_mbpp_can_use_unix_alarm():
+        result = evaluator.score([pred], [test_case])
+        details = result.get("details") or {}
+        detail = details.get("0") or details.get(0) or {}
+        status = str(detail.get("result") or "failed")
+        programs = str(detail.get("programs") or "")
+        backend = "opencompass_mbpp_evaluator"
     else:
-        etype = "runtime_error"
-    return {"passed": False, "error_type": etype, "stderr": stderr[-1200:]}
+        extracted = evaluator._process_answer(pred)
+        programs = evaluator._process_test(test_case, extracted)
+        run_result = _run_mbpp_program_windows_safe(programs, timeout=timeout)
+        status = str(run_result.get("result") or "failed")
+        detail = {
+            "origin": pred,
+            "programs": programs,
+            "result": status,
+            "is_correct": status == "pass",
+            "stderr": run_result.get("stderr", ""),
+            "windows_safe_execution": True,
+        }
+        backend = "opencompass_mbpp_postprocess_windows_safe_execution"
 
-
-def score_mbpp(row: Dict[str, Any], timeout: int = 8) -> Dict[str, Any]:
-    metadata = row.get("metadata") or {}
-    tests = metadata.get("test_list") or metadata.get("tests") or []
-    if isinstance(tests, str):
-        try:
-            tests = json.loads(tests)
-        except Exception:
-            tests = [tests]
-    code = extract_code(row.get("prediction") or row.get("raw_output") or "")
-    if not tests:
-        return {"correct": None, "score": None, "error_type": "no_tests", "extracted_code": code}
-    result = run_python_tests(code, tests, setup_code=str(metadata.get("test_setup_code") or ""), timeout=timeout)
+    correct = status == "pass"
+    extracted_code = programs[: -len(test_case)] if test_case and programs.endswith(test_case) else programs
     return {
-        "correct": bool(result["passed"]),
-        "score": 1.0 if result["passed"] else 0.0,
-        "error_type": result["error_type"],
-        "stderr": result.get("stderr", ""),
-        "extracted_code": code,
+        "correct": correct,
+        "score": 1.0 if correct else 0.0,
+        "error_type": status,
+        "extracted_code": extracted_code.rstrip(),
+        "opencompass_detail": detail,
+        "mbpp_eval_backend": backend,
     }
 
 
@@ -504,6 +537,285 @@ def aggregate_scores(rows: List[Dict[str, Any]], outputs: List[Dict[str, Any]]) 
     return metrics
 
 
+
+# BEGIN OPENCOMPASS_INLINE_TRACE_PATCH
+
+def _trace_as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return obj
+        except Exception:
+            pass
+        return [text]
+    return [value]
+
+
+def _trace_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _trace_clean_token(value: Any) -> str:
+    text = str(value if value is not None else '')
+    text = text.replace('\r', '\\r').replace('\n', '\\n')
+    return text
+
+
+def _trace_sample_key(value: Any) -> str:
+    if value is None:
+        return '0'
+    try:
+        return str(int(value))
+    except Exception:
+        return str(value)
+
+
+def _trace_sample_dir_name(value: Any) -> str:
+    try:
+        return f"sample_{int(value):04d}"
+    except Exception:
+        return 'sample_' + safe_name(str(value))
+
+
+def _trace_gen_length(outputs: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> int:
+    for out in outputs:
+        params = out.get('params') or {}
+        for key in ('max_new_tokens', 'gen_length'):
+            try:
+                n = int(params.get(key))
+                if n > 0:
+                    return n
+            except Exception:
+                pass
+    max_pos = -1
+    for row in rows:
+        for p0 in _trace_as_list(row.get('selected_positions')):
+            try:
+                max_pos = max(max_pos, int(p0))
+            except Exception:
+                pass
+        for p0 in _trace_as_list(row.get('visible_positions')):
+            try:
+                max_pos = max(max_pos, int(p0))
+            except Exception:
+                pass
+    return max(max_pos + 1, 1)
+
+
+def _trace_longest_prefix(done: Set[int]) -> int:
+    i = 0
+    while i in done:
+        i += 1
+    return i
+
+
+def _trace_order_metrics(commits: List[Dict[str, Any]], gen_length: int) -> Dict[str, Any]:
+    first: Dict[int, Dict[str, Any]] = {}
+    for c in commits:
+        pos = _trace_int(c.get('position'), -1)
+        if pos < 0:
+            continue
+        if pos not in first:
+            first[pos] = c
+    ordered = sorted(first.values(), key=lambda x: (_trace_int(x.get('step_idx')), _trace_int(x.get('order_idx'))))
+    positions = [_trace_int(x.get('position')) for x in ordered]
+    total_pairs = len(positions) * (len(positions) - 1) // 2
+    inv = 0
+    conc = 0
+    if total_pairs:
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                if positions[i] <= positions[j]:
+                    conc += 1
+                else:
+                    inv += 1
+    inv_rate = (inv / total_pairs) if total_pairs else None
+    tau = ((conc - inv) / total_pairs) if total_pairs else None
+    left_score = (conc / total_pairs) if total_pairs else None
+
+    by_step: Dict[int, Set[int]] = {}
+    seen: Set[int] = set()
+    for c in ordered:
+        step = _trace_int(c.get('step_idx'))
+        seen.add(_trace_int(c.get('position')))
+        by_step[step] = set(seen)
+    gaps: List[int] = []
+    for done in by_step.values():
+        if not done:
+            continue
+        max_seen = max(done) + 1
+        prefix = _trace_longest_prefix(done)
+        gaps.append(max_seen - prefix)
+    mean_gap = (sum(gaps) / len(gaps)) if gaps else None
+    steps = sorted({_trace_int(c.get('step_idx')) for c in commits})
+    return {
+        'actual_parallelism': round(len(commits) / max(len(steps), 1), 6) if commits else None,
+        'completion_rate': round(len(first) / max(int(gen_length or 1), 1), 6),
+        'order_kendall_tau': round(tau, 6) if tau is not None else None,
+        'inversion_rate': round(inv_rate, 6) if inv_rate is not None else None,
+        'left_to_right_score': round(left_score, 6) if left_score is not None else None,
+        'mean_prefix_gap': round(mean_gap, 6) if mean_gap is not None else None,
+        'committed_unique_positions': len(first),
+        'commit_events': len(commits),
+        'trace_steps': len(steps),
+    }
+
+
+def _trace_text_state(token_by_pos: Dict[int, str], gen_length: int, limit: int = 256) -> str:
+    n = max(1, min(int(gen_length or 1), int(limit or 256)))
+    return ''.join(token_by_pos.get(i, '·') for i in range(n))
+
+
+def _export_trace_text_artifacts(model_output_dir: Path, final_dir: Path, outputs: List[Dict[str, Any]], scores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    trace_path = model_output_dir / 'trace.jsonl'
+    if not trace_path.exists():
+        return {}
+    trace_rows = read_jsonl(trace_path)
+    if not trace_rows:
+        return {}
+
+    outputs_by_sample = {_trace_sample_key(o.get('sample_id')): o for o in outputs}
+    scores_by_sample = {_trace_sample_key(s.get('sample_id')): s for s in scores}
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in trace_rows:
+        sid = _trace_sample_key(row.get('sample_id', row.get('sample_idx', 0)))
+        grouped.setdefault(sid, []).append(row)
+
+    summary_rows: List[Dict[str, Any]] = []
+    for sid, rows in sorted(grouped.items(), key=lambda kv: kv[0]):
+        rows = sorted(enumerate(rows), key=lambda x: (_trace_int(x[1].get('step_idx'), x[0]), x[0]))
+        row_list = [r for _, r in rows]
+        out = outputs_by_sample.get(sid, {})
+        sc = scores_by_sample.get(sid, {})
+        gen_length = _trace_gen_length([out] if out else outputs, row_list)
+        sample_dir = final_dir / 'sample_traces' / _trace_sample_dir_name(sid)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        token_by_pos: Dict[int, str] = {}
+        commits: List[Dict[str, Any]] = []
+        step_chain: List[Dict[str, Any]] = []
+        order_idx = 0
+        for fallback_i, row in enumerate(row_list):
+            step = _trace_int(row.get('step_idx'), fallback_i)
+            positions = [_trace_int(x, -1) for x in _trace_as_list(row.get('selected_positions'))]
+            tokens = [_trace_clean_token(x) for x in _trace_as_list(row.get('selected_decoded_tokens'))]
+            ids = [_trace_clean_token(x) for x in _trace_as_list(row.get('selected_token_ids'))]
+            changed_positions: List[int] = []
+            changed_tokens: List[str] = []
+            for i, pos in enumerate(positions):
+                if pos < 0:
+                    continue
+                tok = tokens[i] if i < len(tokens) else (ids[i] if i < len(ids) else '')
+                if tok in {'', '[MASK]', '<mask>', '<|mask|>'}:
+                    continue
+                is_revision = pos in token_by_pos
+                token_by_pos[pos] = tok
+                commits.append({
+                    'order_idx': order_idx,
+                    'step_idx': step,
+                    'position': pos,
+                    'token': tok,
+                    'is_revision': bool(is_revision),
+                })
+                changed_positions.append(pos)
+                changed_tokens.append(tok)
+                order_idx += 1
+            if changed_positions or not step_chain:
+                step_chain.append({
+                    'step_idx': step,
+                    'changed_positions': json.dumps(changed_positions, ensure_ascii=False),
+                    'changed_tokens': json.dumps(changed_tokens, ensure_ascii=False),
+                    'committed_count': len(set(token_by_pos.keys())),
+                    'text_state': _trace_text_state(token_by_pos, gen_length),
+                })
+
+        metrics = _trace_order_metrics(commits, gen_length)
+        correct = sc.get('correct')
+        score_value = sc.get('score')
+        summary = {
+            'sample_id': sid,
+            'benchmark': out.get('benchmark') or (row_list[0].get('benchmark') if row_list else ''),
+            'condition': out.get('condition') or (row_list[0].get('decoding_config_name') if row_list else ''),
+            'correct': correct,
+            'score': score_value,
+            **metrics,
+            'final_prediction': out.get('prediction') or out.get('raw_output') or '',
+        }
+        summary_rows.append(summary)
+
+        write_csv(sample_dir / 'token_commit_order.csv', commits)
+        write_csv(sample_dir / 'step_events_text.csv', commits)
+        write_csv(sample_dir / 'generation_chain.csv', step_chain)
+        write_csv(sample_dir / 'token_timeline.csv', step_chain)
+        md_lines = [
+            f"# Trace sample {sid}",
+            '',
+            f"- correct: {correct}",
+            f"- score: {score_value}",
+            f"- actual_parallelism: {metrics.get('actual_parallelism')}",
+            f"- order_kendall_tau: {metrics.get('order_kendall_tau')}",
+            f"- inversion_rate: {metrics.get('inversion_rate')}",
+            f"- left_to_right_score: {metrics.get('left_to_right_score')}",
+            '',
+            '## Generation chain',
+            '',
+        ]
+        for item in step_chain:
+            md_lines.append(f"### step {item['step_idx']}")
+            md_lines.append(f"changed_positions: `{item['changed_positions']}`")
+            md_lines.append('')
+            md_lines.append('```text')
+            md_lines.append(str(item['text_state']))
+            md_lines.append('```')
+            md_lines.append('')
+        md_lines.extend(['## Final prediction', '', '```text', str(summary['final_prediction']), '```'])
+        (sample_dir / 'generation_chain.md').write_text('\n'.join(md_lines), encoding='utf-8')
+        write_json(sample_dir / 'trace_text_metrics.json', summary)
+
+    write_csv(final_dir / 'trace_summary.csv', summary_rows)
+    write_jsonl(final_dir / 'trace_summary.jsonl', summary_rows)
+    if not summary_rows:
+        return {}
+    def avg(key: str) -> Optional[float]:
+        vals = []
+        for r in summary_rows:
+            v = r.get(key)
+            if v is None or v == '':
+                continue
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+        return round(sum(vals) / len(vals), 6) if vals else None
+    correct_count = sum(1 for r in summary_rows if r.get('correct') is True)
+    return {
+        'trace_run': True,
+        'trace_samples': len(summary_rows),
+        'trace_correct_count': correct_count,
+        'trace_accuracy': round(correct_count / max(len(summary_rows), 1) * 100, 4),
+        'actual_parallelism': avg('actual_parallelism'),
+        'completion_rate': avg('completion_rate'),
+        'order_kendall_tau': avg('order_kendall_tau'),
+        'inversion_rate': avg('inversion_rate'),
+        'left_to_right_score': avg('left_to_right_score'),
+        'mean_prefix_gap': avg('mean_prefix_gap'),
+    }
+
+# END OPENCOMPASS_INLINE_TRACE_PATCH
+
 def copy_artifacts(src: Path, dst: Path, sample_idx: Optional[int] = None) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for name in ["inputs.jsonl", "outputs.jsonl", "summary.jsonl", "trace.jsonl", "gpu.csv", "run.json", "output_manifest.json"]:
@@ -552,6 +864,10 @@ def evaluate_run(model_output_dir: Path, final_dir: Path, timeout: int = 8, allo
     metrics["eval_source"] = policy["source"]
     final_dir.mkdir(parents=True, exist_ok=True)
     copy_artifacts(model_output_dir, final_dir, sample_idx=outputs[0].get("sample_id") if outputs else None)
+    trace_metrics = _export_trace_text_artifacts(model_output_dir, final_dir, outputs, scores)
+    if trace_metrics:
+        metrics.update(trace_metrics)
+        metrics["eval_backend"] = str(policy["backend"]) + "+native_trace_analysis"
     write_jsonl(final_dir / "scores.jsonl", scores)
     write_json(final_dir / "metrics.json", metrics)
     write_json(final_dir / "eval_policy.json", policy)
@@ -570,7 +886,8 @@ def main() -> int:
     parser.add_argument("--models", nargs="*", default=None)
     parser.add_argument("--model-output-root", default="model_outputs")
     parser.add_argument("--output-root", default="native_outputs")
-    parser.add_argument("--timeout", type=int, default=8, help="MBPP subprocess timeout per sample.")
+    parser.add_argument("--timeout", type=int, default=10, help="Kept for compatibility; OpenCompass MBPPEvaluator uses its own timeout.")
+    parser.add_argument("--eval-backend", choices=["opencompass", "auto", "inline"], default="opencompass", help="Accepted for compatibility. opencompass/auto use OpenCompass evaluator classes directly on native outputs; inline is no longer used for GSM8K/MBPP.")
     parser.add_argument("--allow-generic-eval", action="store_true", help="Exploratory only: allow generic substring fallback for unregistered benchmarks. Default is false to keep scores comparable with previous iLLaDA runs.")
     parser.add_argument("--print-eval-policy", action="store_true", help="Print the fixed benchmark -> evaluator mapping used for consistency across old iLLaDA and future runs.")
     parser.add_argument("--dry-run", action="store_true")
@@ -635,7 +952,6 @@ def main() -> int:
         row = {
             "model": alias,
             "task": condition["task"],
-            "output_task": condition.get("output_task", condition["task"]),
             "experiment": condition["experiment"],
             "benchmark": condition["benchmark"],
             "condition": condition["condition"],
