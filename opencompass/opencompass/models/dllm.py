@@ -151,6 +151,7 @@ class LLaDAModel(BaseModel):
                  token_selection_confidence_threshold_schedule = None,
                  threshold_schedule_label = None,
                  min_transfer_tokens = 1,
+                 min_transfer_tokens_schedule = None,
                  metrics_output = None,
                  per_sample_output = None,
                  step_trace_output = None,
@@ -214,6 +215,7 @@ class LLaDAModel(BaseModel):
         self.token_selection_confidence_threshold_schedule = token_selection_confidence_threshold_schedule
         self.threshold_schedule_label = threshold_schedule_label
         self.min_transfer_tokens = int(min_transfer_tokens)
+        self.min_transfer_tokens_schedule = min_transfer_tokens_schedule
         self.per_sample_output = per_sample_output or metrics_output
         self.step_trace_output = step_trace_output
         self.metrics_output = self.per_sample_output
@@ -530,6 +532,7 @@ class LLaDAModel(BaseModel):
                 'completion_rate_by_block': completion_rate_by_block,
                 'step0_confidence_by_position': step0_confidence_by_position,
                 'min_transfer_tokens': self.min_transfer_tokens,
+                'min_transfer_tokens_schedule': trace.get('min_transfer_tokens_schedule') if trace else self.min_transfer_tokens_schedule,
                 'context_length': self.context_length,
                 'needle_position': self.needle_position,
                 'effective_parallelism': trace.get('planned_parallelism') if trace else (float(self.gen_length / self.gen_steps) if self.gen_steps else None),
@@ -661,6 +664,7 @@ class LLaDAModel(BaseModel):
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
             token_selection_confidence_threshold_schedule = self.token_selection_confidence_threshold_schedule,
             min_transfer_tokens = self.min_transfer_tokens,
+            min_transfer_tokens_schedule = self.min_transfer_tokens_schedule,
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
             tokenizer = self.tokenizer,
@@ -838,6 +842,7 @@ class LLaDABaseModel(LLaDAModel):
             token_selection_confidence_threshold = self.token_selection_confidence_threshold,
             token_selection_confidence_threshold_schedule = self.token_selection_confidence_threshold_schedule,
             min_transfer_tokens = self.min_transfer_tokens,
+            min_transfer_tokens_schedule = self.min_transfer_tokens_schedule,
             return_trace = profile_trace,
             trace_token_snapshots = self.trace_token_snapshots or self.trace_decode_snapshots,
             tokenizer = self.tokenizer,

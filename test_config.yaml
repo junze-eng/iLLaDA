@@ -307,6 +307,23 @@ tasks:
           gen_steps: [512]
           token_selection_confidence_threshold: [null, 0.8, 0.9]
 
+  overprovision_rescue:
+    description: "Task 7: does simply giving more steps (no schedule tricks, plain min_transfer_tokens=1) rescue the completion_rate collapse already measured at block_length=512, gen_steps=64 (token-per-step=8) on MBPP -- task3_mbpp_threshold_counterfactual_mbpp_7/8, completion_rate 0.24-0.29? Keeps block_length=512 fixed (so scheduled_count-per-step stays >1, unlike the degenerate block=256/steps=512 case in task5/task6_overprovisioned_steps where scheduled_count is always <=1 and threshold structurally cannot cause any backlog). gen_steps=64 is the known-collapsed baseline; 128/256 test whether more steps at the same block_length recovers completion_rate."
+    output_path: outputs/overprovision_rescue
+    experiments:
+      - name: task7_mbpp_overprovision_rescue
+        benchmark: mbpp
+        params:
+          sample_limit: 10
+          gen_length: 512
+          gen_blocksize: 512
+          temperature: 0.0
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          gen_steps: [64, 128, 256]
+          token_selection_confidence_threshold: [0.8, 0.9]
+
   baseline:
     description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
     output_path: outputs/baseline

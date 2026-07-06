@@ -128,7 +128,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
              steps_per_block_schedule: Optional[List[int]] = None,
              token_selection_confidence_threshold_schedule: Optional[List[Optional[float]]] = None,
              trace_step0_full_confidence: bool = False,
-             decode_order: str = 'confidence'):
+             decode_order: str = 'confidence',
+             min_transfer_tokens_schedule: Optional[List[int]] = None):
     '''
     Args:
         model: Mask predictor.
@@ -161,6 +162,12 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
             token for that position). 'random' picks a random subset of masked positions. The latter two
             exist to measure whether iLLaDA's free (confidence-based) decoding order carries real value
             over a forced order, by comparing accuracy across all three at matched steps/gen_length.
+        min_transfer_tokens_schedule: Optional per-step-within-block override for min_transfer_tokens,
+            e.g. all zeros except the final few steps. Lets threshold genuinely reject-and-defer
+            (no forced fallback) for most of the block, while still guaranteeing forward progress
+            near the end of the step budget. Must have exactly `block_steps` entries for each block
+            (validated per-block since steps_per_block_schedule can vary). If None, min_transfer_tokens
+            is used as a constant for every step, as before.
     '''
     stop_token_ids = _dynamic_stop_token_ids(tokenizer=tokenizer, stop_token_ids=stop_token_ids)
 
@@ -229,6 +236,7 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         'schedule_overrides_scalar_threshold': bool(schedule_overrides_scalar_threshold),
         'block_thresholds': threshold_schedule if threshold_schedule is not None else [token_selection_confidence_threshold] * num_blocks,
         'min_transfer_tokens': int(min_transfer_tokens),
+        'min_transfer_tokens_schedule': list(min_transfer_tokens_schedule) if min_transfer_tokens_schedule is not None else None,
         'scheduled_transfer_count': 0,
         'threshold_passed_count': 0,
         'fallback_forced_count': 0,
@@ -244,7 +252,16 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
         block_threshold = threshold_schedule[num_block] if threshold_schedule is not None else token_selection_confidence_threshold
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, block_steps)
+        if min_transfer_tokens_schedule is not None:
+            if len(min_transfer_tokens_schedule) != block_steps:
+                raise ValueError(
+                    "min_transfer_tokens_schedule must have exactly block_steps "
+                    f"({block_steps}) entries, got {len(min_transfer_tokens_schedule)}."
+                )
         for i in range(block_steps):
+            step_min_transfer_tokens = (
+                int(min_transfer_tokens_schedule[i]) if min_transfer_tokens_schedule is not None else min_transfer_tokens
+            )
             step_idx = global_step_offset + i
             mask_index = (x == mask_id)
             if cfg_scale > 0.:
@@ -322,8 +339,8 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
                 if block_threshold is not None:
                     keep = select_confidence >= block_threshold
                     passed_count = int(keep.sum().item())
-                    if keep.sum().item() == 0 and min_transfer_tokens > 0:
-                        keep[:min(min_transfer_tokens, scheduled_count)] = True
+                    if keep.sum().item() == 0 and step_min_transfer_tokens > 0:
+                        keep[:min(step_min_transfer_tokens, scheduled_count)] = True
                         forced_count = int(keep.sum().item())
                         transfer_reason = 'threshold_fallback_forced'
                     else:
