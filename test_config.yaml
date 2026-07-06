@@ -429,6 +429,23 @@ tasks:
           gen_steps: [32, 64]
           token_selection_confidence_threshold: [0.8, 0.9]
 
+  threshold_efficiency_probe:
+    description: "Task 9: at a FIXED high-parallelism step budget (gen_steps=32, same 8 tokens/step as task1_gsm8k_strong_parallel's 22% baseline and task8's steps=32 anchor -- thr0.8 n10 acc=40%, thr0.9 n5 acc=20%), does LOWERING the confidence threshold recover completion_rate/accuracy WITHOUT spending any extra steps? Tests whether the accuracy collapse at high parallelism is driven by too few steps (task8's fix: spend more steps) or by an overly strict threshold forcing frequent low-confidence min_transfer_tokens=1 fallback commits (this task's fix: relax the threshold, zero extra compute cost). Combined with task8's existing 0.8/0.9 points at steps=32, this completes a 5-point threshold curve (0.5/0.6/0.7/0.8/0.9) at constant speed -- answering whether accuracy and efficiency can be improved together via threshold alone, as a cheaper alternative to step-doubling."
+    output_path: outputs/threshold_efficiency_probe
+    experiments:
+      - name: task9_gsm8k_threshold_efficiency
+        benchmark: gsm8k
+        params:
+          sample_limit: 10
+          gen_length: 256
+          gen_blocksize: 256
+          gen_steps: 32
+          temperature: 0.0
+          min_transfer_tokens: 1
+          return_trace: true
+        sweep:
+          token_selection_confidence_threshold: [0.5, 0.6, 0.7]
+
   baseline:
     description: "Paper-anchor baseline for iLLaDA-Instruct. Used as reference line in visualization."
     output_path: outputs/baseline
